@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+data/
+cursor_wrapper/node_modules/
+*.egg-info/
+dist/
+build/
+.DS_Store
+*.log

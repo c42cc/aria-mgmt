@@ -1,0 +1,14 @@
+{
+  "name": "ucs-cursor-wrapper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js bridge between UCS Python process and @cursor/sdk",
+  "main": "index.js",
+  "scripts": {
+    "healthcheck": "node index.js --healthcheck"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@cursor/sdk": "^1.0.0"
+  }
+}
