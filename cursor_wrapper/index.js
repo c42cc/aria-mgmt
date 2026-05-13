@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 /**
- * ~80-line bridge between UCS Python process and @cursor/sdk.
- * Reads JSON commands on stdin, writes JSON events on stdout.
+ * Bridge between UCS Python and @cursor/sdk.
+ *
+ * Protocol (single stdout stream, demuxed by Python):
+ *   Python -> Node  {request_id, action, ...}
+ *   Node   -> Python (response) {request_id, type:"response", ...}
+ *   Node   -> Python (error)    {request_id, type:"error",    error}
+ *   Node   -> Python (event)    {type:"event", session_id, event, data}
+ *
+ * One request_id -> one response or error. Build stream events have no
+ * request_id and carry their session_id so Python routes them to a
+ * per-session queue.
  */
 
 const readline = require("readline");
 
 if (process.argv.includes("--healthcheck")) {
-  console.log(JSON.stringify({ status: "ok" }));
+  console.log(JSON.stringify({ type: "response", status: "ok" }));
   process.exit(0);
 }
 
@@ -28,53 +37,98 @@ rl.on("line", async (line) => {
   try {
     cmd = JSON.parse(line);
   } catch {
-    respond({ error: "Invalid JSON" });
+    fail(null, "Invalid JSON");
     return;
   }
 
+  const requestId = cmd.request_id ?? null;
   try {
-    if (cmd.action === "create") {
-      await handleCreate(cmd);
+    if (cmd.action === "ping") {
+      respond(requestId, { ok: true });
+    } else if (cmd.action === "create") {
+      await handleCreate(cmd, requestId);
     } else if (cmd.action === "send") {
-      await handleSend(cmd);
+      await handleSend(cmd, requestId);
+    } else if (cmd.action === "cancel") {
+      await handleCancel(cmd, requestId);
     } else {
-      respond({ error: `Unknown action: ${cmd.action}` });
+      fail(requestId, `Unknown action: ${cmd.action}`);
     }
   } catch (err) {
-    respond({ error: err.message });
+    fail(requestId, err && err.message ? err.message : String(err));
   }
 });
 
-async function handleCreate({ project_path, instruction, model }) {
-  const agent = await Agent.create({
+async function handleCreate({ project_path, instruction, model }, requestId) {
+  const opts = {
     model: model || "composer-2",
     local: { cwd: project_path },
-  });
+  };
+  if (process.env.CURSOR_API_KEY) {
+    opts.apiKey = process.env.CURSOR_API_KEY;
+  }
 
+  const agent = await Agent.create(opts);
   const sessionId = agent.id || `session-${Date.now()}`;
   sessions.set(sessionId, agent);
 
-  respond({ session_id: sessionId, status: "running" });
+  respond(requestId, { session_id: sessionId, status: "running" });
 
-  const run = agent.prompt(instruction);
-  for await (const event of run.stream()) {
-    respond({ session_id: sessionId, event: event.type, data: event });
-  }
-  respond({ session_id: sessionId, event: "completion", status: "done" });
+  // Stream prompt events asynchronously so we can keep accepting commands.
+  (async () => {
+    try {
+      const run = agent.prompt(instruction);
+      for await (const event of run.stream()) {
+        emit({ session_id: sessionId, event: event.type, data: event });
+      }
+      emit({ session_id: sessionId, event: "completion", status: "done" });
+    } catch (err) {
+      emit({
+        session_id: sessionId,
+        event: "error",
+        data: { message: err && err.message ? err.message : String(err) },
+      });
+    }
+  })();
 }
 
-async function handleSend({ session_id, message }) {
+async function handleSend({ session_id, message }, requestId) {
   const agent = sessions.get(session_id);
   if (!agent) {
-    respond({ error: `No session: ${session_id}` });
+    fail(requestId, `No session: ${session_id}`);
     return;
   }
   await agent.send(message);
-  respond({ ok: true, session_id });
+  respond(requestId, { ok: true, session_id });
 }
 
-function respond(obj) {
-  process.stdout.write(JSON.stringify(obj) + "\n");
+async function handleCancel({ session_id }, requestId) {
+  const agent = sessions.get(session_id);
+  if (!agent) {
+    fail(requestId, `No session: ${session_id}`);
+    return;
+  }
+  if (typeof agent.cancel === "function") {
+    await agent.cancel();
+  }
+  sessions.delete(session_id);
+  respond(requestId, { ok: true, cancelled: session_id });
+}
+
+function respond(requestId, obj) {
+  process.stdout.write(
+    JSON.stringify({ type: "response", request_id: requestId, ...obj }) + "\n",
+  );
+}
+
+function fail(requestId, error) {
+  process.stdout.write(
+    JSON.stringify({ type: "error", request_id: requestId, error }) + "\n",
+  );
+}
+
+function emit(obj) {
+  process.stdout.write(JSON.stringify({ type: "event", ...obj }) + "\n");
 }
 
 rl.on("close", () => process.exit(0));

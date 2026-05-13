@@ -1,16 +1,34 @@
 [project]
 name = "ucs"
 version = "0.1.0"
-description = "Voice → Plan → Build: Discord voice to Gemini Live to Claude Opus to Cursor"
-requires-python = ">=3.11"
+description = "Voice -> Plan -> Build: Discord voice to Gemini Live to Claude Opus to Cursor"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "discord.py[voice]>=2.4.0",
-    "google-genai>=1.0.0",
+    # Discord voice receive needs py-cord (NOT discord.py — they share the
+    # `discord` namespace but only py-cord exposes discord.sinks.Sink).
+    "py-cord[voice]>=2.7.0",
+    # Gemini Live API. Note: client.aio.live.connect() is an async context
+    # manager, not an awaitable — the bridge code must use `async with`.
+    "google-genai>=2.0.0",
     "anthropic>=0.42.0",
-    "mem0ai>=0.1.0",
+    "mem0ai>=2.0.0",
     "python-dotenv>=1.0.0",
-    "numpy>=1.26.0",
+    # numpy must be <2: the transformers/torch chain has C-extensions
+    # compiled against 1.x ABI; numpy>=2 will crash at import time.
+    "numpy<2",
+    "mcp>=1.0.0",
+    # chromadb is a transitive of mem0ai; keep it pinned here to fail loud
+    # if mem0 drops it.
+    "chromadb>=0.4.0",
+    "aiohttp>=3.9.0",
 ]
 
 [project.scripts]
 ucs = "src.bot:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]

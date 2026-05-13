@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS events (
     params       TEXT,
     result       TEXT,
     duration_ms  INTEGER,
-    session_key  TEXT
+    session_key  TEXT,
+    token_cost_usd REAL
 );
 
 CREATE TABLE IF NOT EXISTS planning_history (
@@ -56,6 +57,9 @@ def get_connection() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -70,13 +74,24 @@ def log_event(
     result: str | None = None,
     duration_ms: int | None = None,
     session_key: str | None = None,
+    token_cost_usd: float | None = None,
 ) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO events (timestamp, tool_name, params, result, duration_ms, session_key) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (_now(), tool_name, json.dumps(params), result, duration_ms, session_key),
+            "INSERT INTO events (timestamp, tool_name, params, result, duration_ms, session_key, token_cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_now(), tool_name, json.dumps(params), result, duration_ms, session_key, token_cost_usd),
         )
+
+
+def get_daily_spend() -> float:
+    today = datetime.now(timezone.utc).date().isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(token_cost_usd), 0) as total FROM events WHERE timestamp >= ?",
+            (today,),
+        ).fetchone()
+    return float(row["total"]) if row else 0.0
 
 
 def get_planning_history(session_key: str) -> list[dict[str, str]]:

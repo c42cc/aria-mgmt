@@ -1,0 +1,19 @@
+{
+  "name": "discord_voice_bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node sidecar owning the Discord voice WebSocket. Logs in as a separate voice-only bot. py-cord (Bot #1) keeps text/commands/threads; this (Bot #2) only joins voice and streams PCM via stdio.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "@snazzah/davey": "^0.1.11",
+    "discord.js": "^14.16.0",
+    "libsodium-wrappers": "^0.7.13",
+    "opusscript": "^0.0.8",
+    "prism-media": "^1.3.5"
+  }
+}

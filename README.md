@@ -2,6 +2,8 @@
 
 Talk to your software development workflow from your phone. One Python process on your Mac connects Discord voice to Gemini 3.1 Live (conversational layer), which dispatches work to Claude Opus 4.6 (planner) and Cursor (builder) via function calls.
 
+The bot appears in Discord as **Aria**. She is the only non-human in the server and manages every channel and thread herself.
+
 ## Architecture
 
 Three intelligences, strict roles:
@@ -58,12 +60,26 @@ ucs/
 
 ## Discord Setup
 
-1. Create a Discord application at https://discord.com/developers/applications
-2. Add a Bot user, save token to `.env` as `DISCORD_BOT_TOKEN`
-3. Enable intents: Server Members, Message Content, Voice State
-4. Invite bot with scopes `bot` + `applications.commands`
-5. Create channels: `#voice-bot` (voice), `#bot-text` (text), `#bot-logs` (text)
-6. Copy channel IDs to `.env`
+Aria runs as two Discord applications sharing one identity:
+
+- **Aria (text bot)** — py-cord, handles text commands, threads, and tool dispatch.
+  Token in `.env` as `DISCORD_APP_BOT_TOKEN`.
+- **Aria (voice sidecar)** — discord.js Node process (`discord_voice_bridge/`),
+  handles only the voice WebSocket. Token in `.env` as `DISCORD_VOICE_BOT_TOKEN`.
+
+Both applications are invited to the same guild and named "Aria" in the
+Discord developer portal, so they appear as one bot to the user.
+
+Channels (three total):
+
+- `#ucs` (text) — plans, build output, tool results, file attachments
+- `#ucs-alerts` (text) — preflight reports, confirmations, errors
+- `#general` (voice) — natural-language conversation with Aria
+- `#spicy-lit` (text) — SpicyLit outline output
+
+Channel IDs live in `.env` as `DISCORD_TEXT_CHANNEL_ID`, `DISCORD_LOG_CHANNEL_ID`,
+and `DISCORD_VOICE_CHANNEL_ID`. Renaming channels in Discord does not break
+anything because the code reads IDs, not names.
 
 ## Build Phases
 

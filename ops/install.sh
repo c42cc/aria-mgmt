@@ -6,10 +6,22 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "=== UCS Setup ==="
 
-# Python venv
+# Python venv (3.12 required)
+PYTHON_BIN="$(command -v python3.12 || true)"
+if [ -z "$PYTHON_BIN" ]; then
+    echo "ERROR: python3.12 not found. Install with 'brew install python@3.12' first."
+    exit 1
+fi
+
 if [ ! -d "$PROJECT_DIR/.venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv "$PROJECT_DIR/.venv"
+    echo "Creating virtual environment with $PYTHON_BIN..."
+    "$PYTHON_BIN" -m venv "$PROJECT_DIR/.venv"
+else
+    VENV_VERSION="$("$PROJECT_DIR/.venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
+    if [ "$VENV_VERSION" != "3.12" ]; then
+        echo "ERROR: existing .venv is Python $VENV_VERSION, expected 3.12. Remove .venv and re-run."
+        exit 1
+    fi
 fi
 
 echo "Installing Python dependencies..."

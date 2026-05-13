@@ -1,0 +1,152 @@
+---
+description: UCS architecture invariants and project conventions
+alwaysApply: true
+---
+
+# UCS — Project Conventions
+
+Read [`ARCHITECTURE.md`](../../ARCHITECTURE.md) and [`wiring.md`](../../wiring.md)
+when you need a map of the system. They are the source of truth. This file is
+the short version of the rules that hold across the codebase.
+
+## Roles do not blur
+
+- **Gemini Live speaks.** It is the only voice. It does not reason.
+- **Claude Opus thinks.** It plans, analyzes, runs the general-task agent loop.
+  It does not speak to the user; it produces text artifacts.
+- **Cursor SDK builds.** It edits code and runs tests. It does not narrate.
+
+Any change that asks one role to do another's job is a regression. If you find
+yourself wanting a "router model" or a "primary model under Gemini," stop and
+re-read `ARCHITECTURE.md`.
+
+## No frameworks
+
+No agent frameworks (LangChain, AutoGen, LangGraph, Hermes, etc.). The loop
+lives in `src/bot.py` and must remain readable end-to-end. New behavior is a
+new tool in `src/tools.py`, not a new layer.
+
+## Failures must be loud
+
+No silent fallbacks. Bad:
+
+```python
+try:
+    result = await something()
+except Exception:
+    result = None  # silent fallback
+```
+
+Good:
+
+```python
+try:
+    result = await something()
+except SpecificError:
+    log.exception("something failed")
+    raise
+```
+
+Preflight (`src/preflight.py`) refuses to enter ready state on any critical
+failure. Do not add a probe that swallows its own error; return
+`(False, error, fix_command, detail)` so the user sees what broke and how
+to fix it.
+
+## MCP for general integrations
+
+Do not write a custom Gmail client, AppleScript wrapper, GitHub client, or
+shell executor. Use the MCP fleet in `src/mcp.py`. If a required server does
+not exist, ask before writing one.
+
+## Risk tiers are mechanical
+
+`src/mcp.py::_classify_tier` assigns every MCP tool a tier from server
+defaults. Tier I (irreversible) and tier X (executable) **always** confirm
+before firing — this is enforced by the dispatcher, not by prompting Claude
+to be careful. Do not add a code path that bypasses the confirm callback.
+
+## Cost discipline is mechanical
+
+Daily ceiling, per-session call limits, and iteration caps live in
+`src/config.py` (overridable via `.env`). The dispatcher checks them before
+delegating. When you add a paid tool, add it to the dispatch path that
+already runs the spend check; do not call the model API from a fresh entry
+point.
+
+## State stays in three places
+
+- `data/state.db` — structured rows via `src/db.py` (raw SQL, no ORM).
+- `data/mem0/` — durable user facts via `src/memory.py`.
+- `data/audit.jsonl` — append-only record of every MCP call.
+
+Do not introduce a fourth store. Do not abstract these behind a data access
+layer.
+
+## Behavior lives in `prompts/`
+
+Personas and reusable instructions are markdown files. Edit a file, reload
+(`!reload` or the `reload_prompts` tool), and behavior changes. Do not
+embed long instruction strings in Python; put them in `prompts/` and load
+via `prompts.load_template(name)`.
+
+## Channels by ID, not name
+
+Read `DISCORD_*_CHANNEL_ID` from config. Never look up a channel by name.
+Renaming a channel in Discord must never break the bot.
+
+## Aria is one identity, two applications
+
+`DISCORD_APP_BOT_TOKEN` is the py-cord text/commands bot. `DISCORD_VOICE_BOT_TOKEN`
+is the discord.js voice sidecar. They never communicate through Discord. The
+Python parent (`src/bot.py`) is the only glue.
+
+## Capabilities plug in by channel
+
+New capability? Add a package under `capabilities/`. Register a channel ID
+in `.env`. Wire it into `_auto_join_voice_channel` in `src/bot.py` so audio
+routes to its session when the user enters that channel. Do not modify the
+core tool catalog for capability-specific behavior; capabilities own their
+own pipelines.
+
+## Python style
+
+- Python 3.11+. Type hints throughout (`from __future__ import annotations`
+  is already the convention).
+- One module per concern. Names match the layer in `ARCHITECTURE.md`.
+- Async by default. Blocking I/O wrapped in `asyncio.to_thread` when needed
+  (e.g., the Anthropic SDK is sync).
+- Module-level loggers: `log = logging.getLogger(__name__)`.
+
+## Known gotchas
+
+- **Discord voice requires the sidecar.** py-cord cannot connect to voice
+  (close code 4017 / DAVE E2EE). Do not delete the sidecar.
+- **`discord` namespace conflict.** Only `py-cord` exposes
+  `discord.sinks.core.Sink`. Installing `discord.py` instead will silently
+  break voice receive. The `dep_drift` preflight probe catches this.
+- **numpy must be `<2`.** The transformers/torch chain has C-extensions
+  compiled against the 1.x ABI; numpy>=2 crashes at import.
+- **Gemini Live is an async context manager**, not an awaitable. The bridge
+  uses `__aenter__` / `__aexit__` directly.
+- **`make run` is the only correct way to launch.** It kills the prior
+  instance and reinstalls in editable mode, so the running code always
+  matches the source on disk. The `running_code` preflight probe asserts
+  this with a SHA sentinel.
+
+## Don't substitute models
+
+Claude calls use Opus. Memory synthesis may use Haiku for cost. Never
+introduce Sonnet anywhere. The model names are configured in `.env`; do not
+hardcode them outside `src/config.py`.
+
+## Don't push or auto-commit from Cursor
+
+The implementation persona (`prompts/implementation.md`) instructs Cursor to
+work on a fresh branch and never push. Do not add a build step that pushes,
+merges, or modifies `.env`, `.git/`, or files outside the project root.
+
+## Cite where things live before adding new things
+
+Before you add a module, search `ARCHITECTURE.md`'s **Repo Map** for an
+existing home. If the concept fits an existing module, extend it. If it
+truly does not, place it where the map would put it and update the map.
