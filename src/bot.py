@@ -838,6 +838,34 @@ async def reload(ctx: commands.Context):
         await ctx.send("Prompts reloaded. Gemini not connected — changes will apply on next !join.")
 
 
+@bot.command()
+async def ask(ctx: commands.Context, *, message: str):
+    """Send a text request through the full tool dispatch (do_with_claude).
+
+    Bypasses voice — same pipeline, text transport. Results post to the channel.
+    Usage: !ask summarize my emails from today
+    """
+    if not _is_authorized(ctx.author.id):
+        await ctx.send("Not authorized.")
+        return
+
+    await ctx.send(f"Working on it...")
+    from .tools import handle_tool_call
+    session_key = str(ctx.channel.id)
+    try:
+        result = await handle_tool_call("do_with_claude", {
+            "task": message,
+            "session_key": session_key,
+        })
+        if len(result) > 1900:
+            await post_to_text(result)
+            await ctx.send("Done — full result posted to #ucs.")
+        else:
+            await ctx.send(result)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+
+
 # ---------------------------------------------------------------------------
 # SpicyLit: Grok Voice Agent
 # ---------------------------------------------------------------------------
