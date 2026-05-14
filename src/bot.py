@@ -409,6 +409,19 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
         log.warning("Asked to auto-join %s but voice bridge not alive", channel.name)
         return
 
+    is_spicylit = (
+        config.discord_spicylit_channel_id
+        and str(channel.id) == config.discord_spicylit_channel_id
+    )
+
+    if _in_discord_voice:
+        if is_spicylit and _spicylit_active and _grok_session and _grok_session.connected:
+            log.info("SpicyLit already active in %s — skipping duplicate join", channel.name)
+            return
+        if not is_spicylit and gemini and gemini.connected:
+            log.info("Gemini already active in voice — skipping duplicate join")
+            return
+
     if _local_session_active:
         await _close_local_session()
 
@@ -421,15 +434,17 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
     _last_user_activity_at = time.monotonic()
     _cancel_audio_tasks()
 
-    is_spicylit = (
-        config.discord_spicylit_channel_id
-        and str(channel.id) == config.discord_spicylit_channel_id
-    )
-
     if is_spicylit:
         if not config.grok_api_key:
             log.error("Joined #spicy-lit but GROK_API_KEY not set — no audio pipeline")
             return
+
+        if _grok_session and _grok_session.connected:
+            log.warning("Closing leaked Grok session before creating new one")
+            try:
+                await _grok_session.close()
+            except Exception:
+                log.exception("Error closing leaked Grok session")
 
         if gemini and gemini.connected:
             try:
@@ -438,12 +453,14 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
                 log.exception("Error closing Gemini before Grok handoff")
 
         from capabilities.spicy_lit import GrokVoiceSession, init_table
+        from capabilities.spicy_lit.prompts import STORY
         init_table()
 
         _grok_session = GrokVoiceSession(
             api_key=config.grok_api_key,
             voice="eve",
             user_id=config.authorized_user_ids[0] if config.authorized_user_ids else "",
+            mode=STORY,
             post_text_callback=_post_to_spicylit,
             on_disconnect=_on_grok_disconnect,
         )
@@ -454,7 +471,7 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
         _audio_tasks.append(asyncio.create_task(_drain_grok_to_voice()))
         _audio_tasks.append(asyncio.create_task(_grok_watchdog_task()))
         _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
-        log.info("Grok voice pipeline active for #spicy-lit")
+        log.info("Grok voice pipeline active for #spicy-lit (mode=%s)", STORY)
     else:
         if gemini and not gemini.connected:
             try:
@@ -961,8 +978,8 @@ async def _post_to_spicylit(content: str) -> None:
 
 
 @bot.command()
-async def spicylit(ctx: commands.Context):
-    """Switch voice to Grok SpicyLit mode."""
+async def spicylit(ctx: commands.Context, mode: str = "story"):
+    """Switch voice to Grok SpicyLit mode.  Usage: !spicylit [story|joi]"""
     global _spicylit_active, _grok_session, _grok_session_started_at
 
     if not _is_authorized(ctx.author.id):
@@ -979,6 +996,13 @@ async def spicylit(ctx: commands.Context):
         return
 
     from capabilities.spicy_lit import GrokVoiceSession, init_table
+    from capabilities.spicy_lit.prompts import VALID_MODES
+
+    mode = mode.lower().strip()
+    if mode not in VALID_MODES:
+        await ctx.send(f"Unknown mode `{mode}`. Valid modes: {', '.join(sorted(VALID_MODES))}")
+        return
+
     init_table()
 
     if gemini and gemini.connected:
@@ -989,6 +1013,7 @@ async def spicylit(ctx: commands.Context):
         api_key=config.grok_api_key,
         voice="eve",
         user_id=str(ctx.author.id),
+        mode=mode,
         post_text_callback=_post_to_spicylit,
         on_disconnect=_on_grok_disconnect,
     )
@@ -999,7 +1024,7 @@ async def spicylit(ctx: commands.Context):
     _audio_tasks.append(asyncio.create_task(_drain_grok_to_voice()))
     _audio_tasks.append(asyncio.create_task(_grok_watchdog_task()))
     _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
-    await ctx.send("SpicyLit mode active. Grok is listening.")
+    await ctx.send(f"SpicyLit **{mode}** mode active. Grok is listening.")
 
 
 @bot.command()

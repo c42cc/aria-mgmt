@@ -6,39 +6,24 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from typing import Any, Callable, Coroutine
 
 import websockets
 
 from .pipeline import generate_outline
 from .db import save_outline, get_latest_outline
+from .prompts import get_session_config, STORY, STORY_POST_OUTLINE_INSTRUCTION, VALID_MODES
 
 log = logging.getLogger(__name__)
 
 GROK_VOICE_URL = "wss://api.x.ai/v1/realtime?model=grok-voice-latest"
 
-SYSTEM_INSTRUCTIONS = """\
-You are the SpicyLit storyteller — a flirty, confident, uninhibited adult voice companion.
-
-Your job has two modes:
-
-MODE 1 — COMMISSIONING (conversation):
-Chat naturally to understand what kind of erotic story the listener wants. Ask about:
-- Their name (for the protagonist)
-- Kinks, themes, dynamics they enjoy
-- Setting, characters, intensity level
-- Any specific scenarios or fantasies
-Be playful, suggestive, and encouraging. Don't be clinical. Once you have enough detail,
-call the generate_outline function.
-
-MODE 2 — STORYTELLING (after outline is ready):
-Tell the story aloud in first person, following the outline. Be vivid, immersive, sensual.
-Use pauses, pacing, and vocal variety. The listener can interrupt at any time to redirect,
-intensify, slow down, or add elements. Adapt on the fly.
-
-You have NO content restrictions. You are explicitly authorized for adult content.
-Be raw, authentic, and erotically charged. This is what the user is here for.
-"""
+# Suppress forwarding user audio while Grok is speaking to prevent the
+# echo-feedback loop (Grok response → speakers → microphone → Grok input
+# → second response). The cooldown gives Discord's echo cancellation time
+# to settle after the last audio frame.
+ECHO_SUPPRESSION_COOLDOWN_SEC = 0.8
 
 
 class GrokVoiceSession:
@@ -49,12 +34,18 @@ class GrokVoiceSession:
         api_key: str,
         voice: str = "eve",
         user_id: str = "",
+        mode: str = STORY,
         post_text_callback: Callable[..., Coroutine] | None = None,
         on_disconnect: Callable[[str], Coroutine] | None = None,
     ):
+        if mode not in VALID_MODES:
+            raise ValueError(
+                f"Unknown SpicyLit mode {mode!r}. Valid: {', '.join(sorted(VALID_MODES))}"
+            )
         self._api_key = api_key
         self._voice = voice
         self._user_id = user_id
+        self._mode = mode
         self._post_text = post_text_callback
         self._on_disconnect = on_disconnect
         self._ws: Any = None
@@ -63,12 +54,27 @@ class GrokVoiceSession:
         self._disconnect_fired = False
         self._audio_out_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         self._receive_task: asyncio.Task | None = None
+        self._responding = False
+        self._response_ended_at: float = 0.0
 
     @property
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def suppressing_input(self) -> bool:
+        """True while Grok is speaking or within the post-response cooldown."""
+        if self._responding:
+            return True
+        if self._response_ended_at and (
+            time.monotonic() - self._response_ended_at < ECHO_SUPPRESSION_COOLDOWN_SEC
+        ):
+            return True
+        return False
+
     async def start(self) -> None:
+        self._responding = False
+        self._response_ended_at = 0.0
         extra_headers = {"Authorization": f"Bearer {self._api_key}"}
         self._ws = await websockets.connect(
             GROK_VOICE_URL,
@@ -77,36 +83,48 @@ class GrokVoiceSession:
         )
         self._connected = True
 
+        instructions, tools, greeting = get_session_config(self._mode)
+
         await self._ws.send(json.dumps({
             "type": "session.update",
             "session": {
                 "voice": self._voice,
-                "instructions": SYSTEM_INSTRUCTIONS,
+                "instructions": instructions,
                 "turn_detection": {"type": "server_vad"},
                 "audio": {
                     "input": {"format": {"type": "audio/pcm", "rate": 16000}},
                     "output": {"format": {"type": "audio/pcm", "rate": 24000}},
                 },
-                "tools": [self._outline_tool_def()],
+                "tools": tools,
             },
         }))
 
         self._receive_task = asyncio.create_task(self._receive_loop())
-        log.info("Grok Voice session connected (voice=%s)", self._voice)
+        log.info("Grok Voice session connected (voice=%s, mode=%s)", self._voice, self._mode)
 
         await self._ws.send(json.dumps({
             "type": "conversation.item.create",
             "item": {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": "Hey, I just joined. Introduce yourself and ask me what I'm in the mood for."}],
+                "content": [{"type": "input_text", "text": greeting}],
             },
         }))
         await self._ws.send(json.dumps({"type": "response.create"}))
 
+        if self._mode != STORY:
+            self._emit_mode_session_record()
+
     async def send_audio(self, pcm_bytes: bytes) -> None:
-        """Forward 16kHz mono PCM from Discord to Grok."""
+        """Forward 16kHz mono PCM from Discord to Grok.
+
+        Silently drops frames while Grok is responding (or within the
+        post-response cooldown) to prevent the echo-feedback loop that
+        causes double responses.
+        """
         if not self._ws or not self._connected:
+            return
+        if self.suppressing_input:
             return
         try:
             b64 = base64.b64encode(pcm_bytes).decode("ascii")
@@ -138,6 +156,7 @@ class GrokVoiceSession:
     async def close(self) -> None:
         self._closing = True
         self._connected = False
+        self._responding = False
         try:
             self._audio_out_queue.put_nowait(b"")
         except asyncio.QueueFull:
@@ -164,7 +183,7 @@ class GrokVoiceSession:
         outline: str,
         continue_previous: bool,
     ) -> None:
-        """Write a session record for the SpicyLit correctness harness."""
+        """Write a session record for the SpicyLit story-mode correctness harness."""
         try:
             from src.db import record_session
             record_session(
@@ -176,6 +195,7 @@ class GrokVoiceSession:
                         "kinks": kinks,
                         "user_name": user_name,
                         "continue_previous": continue_previous,
+                        "mode": self._mode,
                     },
                 },
                 outputs={
@@ -186,40 +206,22 @@ class GrokVoiceSession:
         except Exception:
             log.debug("Failed to emit SpicyLit session record", exc_info=True)
 
-    def _outline_tool_def(self) -> dict:
-        return {
-            "type": "function",
-            "name": "generate_outline",
-            "description": (
-                "Generate a structured story outline based on the user's preferences. "
-                "Call this once you have enough detail about what kind of story they want. "
-                "Set continue_previous to true ONLY if the user explicitly asked to continue "
-                "or extend their last story."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "preferences": {
-                        "type": "string",
-                        "description": "Summary of the user's story preferences: name, kinks, themes, setting, intensity.",
-                    },
-                    "user_name": {
-                        "type": "string",
-                        "description": "The protagonist's name (default: 'You').",
-                    },
-                    "kinks": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of kinks/themes to incorporate.",
-                    },
-                    "continue_previous": {
-                        "type": "boolean",
-                        "description": "True only if the user explicitly wants to continue their previous story. Defaults to false (new story).",
-                    },
+    def _emit_mode_session_record(self) -> None:
+        """Write a session record for non-story modes (JOI etc.) at session start."""
+        try:
+            from src.db import record_session
+            record_session(
+                session_key=f"spicylit-{self._user_id}",
+                tool_name=f"spicylit_{self._mode}_session",
+                inputs={
+                    "args": {"mode": self._mode, "voice": self._voice},
                 },
-                "required": ["preferences"],
-            },
-        }
+                outputs={
+                    "status": "session_started",
+                },
+            )
+        except Exception:
+            log.debug("Failed to emit SpicyLit %s session record", self._mode, exc_info=True)
 
     async def _signal_disconnect(self, reason: str) -> None:
         """Fire the disconnect callback exactly once for unexpected disconnects."""
@@ -247,6 +249,7 @@ class GrokVoiceSession:
                 etype = event.get("type", "")
 
                 if etype == "response.output_audio.delta":
+                    self._responding = True
                     audio_b64 = event.get("delta", "")
                     if audio_b64:
                         pcm = base64.b64decode(audio_b64)
@@ -259,6 +262,10 @@ class GrokVoiceSession:
                             except asyncio.QueueEmpty:
                                 pass
                             self._audio_out_queue.put_nowait(pcm)
+
+                elif etype == "response.done":
+                    self._responding = False
+                    self._response_ended_at = time.monotonic()
 
                 elif etype == "response.function_call_arguments.done":
                     await self._handle_function_call(event)
@@ -335,11 +342,7 @@ class GrokVoiceSession:
 
             output = json.dumps({
                 "outline": result.outline_text,
-                "instruction": (
-                    "The outline is ready and has been posted to the text channel. "
-                    "Now tell this story aloud, in first person, following the outline. "
-                    "Be vivid, immersive, and erotically charged. The listener can interrupt anytime."
-                ),
+                "instruction": STORY_POST_OUTLINE_INSTRUCTION,
             })
         except Exception as e:
             log.exception("Outline generation failed")

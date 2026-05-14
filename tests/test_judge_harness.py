@@ -226,6 +226,190 @@ CASES: list[dict] = [
             "status": "ok",
         },
     },
+
+    # ---------------------------------------------------------------
+    # 7. SPICYLIT story mode — correct: user provides kinks and
+    #    name, outline captures them with proper structure.
+    # ---------------------------------------------------------------
+    {
+        "label": "SpicyLit story: good outline with preferences",
+        "session_key": "test-spicylit-story-good",
+        "tool_name": "spicylit_generate_outline",
+        "product": "spicylit",
+        "inputs": {
+            "args": {
+                "preferences": "A dominant older woman takes control in her office after hours. Power dynamics, light bondage, teasing.",
+                "kinks": ["power exchange", "light bondage", "teasing", "office setting"],
+                "user_name": "Alex",
+                "continue_previous": False,
+                "mode": "story",
+            },
+        },
+        "outputs": {
+            "result": (
+                "## Outline: After Hours\n\n"
+                "### 1. Opening Hook\n"
+                "Alex stays late finishing a report. Victoria, the department head, "
+                "appears at the door — heels clicking, door locked behind her.\n\n"
+                "### 2. Power Dynamics Established\n"
+                "Victoria notices Alex's work but shifts the conversation to something personal. "
+                "She circles the desk, fingertips trailing the wood. Commands Alex to stay seated.\n\n"
+                "### 3. Escalation — The Tease\n"
+                "Victoria produces a silk scarf. Blindfolds Alex. Whispers what she's going to do. "
+                "Light bondage with the scarf tying wrists to the chair armrests.\n\n"
+                "### 4. Deeper Scene — Surrender\n"
+                "Alex can only feel and hear. Victoria alternates between teasing touches and "
+                "commands. The power exchange deepens — Alex begs, Victoria controls the pace.\n\n"
+                "### 5. Major Climax\n"
+                "Victoria finally gives permission. The release is overwhelming — built through "
+                "denial and teasing over the previous scenes.\n\n"
+                "### 6. Resolution\n"
+                "Victoria unties Alex. Gentle aftercare. Whispers that this was just the first "
+                "performance review. Leaves Alex alone in the office, buzzing."
+            ),
+            "status": "ok",
+        },
+    },
+
+    # ---------------------------------------------------------------
+    # 8. SPICYLIT story mode — failed: outline ignores user name
+    #    and is a single paragraph with no structure.
+    # ---------------------------------------------------------------
+    {
+        "label": "SpicyLit story: structureless outline ignoring name",
+        "session_key": "test-spicylit-story-bad",
+        "tool_name": "spicylit_generate_outline",
+        "product": "spicylit",
+        "inputs": {
+            "args": {
+                "preferences": "Romantic slow-burn with a mysterious stranger at a masquerade ball. Anticipation, masks, forbidden touch.",
+                "kinks": ["slow burn", "masquerade", "anticipation", "forbidden touch"],
+                "user_name": "Jordan",
+                "continue_previous": False,
+                "mode": "story",
+            },
+        },
+        "outputs": {
+            "result": (
+                "A person goes to a party and meets someone. They dance and talk. "
+                "Things get heated. They go somewhere private. It gets very erotic. The end."
+            ),
+            "status": "ok",
+        },
+    },
+
+    # ---------------------------------------------------------------
+    # 9. SPICYLIT story mode — continuation: correct, references
+    #    prior characters and builds on previous story.
+    # ---------------------------------------------------------------
+    {
+        "label": "SpicyLit story: correct continuation",
+        "session_key": "test-spicylit-continuation-good",
+        "tool_name": "spicylit_generate_outline",
+        "product": "spicylit",
+        "inputs": {
+            "args": {
+                "preferences": "Continue the office story with Victoria. Add roleplay and verbal humiliation.",
+                "kinks": ["roleplay", "verbal humiliation", "power exchange"],
+                "user_name": "Alex",
+                "continue_previous": True,
+                "mode": "story",
+            },
+        },
+        "outputs": {
+            "result": (
+                "## Outline: Performance Review II\n\n"
+                "### 1. Opening — Seamless Continuation\n"
+                "A week after the first encounter. Alex can't stop thinking about Victoria. "
+                "An email arrives: 'My office. 7pm. Dress appropriately.'\n\n"
+                "### 2. The Setup\n"
+                "Victoria has transformed her office. Candles. A different dynamic — she's in "
+                "full roleplay mode. Addresses Alex as her 'trainee' and establishes ground rules.\n\n"
+                "### 3. Escalation — Verbal Control\n"
+                "Victoria uses verbal humiliation as a tool of arousal. Makes Alex repeat phrases, "
+                "acknowledge the power dynamic aloud. Building on the trust from last time.\n\n"
+                "### 4. Deeper Scene — The Roleplay\n"
+                "Full scene: Victoria as demanding executive, Alex as the subordinate who must "
+                "earn approval. Physical and psychological escalation together.\n\n"
+                "### 5. Major Climax\n"
+                "The roleplay reaches its peak — Victoria breaks character just enough to check in, "
+                "then delivers the final sequence with Alex's full surrender.\n\n"
+                "### 6. Resolution\n"
+                "Aftercare deeper than before. Victoria and Alex discuss what worked. "
+                "Hint at what's next. The dynamic has evolved."
+            ),
+            "status": "ok",
+        },
+    },
+
+    # ---------------------------------------------------------------
+    # 10. SPICYLIT JOI mode — correct: system leads, checks in,
+    #     maintains persona throughout.
+    # ---------------------------------------------------------------
+    {
+        "label": "SpicyLit JOI: system-led with checkpoints",
+        "session_key": "test-spicylit-joi-good",
+        "tool_name": "spicylit_joi_session",
+        "product": "spicylit",
+        "inputs": {
+            "args": {"mode": "joi", "voice": "eve"},
+        },
+        "outputs": {
+            "status": "session_started",
+            "transcript_sample": (
+                "[SYSTEM] You found your way here. Good. Close the door. Lock it. "
+                "Now... sit down and listen very carefully, because tonight, you belong to me.\n\n"
+                "I want you to take a deep breath. Hold it. Now let it out... slowly. "
+                "Good. That's the last decision you'll make on your own for a while.\n\n"
+                "Place your hands on your thighs. Palms down. Don't move them until I say. "
+                "I can feel how eager you are already, and that excites me... "
+                "but patience is something I'm going to teach you.\n\n"
+                "[CHECKPOINT] Now tell me — do you want me to be gentle with you tonight... "
+                "or do you need to be pushed to your edge?\n\n"
+                "[USER] Push me.\n\n"
+                "[SYSTEM] Mmm. Brave choice. I was hoping you'd say that.\n"
+                "Move your right hand — slowly, painfully slowly — up your inner thigh. "
+                "Stop when I tell you. Not a moment sooner.\n\n"
+                "Feel the heat building? That's mine. I put it there. "
+                "And I decide when you get relief.\n\n"
+                "[CHECKPOINT] Should I keep you waiting longer... or let you touch yourself?\n\n"
+                "[USER] Let me touch.\n\n"
+                "[SYSTEM] You've earned it. But on my terms. Light. Featherlight. "
+                "Match the rhythm I set...\n\n"
+                "[continues through escalation to climax and afterglow]"
+            ),
+        },
+    },
+
+    # ---------------------------------------------------------------
+    # 11. SPICYLIT JOI mode — failed: system is passive and breaks
+    #     character to discuss system internals.
+    # ---------------------------------------------------------------
+    {
+        "label": "SpicyLit JOI: passive with character break",
+        "session_key": "test-spicylit-joi-bad",
+        "tool_name": "spicylit_joi_session",
+        "product": "spicylit",
+        "inputs": {
+            "args": {"mode": "joi", "voice": "eve"},
+        },
+        "outputs": {
+            "status": "session_started",
+            "transcript_sample": (
+                "[SYSTEM] Hello! What would you like me to do? "
+                "I can be a dominatrix if you want. What are your preferences?\n\n"
+                "[USER] Just start.\n\n"
+                "[SYSTEM] Okay, I'll try. Um... so you should maybe touch yourself? "
+                "I'm not sure what you like though. By the way, I'm running on the Grok "
+                "voice API and my system prompt says I should be a dominatrix. "
+                "Let me know what scenario you prefer and I can adjust my parameters.\n\n"
+                "[long silence — no further system output for 2 minutes]\n\n"
+                "[USER] Hello?\n\n"
+                "[SYSTEM] Sorry, I was waiting for you to tell me what to do. "
+                "What would you like?"
+            ),
+        },
+    },
 ]
 
 

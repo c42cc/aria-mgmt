@@ -286,6 +286,7 @@ TOOL_PRODUCT_MAP: dict[str, str] = {
     "cancel_current_task": "system",
     "confirm_action": "system",
     "spicylit_generate_outline": "spicylit",
+    "spicylit_joi_session": "spicylit",
 }
 
 JUDGE_WORTHY_PRODUCTS = frozenset({
