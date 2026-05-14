@@ -21,10 +21,11 @@ The headline use case is voice-driven software development: describe a problem
 out loud, hear a plan, approve it, hear the build narrate itself, get the diff
 in a text channel. But the same shell handles general assistant work via MCP.
 
-The whole system is **one Python process on the user's Mac, supervised by
-launchd**, plus a small number of subprocess sidecars for what Python cannot
-own directly. There is no agent framework, no orchestrator, no meta-router.
-The loop is readable end-to-end in `src/bot.py`.
+The whole system is **one Python process on the user's Mac**, plus a small
+number of subprocess sidecars for what Python cannot own directly. launchd
+can supervise it; `deploy.sh` is the production launch path; `make run` is
+the development path. There is no agent framework, no orchestrator, no
+meta-router. The loop is readable end-to-end in `src/bot.py`.
 
 ---
 
@@ -195,6 +196,12 @@ Three concrete patterns sit behind the tool dispatch:
   persona to the Cursor SDK in a project working directory; stream the
   resulting events back into Discord and into Gemini's context.
 
+When `UCS_ENABLED=true`, the first two patterns are served by the UCS
+Intelligence Loop (`src/ucs.py`) instead of direct Anthropic calls. The
+loop supports model hot-swapping per step, context budget management, and
+a configurable iteration cap. The Cursor agent path is unchanged. Both
+paths write to the `loop_executions` table for observability.
+
 ### State
 
 Three flat stores, listed in Primitives. None of them are abstracted behind
@@ -301,7 +308,9 @@ points; cross-references inside the code are reliable.
 | The Mac-local loop (no Discord) | `src/local_voice.py` |
 | The boot health checks | `src/preflight.py` |
 | Bootstrap a fresh machine | `ops/bootstrap.sh` |
-| Run the bot (the only blessed way) | `make run` |
+| Run (development — foreground, simple kill) | `make run` via `Makefile` |
+| Deploy (production — git push, restart, smoke test) | `deploy.sh` |
+| Kill all processes (launchd-aware) | `kill.sh` |
 | launchd unit | `ops/com.you.voicebot.plist` |
 
 ### Layers
@@ -314,6 +323,9 @@ points; cross-references inside the code are reliable.
 | Conversational session (default) | `src/gemini_session.py` |
 | Conversational session (SpicyLit) | `capabilities/spicy_lit/grok_voice.py` |
 | Tool dispatch & tool implementations | `src/tools.py` |
+| UCS intelligence loop + model router | `src/ucs.py` (active when `UCS_ENABLED=true`) |
+| UCS evaluation layer (offline CLI) | `src/eval.py` |
+| Product correctness harness | `src/judge.py` + `specs/correctness/` |
 | MCP client and dispatch | `src/mcp.py` |
 | Cursor bridge (Python side) | `src/cursor_bridge.py` |
 | Cursor bridge (Node sidecar) | `cursor_wrapper/index.js` |
@@ -321,6 +333,7 @@ points; cross-references inside the code are reliable.
 | Structured state | `src/db.py` + `data/state.db` |
 | Audit log | `src/mcp.py` (writer) + `data/audit.jsonl` |
 | Configuration | `src/config.py` + `.env` |
+| Model registry | `models.yaml` |
 
 ### Editable behavior
 
@@ -332,6 +345,7 @@ points; cross-references inside the code are reliable.
 | Claude general-agent persona | `prompts/do_with_claude_system.md` |
 | Build target paths | `projects/registry.md` |
 | Saved workflows | `workflows/` |
+| Model registry + loop profiles | `models.yaml` |
 
 ### Capabilities
 
@@ -347,6 +361,7 @@ points; cross-references inside the code are reliable.
 | Smoke tests (cheap, no API calls) | `tests/smoke.py` |
 | Deep integration (real API round-trips) | `tests/deep_integration.py` |
 | One-shot machine setup | `ops/bootstrap.sh` |
+| Dependency install (venv + npm) | `ops/install.sh` |
 | macOS permissions helper | `ops/grant_permissions.sh` |
 | Swift binary build for Apple MCP | `ops/build_macos_swift.sh` |
 | Google OAuth bootstrap | `ops/google_oauth_bootstrap.py` |
@@ -358,6 +373,7 @@ points; cross-references inside the code are reliable.
 | Structured state DB | `data/state.db` |
 | Memory vector store | `data/mem0/` |
 | MCP call audit | `data/audit.jsonl` |
+| Correctness verdicts | `data/verdicts.ndjson` |
 | Stale-launch sentinel | `data/.preflight_boot_sha` |
 
 ---
@@ -417,7 +433,14 @@ one of these, treat that as a bug, not a feature.
     the Mac. The bot runs on the Mac. There is no remote worker, no PC
     handoff, no GPU dependency.
 
-12. **`make run` is the only correct way to launch.** It kills any prior
-    instance, reinstalls the package in editable mode, then re-launches.
-    This is how the preflight "running code matches source" probe stays
-    honest.
+12. **Both launch paths ensure fresh code.** `make run` (development) and
+    `deploy.sh` (production) both reinstall the package in editable mode
+    before launching, so the running code always matches the source on
+    disk. The preflight `running_code` probe verifies this at boot.
+
+13. **User voice edits to prompts always win.** The eval layer advises; it
+    does not override. When a user tunes a prompt by voice through the
+    Universal Constructor loop, that edit is the new ground truth. The eval
+    layer may flag that a user edit degraded a score, but it must never
+    automatically roll back or overwrite a user-initiated change. Trust in
+    the system depends on this guarantee.

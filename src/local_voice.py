@@ -16,6 +16,7 @@ from .config import config
 from .cursor_bridge import CursorBridge
 from .db import init_db, update_cursor_session_event, upsert_cursor_session
 from .gemini_session import GeminiSession
+from .local_audio import INPUT_RATE, OUTPUT_RATE, INPUT_BLOCK, OUTPUT_BLOCK
 from .memory import init_memory
 
 logging.basicConfig(
@@ -24,12 +25,6 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger("local_voice")
-
-# Gemini Live audio formats: 16-bit signed PCM, mono, little-endian
-INPUT_RATE = 16000   # Gemini expects 16 kHz mono PCM
-OUTPUT_RATE = 24000  # Gemini emits 24 kHz mono PCM
-INPUT_BLOCK = 1600   # 100 ms at 16 kHz
-OUTPUT_BLOCK = 480   # 20 ms at 24 kHz (lower playback latency)
 
 
 # ---------------------------------------------------------------------------

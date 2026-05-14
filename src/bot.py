@@ -16,6 +16,7 @@ from .cursor_bridge import CursorBridge
 from .db import init_db, get_daily_spend, log_event, upsert_cursor_session, update_cursor_session_event
 from .discord_voice import voice_bridge
 from .gemini_session import GeminiSession
+from .local_audio import SpeakerOutput
 from .memory import init_memory, remember, recall
 
 logging.basicConfig(
@@ -50,11 +51,108 @@ _grok_session_started_at: float = 0.0
 _grok_paused: bool = False
 
 _pending_voice_channel_id: str | None = None
+_in_discord_voice: bool = False
+
+_wake_listener = None          # WakeWordListener | None (typed loosely to avoid import at module level)
+_local_speaker: SpeakerOutput | None = None
+_local_session_active: bool = False
+_local_silence_task: asyncio.Task | None = None
 
 IDLE_TIMEOUT_SEC = 25
 GROK_IDLE_TIMEOUT_SEC = 25
 GROK_COST_PER_MINUTE = 0.05
 VOICE_EXIT_TIMEOUT_SEC = 600  # leave voice after 10 min of total silence
+LOCAL_SILENCE_TIMEOUT_SEC = 8  # close local voice session after 8s idle
+
+
+# ---------------------------------------------------------------------------
+# Local voice session (wake word → Gemini via Mac mic/speakers)
+# ---------------------------------------------------------------------------
+
+async def _on_wake_word() -> None:
+    """Called by WakeWordListener when the wake word is detected."""
+    global _local_session_active, _local_speaker, _local_silence_task
+
+    if _local_session_active:
+        return
+    if _in_discord_voice:
+        log.debug("Wake word heard but Discord voice is active — ignoring")
+        return
+    if not gemini:
+        log.warning("Wake word heard but Gemini not constructed yet")
+        return
+
+    log.info("Wake word detected — opening local Gemini session")
+    _local_session_active = True
+
+    if _wake_listener:
+        _wake_listener.pause()
+
+    try:
+        if not gemini.connected:
+            await gemini.connect()
+    except Exception:
+        log.exception("Failed to connect Gemini on wake word")
+        _local_session_active = False
+        if _wake_listener:
+            _wake_listener.resume()
+        return
+
+    if _wake_listener:
+        _wake_listener.set_forward_callback(gemini.send_audio)
+
+    _local_speaker = SpeakerOutput()
+    _local_speaker.start(gemini)
+
+    _local_silence_task = asyncio.create_task(
+        _local_silence_watchdog(), name="local_silence_wd"
+    )
+    log.info("Local voice session active")
+
+
+async def _local_silence_watchdog() -> None:
+    """Close local session after LOCAL_SILENCE_TIMEOUT_SEC of no Gemini output."""
+    try:
+        await asyncio.sleep(3)
+        while _local_session_active:
+            await asyncio.sleep(2)
+            if _local_speaker and _local_speaker.last_output_at > 0:
+                idle = time.monotonic() - _local_speaker.last_output_at
+                if idle > LOCAL_SILENCE_TIMEOUT_SEC:
+                    break
+    except asyncio.CancelledError:
+        return
+
+    log.info("%ds silence — closing local voice session", LOCAL_SILENCE_TIMEOUT_SEC)
+    await _close_local_session()
+
+
+async def _close_local_session() -> None:
+    global _local_session_active, _local_speaker, _local_silence_task
+
+    _local_session_active = False
+
+    if _wake_listener:
+        _wake_listener.set_forward_callback(None)
+
+    if _local_speaker:
+        await _local_speaker.stop()
+        _local_speaker = None
+
+    if gemini and gemini.connected:
+        try:
+            await gemini.close()
+        except Exception:
+            log.exception("Error closing Gemini after local session")
+
+    if _local_silence_task and not _local_silence_task.done():
+        _local_silence_task.cancel()
+    _local_silence_task = None
+
+    if _wake_listener:
+        _wake_listener.resume()
+
+    log.info("Local voice session closed — wake word listening resumed")
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +334,7 @@ async def _voice_exit_watchdog_task() -> None:
     already paused and triggers a full disconnect from the voice channel.
     """
     global _spicylit_active, _grok_session, _session_paused, _grok_paused
-    global _pause_transcript, _last_user_activity_at
+    global _pause_transcript, _last_user_activity_at, _in_discord_voice
     try:
         while True:
             await asyncio.sleep(30)
@@ -247,6 +345,7 @@ async def _voice_exit_watchdog_task() -> None:
                 continue
 
             log.info("%.0fs silence — auto-leaving voice channel", idle)
+            _in_discord_voice = False
 
             current = asyncio.current_task()
             for task in _audio_tasks:
@@ -304,14 +403,19 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
     """
     global _spicylit_active, _grok_session, _grok_session_started_at
     global _last_audio_received_at, _last_user_activity_at
+    global _in_discord_voice
 
     if not voice_bridge.alive:
         log.warning("Asked to auto-join %s but voice bridge not alive", channel.name)
         return
 
+    if _local_session_active:
+        await _close_local_session()
+
     log.info("Auto-joining voice channel %s", channel.name)
     voice_bridge.register_audio_callback(_on_voice_audio)
     await voice_bridge.join(str(channel.id))
+    _in_discord_voice = True
 
     _last_audio_received_at = 0.0
     _last_user_activity_at = time.monotonic()
@@ -363,14 +467,20 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
         _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
         _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
 
+        # Inject join context with turn_complete=False so Gemini knows the
+        # user just joined but does NOT auto-speak a greeting. The user's
+        # first utterance is the only thing that should trigger Aria's first
+        # spoken turn. A `turn_complete=True` greeting here used to collide
+        # with the user's first request (Gemini queued both turns) and
+        # produced the "double response" the user reported.
         if gemini and gemini.connected:
             try:
                 await gemini.inject_text(
-                    "Corbin just joined the voice channel. Greet him naturally.",
-                    turn_complete=True,
+                    "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]",
+                    turn_complete=False,
                 )
             except Exception:
-                log.exception("Failed to inject greeting into Gemini")
+                log.exception("Failed to inject join context into Gemini")
 
 
 def _find_authorized_user_voice_channel() -> discord.VoiceChannel | None:
@@ -469,6 +579,9 @@ async def on_ready():
 
     gemini = GeminiSession(tool_handler=_handle_tool_call)
 
+    from .tools import set_transcript_provider
+    set_transcript_provider(lambda: gemini.get_recent_transcript(3) if gemini else [])
+
     # Bring up MCP and run preflight *before* declaring ready
     from .mcp import init_mcp
     mcp = None
@@ -519,6 +632,17 @@ async def on_ready():
 
     log.info("Preflight passed (%d probes). Gemini will connect on !join.", len(report.results))
 
+    # Start wake-word listener for local Mac voice
+    global _wake_listener
+    try:
+        from .wake_word import WakeWordListener
+        _wake_listener = WakeWordListener(on_wake=_on_wake_word)
+        await _wake_listener.start()
+        log.info("Wake-word listener active")
+    except Exception:
+        log.exception("Wake-word listener failed to start — local voice unavailable")
+        _wake_listener = None
+
     target_channel: discord.VoiceChannel | None = None
 
     if _pending_voice_channel_id:
@@ -544,7 +668,7 @@ async def on_ready():
 @bot.command()
 async def join(ctx: commands.Context):
     """Join the voice channel and start Gemini session."""
-    global _last_audio_received_at, _last_user_activity_at
+    global _last_audio_received_at, _last_user_activity_at, _in_discord_voice
 
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
@@ -562,8 +686,12 @@ async def join(ctx: commands.Context):
         await ctx.send("Voice bridge not running — check DISCORD_VOICE_BOT_TOKEN.")
         return
 
+    if _local_session_active:
+        await _close_local_session()
+
     voice_bridge.register_audio_callback(_on_voice_audio)
     await voice_bridge.join(str(ctx.author.voice.channel.id))
+    _in_discord_voice = True
     await ctx.send(f"Joined {ctx.author.voice.channel.name}")
 
     if gemini and not gemini.connected:
@@ -580,9 +708,11 @@ async def join(ctx: commands.Context):
 @bot.command()
 async def leave(ctx: commands.Context):
     """Leave voice channel and close Gemini session."""
+    global _in_discord_voice
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
         return
+    _in_discord_voice = False
     _cancel_audio_tasks()
     if gemini and gemini.connected:
         await gemini.close()
@@ -640,6 +770,24 @@ async def status(ctx: commands.Context):
             parts.append("**MCP servers:** not initialized")
     except ImportError:
         parts.append("**MCP servers:** module not loaded")
+
+    try:
+        from .db import get_correctness_summary
+        summary = get_correctness_summary(hours=24)
+        if summary:
+            lines = ["**Correctness (24h):**"]
+            for product, stats in sorted(summary.items()):
+                rate = stats["correctness_rate"]
+                total = stats["total"]
+                lines.append(
+                    f"  {product}: {rate:.0%} ({stats['correct']}/{total} correct, "
+                    f"{stats['failed']} failed)"
+                )
+            parts.append("\n".join(lines))
+        else:
+            parts.append("**Correctness:** no verdicts in last 24h")
+    except Exception:
+        parts.append("**Correctness:** unavailable")
 
     await ctx.send("\n".join(parts))
 
@@ -863,7 +1011,7 @@ async def on_voice_state_update(
     """Auto-join when the authorized user enters voice; clean up when they leave."""
     global _spicylit_active, _grok_session
     global _session_paused, _grok_paused, _pause_transcript
-    global _last_user_activity_at, _pending_voice_channel_id
+    global _last_user_activity_at, _pending_voice_channel_id, _in_discord_voice
     if str(member.id) not in config.authorized_user_ids:
         return
 
@@ -887,6 +1035,7 @@ async def on_voice_state_update(
 
     elif left_channel:
         log.info("Authorized user left voice — cleaning up")
+        _in_discord_voice = False
         _session_paused = False
         _grok_paused = False
         _pause_transcript = ""

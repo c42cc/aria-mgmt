@@ -157,9 +157,63 @@ TOOL_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="rollback_prompt",
+        description="Restore a prompt template to a previous version. Use when the user wants to undo a prompt edit. Call prompt_versions first to see available versions.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "name": types.Schema(type="STRING", description="Template name to rollback."),
+                "version": types.Schema(type="INTEGER", description="Version number to restore."),
+            },
+            required=["name", "version"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="prompt_versions",
+        description="List all saved versions of a prompt template. Shows version numbers, when they were created, and how they originated (user edit, rollback, etc). Use before rollback_prompt.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "name": types.Schema(type="STRING", description="Template name to show history for."),
+            },
+            required=["name"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="reload_prompts",
         description="Clear the prompt cache and reconnect your session so changes to your system prompt take effect immediately. Call after editing gemini_system. For other prompts, changes take effect on next use automatically.",
         parameters=types.Schema(type="OBJECT", properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="get_focused_app",
+        description="Get the name and bundle ID of the frontmost Mac application. Use to check what app is currently focused before pasting.",
+        parameters=types.Schema(type="OBJECT", properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="focus_app",
+        description="Bring a Mac application to the front. Use when the user wants to paste into a specific app that isn't currently focused.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "app_name": types.Schema(type="STRING", description="Application name (e.g. 'Cursor', 'Notes', 'TextEdit', 'Slack')."),
+            },
+            required=["app_name"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="dictate_into_focused_app",
+        description=(
+            "Type text into the frontmost Mac application by copying to clipboard and pasting. "
+            "Use when the user says 'put this in', 'type into', 'paste into', or 'dictate into' an app. "
+            "Call focus_app first if the target app is not already focused."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "text": types.Schema(type="STRING", description="The text to paste into the focused application."),
+            },
+            required=["text"],
+        ),
     ),
 ]
 
@@ -251,6 +305,14 @@ class GeminiSession:
             return ""
         lines = [f"{e.role}: {e.text}" for e in recent if e.text]
         return "\n".join(lines)
+
+    def get_recent_transcript(self, max_turns: int = 3) -> list[dict[str, str]]:
+        """Structured recent transcript for session record capture."""
+        return [
+            {"role": e.role, "text": e.text}
+            for e in list(self._transcript_buffer)[-max_turns:]
+            if e.text
+        ]
 
     async def wait_for_confirmation(self, action_id: str, timeout: float = 60.0) -> dict:
         """Wait for a confirm_action tool call with the given action_id."""

@@ -156,6 +156,36 @@ class GrokVoiceSession:
             self._ws = None
         log.info("Grok Voice session closed")
 
+    def _emit_session_record(
+        self,
+        preferences: str,
+        kinks: list[str],
+        user_name: str,
+        outline: str,
+        continue_previous: bool,
+    ) -> None:
+        """Write a session record for the SpicyLit correctness harness."""
+        try:
+            from src.db import record_session
+            record_session(
+                session_key=f"spicylit-{self._user_id}",
+                tool_name="spicylit_generate_outline",
+                inputs={
+                    "args": {
+                        "preferences": preferences,
+                        "kinks": kinks,
+                        "user_name": user_name,
+                        "continue_previous": continue_previous,
+                    },
+                },
+                outputs={
+                    "result": outline[:10_000],
+                    "status": "ok",
+                },
+            )
+        except Exception:
+            log.debug("Failed to emit SpicyLit session record", exc_info=True)
+
     def _outline_tool_def(self) -> dict:
         return {
             "type": "function",
@@ -288,6 +318,14 @@ class GrokVoiceSession:
                 outline=result.outline_text,
                 kinks=result.kinks,
                 user_name=result.user_name,
+            )
+
+            self._emit_session_record(
+                preferences=preferences,
+                kinks=kinks,
+                user_name=user_name,
+                outline=result.outline_text,
+                continue_previous=continue_previous,
             )
 
             if self._post_text:

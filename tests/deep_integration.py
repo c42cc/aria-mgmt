@@ -173,7 +173,49 @@ async def run():
         await post(sess, headers, f"**[11] Daily spend:** {s11} (${spend:.4f})")
         print(f"  {s11}")
 
-        await post(sess, headers, "---\n**All 11 deep tests complete.**")
+        # 12. loop_executions row after plan_with_claude
+        print("[12] loop_executions after plan...")
+        from src.db import get_connection
+        with get_connection() as conn:
+            row12 = conn.execute(
+                "SELECT * FROM loop_executions WHERE tool_name = 'plan_with_claude' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row12 and row12["tokens_in"] and row12["tokens_in"] > 0 and row12["cost_usd"] and row12["cost_usd"] > 0:
+            s12 = f"PASS (tokens_in={row12['tokens_in']}, cost=${row12['cost_usd']:.4f})"
+        else:
+            s12 = f"FAIL (row={dict(row12) if row12 else None})"
+        await post(sess, headers, f"**[12] loop_executions after plan:** {s12}")
+        print(f"  {s12}")
+
+        # 13. prompt_versions row after edit_prompt
+        print("[13] prompt_versions after edit...")
+        from src.prompts import save_template, get_versions, get_path, read_raw
+        test_name = "_deep_test_prompt"
+        test_path = get_path(test_name)
+        try:
+            with open(test_path, "w") as f:
+                f.write("deep test original content")
+            r13 = await handle_tool_call(
+                "edit_prompt",
+                {"name": test_name, "instruction": "Add the word VERIFIED at the top."},
+            )
+            versions = get_versions(test_name)
+            if versions and len(versions) >= 1:
+                s13 = f"PASS ({len(versions)} version(s), origin={versions[0].get('origin')})"
+            else:
+                s13 = f"FAIL (versions={versions})"
+        except Exception as e:
+            s13 = f"FAIL ({e})"
+        finally:
+            if os.path.exists(test_path):
+                os.unlink(test_path)
+            with get_connection() as conn:
+                conn.execute("DELETE FROM prompt_versions WHERE prompt_name = ?", (test_name,))
+        await post(sess, headers, f"**[13] prompt_versions after edit:** {s13}")
+        print(f"  {s13}")
+
+        await post(sess, headers, "---\n**All 13 deep tests complete.**")
         print("\nDone.")
 
         await mcp.stop_all()

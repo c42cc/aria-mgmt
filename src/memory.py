@@ -44,7 +44,7 @@ def init_memory() -> None:
             },
         },
     })
-    log.info("mem0 initialized (Anthropic LLM + HuggingFace embedder)")
+    log.info("mem0 initialized (Anthropic LLM + Gemini embedder)")
 
 
 def remember(text: str, user_id: str = "default") -> None:

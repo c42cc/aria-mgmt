@@ -110,7 +110,7 @@ own pipelines.
 
 ## Python style
 
-- Python 3.11+. Type hints throughout (`from __future__ import annotations`
+- Python 3.12. Type hints throughout (`from __future__ import annotations`
   is already the convention).
 - One module per concern. Names match the layer in `ARCHITECTURE.md`.
 - Async by default. Blocking I/O wrapped in `asyncio.to_thread` when needed
@@ -128,9 +128,9 @@ own pipelines.
   compiled against the 1.x ABI; numpy>=2 crashes at import.
 - **Gemini Live is an async context manager**, not an awaitable. The bridge
   uses `__aenter__` / `__aexit__` directly.
-- **`make run` is the only correct way to launch.** It kills the prior
-  instance and reinstalls in editable mode, so the running code always
-  matches the source on disk. The `running_code` preflight probe asserts
+- **Both launch paths ensure fresh code.** `make run` (development) and
+  `deploy.sh` (production) both reinstall in editable mode, so the running
+  code always matches source. The `running_code` preflight probe verifies
   this with a SHA sentinel.
 
 ## Don't substitute models

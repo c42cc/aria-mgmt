@@ -370,7 +370,7 @@ Each store is touched by a small, named set of writers.
 
 | Table | Writers | Read by |
 |---|---|---|
-| `cursor_sessions` | `tools._build_with_cursor`, `bot._cursor_event_consumer`, `tools._cursor_status` | `tools._cursor_status`, status command |
+| `cursor_sessions` | `tools._build_with_cursor`, `bot._cursor_event_consumer` | `tools._cursor_status`, status command |
 | `events` | `tools.handle_tool_call`, Claude call sites, `bot._log_grok_cost`, `preflight.probe_db` | `db.get_daily_spend`, status command |
 | `planning_history` | `tools._plan_with_claude` | `tools._plan_with_claude` |
 | `discord_threads` | (reserved for future thread<>session bindings) | — |
@@ -397,10 +397,10 @@ How each subsystem fails, and what the system does about it.
 |---|---|---|
 | Gemini Live WebSocket | Drops mid-session | Receive loop catches the exception, exponential backoff, reconnect, replay short transcript as background context. |
 | Anthropic API | Network or model error | Tool returns a JSON `error`; Gemini speaks the error; the user can retry. |
-| Cursor wrapper | Subprocess dies | All pending futures resolve with `CursorBridgeError`; event consumers drain. Bridge is not auto-restarted; `make run` cycles it. |
+| Cursor wrapper | Subprocess dies | All pending futures resolve with `CursorBridgeError`; event consumers drain. Bridge is not auto-restarted; restarting the parent (`make run` or `deploy.sh`) cycles it. |
 | Discord voice sidecar | Subprocess exits | Reader logs the exit; `!join` will fail noisily until the parent is restarted. |
 | MCP server | Server crashes | The catalog entry is still present but calls return an error; `health_check` shows it as down; preflight on rerun catches it. |
-| Stale launch | Source on disk drifted from running process | Preflight `running_code` probe fails warn-level; `make run` is the fix and is mechanical. |
+| Stale launch | Source on disk drifted from running process | Preflight `running_code` probe fails warn-level; restarting via `make run` or `deploy.sh` is the fix. |
 | Dependency drift | numpy>=2, discord.py instead of py-cord, etc. | `dep_drift` probe fails critical with the fix command. |
 | Cost ceiling | Daily cap reached | Dispatcher returns an error for paid tools; read-only and control tools still work. |
 
@@ -409,8 +409,9 @@ How each subsystem fails, and what the system does about it.
 ## Shutdown
 
 `bot.run(...)` returns when py-cord exits. The bot does not currently have a
-graceful shutdown path on SIGTERM; launchd kills the process and the OS
-reaps the sidecars. The next launch starts cleanly because:
+graceful shutdown path on SIGTERM; `kill.sh` (or launchd) terminates the
+process tree and the OS reaps the sidecars. The next launch starts cleanly
+because:
 
 - SQLite is WAL with `busy_timeout`.
 - mem0 stores files atomically.

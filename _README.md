@@ -43,14 +43,17 @@ ucs/
 │   ├── bot.py              # Main entry point
 │   ├── discord_voice.py    # Voice channel I/O, PCM resampling
 │   ├── gemini_session.py   # Gemini Live WebSocket + function calls
-│   ├── tools.py            # Four tool implementations
+│   ├── tools.py            # Tool implementations + UCS dispatch
+│   ├── ucs.py              # UCS Intelligence Loop, Model Router (UCS_ENABLED=true)
+│   ├── eval.py             # Offline prompt evaluation CLI
 │   ├── cursor_bridge.py    # Python ↔ Node subprocess bridge
 │   ├── memory.py           # mem0 wrapper
 │   ├── db.py               # SQLite schema + queries
-│   ├── prompts.py          # Prompt template loader
+│   ├── prompts.py          # Prompt template loader + versioning
 │   └── config.py           # Env loading, defaults
 ├── cursor_wrapper/         # Node.js bridge to @cursor/sdk
-├── prompts/                # Markdown prompt templates
+├── prompts/                # Markdown prompt templates (versioned)
+├── models.yaml             # Model registry (costs, capabilities, keys)
 ├── projects/               # Project registry
 ├── workflows/              # Saved workflow descriptions
 ├── data/                   # Local state (gitignored)

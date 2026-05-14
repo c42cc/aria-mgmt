@@ -291,8 +291,7 @@ async def probe_cursor_bridge(cursor_bridge: Any) -> tuple[bool, str, str, str]:
             return False, f"ping returned: {result}", "", ""
         return True, "", "", f"pid={cursor_bridge._process.pid} ping ok"
     except AttributeError:
-        # ping not yet implemented — bridge alive is acceptable signal
-        return True, "", "", f"pid={cursor_bridge._process.pid} (ping action not available)"
+        return False, "cursor_bridge.ping() not implemented", "Update cursor_wrapper to support ping", ""
     except asyncio.TimeoutError:
         return False, "ping timed out after 5s", "", ""
 
@@ -386,6 +385,51 @@ async def probe_running_code() -> tuple[bool, str, str, str]:
     return True, "", "", f"sha={current_sha}"
 
 
+async def probe_wake_word_model() -> tuple[bool, str, str, str]:
+    """OpenWakeWord model loads without error."""
+    try:
+        from openwakeword.model import Model
+        m = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+        return True, "", "", f"loaded hey_jarvis, {len(m.models)} model(s)"
+    except ImportError:
+        return (
+            False,
+            "openwakeword not installed",
+            ".venv/bin/pip install -e .",
+            "",
+        )
+    except Exception as exc:
+        return (
+            False,
+            f"wake word model failed to load: {exc}",
+            ".venv/bin/pip install openwakeword>=0.6",
+            "",
+        )
+
+
+async def probe_accessibility() -> tuple[bool, str, str, str]:
+    """macOS Accessibility permission works (needed for keystroke paste)."""
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e",
+        'tell application "System Events" to get name of first process whose frontmost is true',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = stderr.decode().strip()
+        if "-1743" in err or "not allowed assistive access" in err.lower():
+            return (
+                False,
+                "Accessibility permission denied for System Events",
+                "System Settings → Privacy & Security → Accessibility → grant your terminal app",
+                err[:200],
+            )
+        return False, f"osascript failed: {err[:200]}", "", ""
+    app_name = stdout.decode().strip()
+    return True, "", "", f"frontmost={app_name}"
+
+
 async def probe_prompts() -> tuple[bool, str, str, str]:
     """All prompt templates load without falling back."""
     from .prompts import load_template
@@ -406,6 +450,87 @@ async def probe_prompts() -> tuple[bool, str, str, str]:
             return False, f"template '{name}' suspiciously short ({len(text)} chars)", "", ""
         sizes[name] = len(text)
     return True, "", "", json.dumps(sizes)
+
+
+async def probe_models_yaml() -> tuple[bool, str, str, str]:
+    """models.yaml exists, parses, and all referenced api_key_env vars are set."""
+    from .config import config
+    import yaml
+
+    path = config.models_config
+    if not os.path.exists(path):
+        return False, f"models.yaml not found at {path}", "Create models.yaml in project root", ""
+
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except Exception as exc:
+        return False, f"models.yaml parse error: {exc}", "Fix YAML syntax in models.yaml", ""
+
+    if not isinstance(data, dict) or "models" not in data:
+        return False, "models.yaml missing top-level 'models' key", "", ""
+
+    models = data["models"]
+    missing_keys: list[str] = []
+    for name, spec in models.items():
+        if not isinstance(spec, dict):
+            continue
+        env_var = spec.get("api_key_env", "")
+        if env_var and not os.getenv(env_var):
+            if spec.get("note") and "not available" in spec["note"].lower():
+                continue
+            missing_keys.append(f"{name}: ${env_var}")
+
+    if missing_keys:
+        return (
+            False,
+            f"API keys not set for: {', '.join(missing_keys)}",
+            "Set missing keys in .env",
+            f"{len(models)} models, {len(missing_keys)} missing keys",
+        )
+
+    return True, "", "", f"{len(models)} models, all keys present"
+
+
+async def probe_loop_tables() -> tuple[bool, str, str, str]:
+    """prompt_versions and loop_executions tables exist and accept writes."""
+    from .db import get_connection
+
+    try:
+        with get_connection() as conn:
+            conn.execute("SELECT COUNT(*) FROM prompt_versions")
+            conn.execute("SELECT COUNT(*) FROM loop_executions")
+    except Exception as exc:
+        return False, f"UCS tables missing or broken: {exc}", "Restart bot to re-run init_db()", ""
+
+    return True, "", "", "prompt_versions + loop_executions tables OK"
+
+
+async def probe_judge_available() -> tuple[bool, str, str, str]:
+    """Correctness harness: specs exist, tables exist, Gemini Flash reachable."""
+    from .db import get_connection
+    from .judge import SPECS_DIR, load_spec
+
+    issues: list[str] = []
+
+    if not os.path.isdir(SPECS_DIR):
+        issues.append(f"specs directory missing: {SPECS_DIR}")
+    else:
+        specs_found = [f[:-3] for f in os.listdir(SPECS_DIR) if f.endswith(".md")]
+        if not specs_found:
+            issues.append("no correctness spec files found in specs/correctness/")
+
+    try:
+        with get_connection() as conn:
+            conn.execute("SELECT COUNT(*) FROM session_records")
+            conn.execute("SELECT COUNT(*) FROM verdicts")
+    except Exception as exc:
+        issues.append(f"judge tables missing: {exc}")
+
+    if issues:
+        return False, "; ".join(issues), "Restart bot to re-run init_db(), check specs/correctness/", ""
+
+    return True, "", "", f"specs: {', '.join(specs_found)}, tables OK"
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +559,9 @@ async def run_all(
     report.results.append(await _run_probe("running_code", WARN, probe_running_code))
     report.results.append(await _run_probe("prompts", CRITICAL, probe_prompts))
     report.results.append(await _run_probe("db", CRITICAL, probe_db))
+    report.results.append(await _run_probe("models_yaml", WARN, probe_models_yaml))
+    report.results.append(await _run_probe("loop_tables", WARN, probe_loop_tables))
+    report.results.append(await _run_probe("judge_available", WARN, probe_judge_available))
 
     # External APIs
     report.results.append(await _run_probe("anthropic", CRITICAL, probe_anthropic))
@@ -470,6 +598,10 @@ async def run_all(
         report.results.append(
             await _run_probe("cursor_bridge", WARN, lambda: probe_cursor_bridge(cursor_bridge))
         )
+
+    # Wake word + accessibility
+    report.results.append(await _run_probe("wake_word_model", WARN, probe_wake_word_model))
+    report.results.append(await _run_probe("accessibility", WARN, probe_accessibility))
 
     report.finished_at = datetime.now(timezone.utc).isoformat()
     return report

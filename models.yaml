@@ -1,0 +1,71 @@
+# UCS Model Registry
+#
+# Single source of truth for all models the system can use.
+# Phase 1: read by preflight only (validates keys are set).
+# Phase 2: read by ModelRouter when UCS_ENABLED=true.
+#
+# Config precedence:
+#   UCS_ENABLED=false  → .env fields (CLAUDE_MODEL, etc.) are authoritative.
+#   UCS_ENABLED=true   → this file is authoritative for the UCS code path.
+
+models:
+  claude-opus:
+    provider: anthropic
+    model_id: claude-opus-4-6
+    api_key_env: ANTHROPIC_API_KEY
+    capabilities: [reasoning, code, analysis, long-context]
+    cost_per_m_input: 15.0
+    cost_per_m_output: 75.0
+    context_window: 200000
+
+  claude-haiku:
+    provider: anthropic
+    model_id: claude-haiku-3
+    api_key_env: ANTHROPIC_API_KEY
+    capabilities: [fast, cheap, verification, classification]
+    cost_per_m_input: 0.25
+    cost_per_m_output: 1.25
+    context_window: 200000
+
+  gemini-flash:
+    provider: google
+    model_id: gemini-2.5-flash
+    api_key_env: GEMINI_API_KEY
+    capabilities: [fast, cheap, reasoning, extraction]
+    cost_per_m_input: 0.15
+    cost_per_m_output: 0.60
+    context_window: 1000000
+
+  gemini-live:
+    provider: google
+    model_id: gemini-3.1-flash-live-preview
+    api_key_env: GEMINI_API_KEY
+    capabilities: [voice, realtime, function-calling]
+    context_window: 32000
+    note: "Voice-only. Used by GeminiSession. Not available for reasoning tasks."
+
+  cursor:
+    provider: cursor
+    model_id: composer-2
+    api_key_env: CURSOR_API_KEY
+    capabilities: [code-editing, testing]
+    note: "Build layer. Not available for reasoning tasks."
+
+# Phase 2: used by ModelRouter when UCS_ENABLED=true
+defaults:
+  reasoning: claude-opus
+  verification: claude-haiku
+  fast_extraction: gemini-flash
+
+fallback_chains:
+  claude-opus: [gemini-flash]
+  claude-haiku: [gemini-flash]
+  gemini-flash: [claude-haiku]
+
+loop_profiles:
+  planning:
+    max_iterations: 1
+    verification: false
+  agent:
+    max_iterations: 30
+    verification: false

@@ -33,6 +33,8 @@ import {
   StreamType,
   EndBehaviorType,
   VoiceConnectionStatus,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
   entersState,
 } from "@discordjs/voice";
 import prism from "prism-media";
@@ -237,11 +239,45 @@ function setupReceiver(conn) {
   });
 }
 
+// Playback architecture:
+// The discord.js AudioPlayer kills an AudioResource after maxMissedFrames
+// (default 100ms) of no data. The resource then enters silence-padding mode
+// and dies permanently — pushing more PCM into a stream that feeds a dead
+// resource produces no sound. So we rebuild playbackStream + FFmpeg upsampler
+// + AudioResource on every audio burst, and tear them down when the player
+// goes Idle. The player itself stays alive for the lifetime of the voice
+// connection so the "speaking" indicator behaves correctly (only on while
+// Aria is actually producing audio).
 function setupPlayback(conn) {
-  player = createAudioPlayer();
+  player = createAudioPlayer({
+    behaviors: {
+      noSubscriber: NoSubscriberBehavior.Play,
+    },
+  });
   conn.subscribe(player);
 
-  playbackStream = new Readable({ read() {} });
+  player.on(AudioPlayerStatus.Idle, () => {
+    teardownPlaybackStream("player idle");
+  });
+  player.on("error", (e) => {
+    diag("audio player error", { message: e.message });
+    teardownPlaybackStream("player error");
+  });
+}
+
+function teardownPlaybackStream(reason) {
+  if (!playbackStream) return;
+  diag("teardown playback stream", { reason });
+  try { playbackStream.push(null); } catch {}
+  try { playbackStream.destroy(); } catch {}
+  playbackStream = null;
+}
+
+function ensurePlaybackStream() {
+  if (playbackStream) return playbackStream;
+  if (!player || !connection) return null;
+
+  const stream = new Readable({ read() {} });
   const upsampler = new prism.FFmpeg({
     args: [
       "-analyzeduration", "0",
@@ -250,11 +286,28 @@ function setupPlayback(conn) {
       "-ar", "48000", "-ac", "2", "-f", "s16le",
     ],
   });
-  upsampler.on("error", (e) => fail(`upsampler: ${e.message}`));
-  playbackStream.pipe(upsampler);
+  upsampler.on("error", (e) => {
+    // FFmpeg upsamplers sometimes emit "Premature close" when their consumer
+    // detaches between bursts. That is expected — we already tore down on the
+    // player Idle event. Log at diag level so we keep the audit trail but
+    // do not propagate it to Python as a hard error event.
+    diag("upsampler error (non-fatal)", { message: e.message });
+  });
+  stream.pipe(upsampler);
 
-  const resource = createAudioResource(upsampler, { inputType: StreamType.Raw });
+  // silencePaddingFrames (default 5) gives 100ms of trailing silence after
+  // the last real PCM packet. That window is also when the player decides
+  // to call stop() on the resource (after `maxMissedFrames` of no data),
+  // which causes a clean transition to Idle. We then rebuild on the next
+  // doPlay. Setting padding to 0 is aggressive and can wedge the resource
+  // before FFmpeg's first flush on a small burst.
+  const resource = createAudioResource(upsampler, {
+    inputType: StreamType.Raw,
+  });
   player.play(resource);
+  playbackStream = stream;
+  diag("new playback burst started");
+  return playbackStream;
 }
 
 function doLeave() {
@@ -263,9 +316,9 @@ function doLeave() {
     try { connection.destroy(); } catch {}
     connection = null;
   }
-  if (playbackStream) {
-    try { playbackStream.push(null); } catch {}
-    playbackStream = null;
+  teardownPlaybackStream("leave");
+  if (player) {
+    try { player.stop(true); } catch {}
   }
   player = null;
   speakerSubscriptions.clear();
@@ -273,8 +326,10 @@ function doLeave() {
 }
 
 function doPlay({ pcm_b64 }) {
-  if (!playbackStream || !pcm_b64) return;
-  playbackStream.push(Buffer.from(pcm_b64, "base64"));
+  if (!pcm_b64 || !player || !connection) return;
+  const stream = ensurePlaybackStream();
+  if (!stream) return;
+  stream.push(Buffer.from(pcm_b64, "base64"));
 }
 
 const rl = readline.createInterface({ input: process.stdin });

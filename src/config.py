@@ -47,9 +47,13 @@ class Config:
     grok_api_key: str = os.getenv("GROK_API_KEY", "")
     discord_spicylit_channel_id: str = os.getenv("DISCORD_SPICYLIT_CHANNEL_ID", "")
 
+    # UCS feature flag — Phase 2 parallel path
+    ucs_enabled: bool = os.getenv("UCS_ENABLED", "false").lower() == "true"
+
     # Paths
     data_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     prompts_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
+    models_config: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models.yaml")
     projects_registry: str = os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "projects", "registry.md"
     )
