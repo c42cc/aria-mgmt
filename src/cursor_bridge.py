@@ -55,7 +55,9 @@ class CursorBridge:
         return self._process is not None and self._process.returncode is None
 
     async def start(self) -> None:
-        """Start the Node.js cursor_wrapper subprocess."""
+        """Start the Node.js cursor_wrapper subprocess. Idempotent."""
+        if self.alive:
+            return
         wrapper_path = os.path.join(config.cursor_wrapper_dir, "index.js")
         env = os.environ.copy()
         if config.cursor_api_key:

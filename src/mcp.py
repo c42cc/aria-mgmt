@@ -55,11 +55,28 @@ MCP_SERVERS: dict[str, dict[str, Any]] = {
         "env": {"GITHUB_TOKEN": os.getenv("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN_MORE_SCOPE", ""))},
         "tier_defaults": {"get": "R", "list": "R", "create": "W", "update": "W", "search": "R"},
     },
+    "gmail": {
+        "command": ["npx", "@gongrzhe/server-gmail-autoauth-mcp"],
+        "transport": "stdio",
+        "tier_defaults": {"read": "R", "get": "R", "list": "R", "search": "R",
+                          "send": "I", "draft": "W", "create": "W", "delete": "I",
+                          "modify": "W", "batch": "W"},
+    },
 }
 
 AUDIT_PATH = os.path.join(config.data_dir, "audit.jsonl")
 
 _ENV_VAR_PATTERN = re.compile(r"[A-Z_]{4,}=\S+")
+_VALID_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """Replace characters invalid for Anthropic's tool name pattern with underscores."""
+    if _VALID_TOOL_NAME.match(name):
+        return name
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:128]
+    log.info("Sanitized MCP tool name: %r -> %r", name, sanitized)
+    return sanitized
 
 
 def _redact_args(tool_name: str, args: dict) -> dict:
@@ -102,7 +119,7 @@ def _audit_log(
         "server": server,
         "tool": tool,
         "args": _redact_args(tool, args),
-        "result_summary": result_summary[:500],
+        "result_summary": result_summary[:1_000_000],
         "tier": tier,
         "confirmed": confirmed,
         "session_key": session_key,
@@ -118,6 +135,7 @@ class MCPClient:
         self._servers: dict[str, Any] = {}
         self._tools: dict[str, dict] = {}
         self._tool_to_server: dict[str, str] = {}
+        self._original_names: dict[str, str] = {}
         self._started = False
         self._confirm_callback: Any = None
 
@@ -125,7 +143,9 @@ class MCPClient:
         self._confirm_callback = cb
 
     async def start_all(self) -> None:
-        """Start all configured MCP servers and collect their tool catalogs."""
+        """Start all configured MCP servers and collect their tool catalogs. Idempotent."""
+        if self._started:
+            return
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
@@ -151,16 +171,29 @@ class MCPClient:
             tools_result = await asyncio.wait_for(session.list_tools(), timeout=10)
 
             for tool in tools_result.tools:
-                self._tools[tool.name] = {
-                    "name": tool.name,
+                safe_name = _sanitize_tool_name(tool.name)
+                self._tools[safe_name] = {
+                    "name": safe_name,
                     "description": tool.description or "",
                     "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
                     "server": name,
                 }
-                self._tool_to_server[tool.name] = name
+                self._tool_to_server[safe_name] = name
+                if safe_name != tool.name:
+                    self._original_names[safe_name] = tool.name
 
             self._servers[name] = session
-            log.info("MCP server '%s' started: %d tools", name, len(tools_result.tools))
+
+            if name == "apple":
+                for tname in list(self._tools.keys()):
+                    if tname.startswith("mail_") and self._tool_to_server.get(tname) == "apple":
+                        del self._tools[tname]
+                        del self._tool_to_server[tname]
+                        self._original_names.pop(tname, None)
+                        log.info("Filtered apple mail tool: %s (Gmail-only policy)", tname)
+
+            log.info("MCP server '%s' started: %d tools", name, len(
+                [t for t in self._tools if self._tool_to_server.get(t) == name]))
 
         for name, cfg in MCP_SERVERS.items():
             try:
@@ -213,10 +246,11 @@ class MCPClient:
             confirmed = True
 
         try:
-            result = await session.call_tool(tool_name, args)
+            wire_name = self._original_names.get(tool_name, tool_name)
+            result = await session.call_tool(wire_name, args)
             result_text = str(result.content) if hasattr(result, "content") else str(result)
-            _audit_log(server_name, tool_name, args, result_text[:500], tier, confirmed, session_key)
-            return result_text[:4000]
+            _audit_log(server_name, tool_name, args, result_text[:1_000_000], tier, confirmed, session_key)
+            return result_text[:50_000]
         except Exception as e:
             error_msg = f"MCP tool error: {e}"
             _audit_log(server_name, tool_name, args, error_msg, tier, confirmed, session_key)
@@ -267,8 +301,10 @@ mcp_client: MCPClient | None = None
 
 
 async def init_mcp() -> MCPClient:
-    """Initialize and start the global MCP client."""
+    """Initialize and start the global MCP client. Idempotent."""
     global mcp_client
+    if mcp_client is not None and mcp_client._started:
+        return mcp_client
     mcp_client = MCPClient()
     await mcp_client.start_all()
     return mcp_client

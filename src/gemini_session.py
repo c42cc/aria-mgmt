@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import time
 from typing import Any, Callable, Coroutine
@@ -223,8 +224,27 @@ TranscriptEntry = collections.namedtuple("TranscriptEntry", ["role", "text", "ts
 class GeminiSession:
     """Manages a Gemini Live session with audio streaming and tool dispatch."""
 
-    def __init__(self, tool_handler: Callable[..., Coroutine] | None = None):
+    def __init__(
+        self,
+        tool_handler: Callable[..., Coroutine] | None = None,
+        transcript_callback: Callable[[str, str], Coroutine] | None = None,
+        orphan_callback: Callable[[str, str, str], Coroutine] | None = None,
+    ):
+        """
+        transcript_callback(role, text) is invoked once per *completed* turn
+        with role in {"user", "aria"} and the full transcribed text. Used
+        by bot.py to record the turn into the shared ConversationBuffer
+        and mirror it to the voice-channel text chat.
+
+        orphan_callback(tool_name, fc_id, result_text) is invoked when a
+        tool dispatch finishes but the session has already closed so the
+        result cannot be sent back to Gemini. This is the loud-failure
+        signal for L1 — a side-effect happened (MCP write/send) but the
+        model never heard about it. The bot routes this to #ucs-alerts.
+        """
         self.tool_handler = tool_handler
+        self.transcript_callback = transcript_callback
+        self.orphan_callback = orphan_callback
         self._client: genai.Client | None = None
         self._session: Any = None
         self._session_ctx: Any = None
@@ -234,22 +254,61 @@ class GeminiSession:
 
         self._transcript_buffer: collections.deque[TranscriptEntry] = collections.deque(maxlen=100)
 
+        # Per-turn accumulators; flushed to the buffer and the callback
+        # when Gemini signals turn_complete (or the session is closing).
+        self._user_turn_acc: str = ""
+        self._aria_turn_acc: str = ""
+
         self._pending_confirmations: dict[str, asyncio.Event] = {}
         self._confirmation_results: dict[str, dict] = {}
+
+        self._lifecycle_lock = asyncio.Lock()
+        self._served_fc_ids: set[str] = set()
+
+        # Track in-flight dispatch tasks so we can await them on close.
+        # Without this, _do_close cancels the receive loop but a side-
+        # effecting tool can still be running unobserved, lose its
+        # response, and leave the model unaware of what happened. The
+        # close path now awaits these with a bounded timeout (L1 fix).
+        self._dispatch_tasks: set[asyncio.Task] = set()
 
     @property
     def connected(self) -> bool:
         return self._connected
 
     async def connect(self) -> None:
-        """Establish Gemini Live WebSocket connection."""
+        """Establish Gemini Live WebSocket connection.
+
+        Idempotent: returns immediately if already connected with a live
+        receive task. All callers are safe to call without external guards.
+        """
+        async with self._lifecycle_lock:
+            if self._connected and self._receive_task and not self._receive_task.done():
+                log.debug("connect() called but already connected — skipping")
+                return
+            await self._do_connect()
+            self._receive_task = asyncio.create_task(self._receive_loop())
+        log.info("Gemini Live session connected (model=%s)", config.gemini_model)
+
+    async def _do_connect(self) -> None:
+        """Create a new Gemini Live session. Caller must hold _lifecycle_lock."""
         if not config.google_api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
+
+        self._user_turn_acc = ""
+        self._aria_turn_acc = ""
 
         self._client = genai.Client(api_key=config.google_api_key)
 
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore",
+                    ),
+                ),
+            ),
             tools=TOOL_DECLARATIONS,
             system_instruction=types.Content(
                 parts=[types.Part(text=load_template("gemini_system"))]
@@ -263,8 +322,6 @@ class GeminiSession:
         )
         self._session = await self._session_ctx.__aenter__()
         self._connected = True
-        self._receive_task = asyncio.create_task(self._receive_loop())
-        log.info("Gemini Live session connected (model=%s)", config.gemini_model)
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
         """Send PCM audio chunk (16kHz mono int16) to Gemini."""
@@ -314,6 +371,33 @@ class GeminiSession:
             if e.text
         ]
 
+    async def _flush_turn_accumulators(self) -> None:
+        """Emit accumulated per-turn transcripts to the callback, then reset.
+
+        Called on every `turn_complete` (and `interrupted`) signal from
+        Gemini. The callback is invoked at most once per role per turn
+        with the full transcript text. If the callback raises, we log
+        and continue — a misbehaving downstream must not break voice.
+        """
+        user_text = self._user_turn_acc.strip()
+        aria_text = self._aria_turn_acc.strip()
+        self._user_turn_acc = ""
+        self._aria_turn_acc = ""
+
+        if not self.transcript_callback:
+            return
+
+        if user_text:
+            try:
+                await self.transcript_callback("user", user_text)
+            except Exception:
+                log.exception("transcript_callback failed for user turn")
+        if aria_text:
+            try:
+                await self.transcript_callback("aria", aria_text)
+            except Exception:
+                log.exception("transcript_callback failed for aria turn")
+
     async def wait_for_confirmation(self, action_id: str, timeout: float = 60.0) -> dict:
         """Wait for a confirm_action tool call with the given action_id."""
         event = asyncio.Event()
@@ -359,19 +443,37 @@ class GeminiSession:
                                     self._transcript_buffer.append(
                                         TranscriptEntry("assistant", part.text, time.time())
                                     )
+                                    self._aria_turn_acc += part.text
 
                         if sc.input_transcription and sc.input_transcription.text:
                             self._transcript_buffer.append(
                                 TranscriptEntry("user", sc.input_transcription.text, time.time())
                             )
+                            self._user_turn_acc += sc.input_transcription.text
 
                         if sc.output_transcription and sc.output_transcription.text:
                             self._transcript_buffer.append(
                                 TranscriptEntry("assistant", sc.output_transcription.text, time.time())
                             )
+                            self._aria_turn_acc += sc.output_transcription.text
+
+                        if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
+                            await self._flush_turn_accumulators()
 
                     elif msg.tool_call:
+                        seen_in_turn: set[str] = set()
                         for fc in msg.tool_call.function_calls:
+                            if fc.id in self._served_fc_ids:
+                                log.info("Skipping already-served fc.id=%s (%s)", fc.id, fc.name)
+                                continue
+
+                            dedup_key = f"{fc.name}:{json.dumps(dict(fc.args) if fc.args else {}, sort_keys=True)}"
+                            if dedup_key in seen_in_turn:
+                                log.info("Skipping duplicate in-turn call: %s", fc.name)
+                                continue
+                            seen_in_turn.add(dedup_key)
+                            self._served_fc_ids.add(fc.id)
+
                             log.info("Gemini tool call: %s(%s)", fc.name, fc.id)
 
                             if fc.name == "confirm_action":
@@ -393,21 +495,9 @@ class GeminiSession:
                                 continue
 
                             if self.tool_handler:
-                                try:
-                                    result = await self.tool_handler(
-                                        fc.name, dict(fc.args) if fc.args else {}
-                                    )
-                                except Exception as e:
-                                    log.exception("Tool handler error for %s", fc.name)
-                                    result = f'{{"error": "{e}"}}'
-
-                                await self._session.send_tool_response(
-                                    function_responses=types.FunctionResponse(
-                                        name=fc.name,
-                                        response={"result": result},
-                                        id=fc.id,
-                                    )
-                                )
+                                task = asyncio.create_task(self._dispatch_tool_call(fc))
+                                self._dispatch_tasks.add(task)
+                                task.add_done_callback(self._dispatch_tasks.discard)
 
             except asyncio.CancelledError:
                 log.info("Gemini receive loop cancelled")
@@ -424,12 +514,18 @@ class GeminiSession:
                     except Exception:
                         pass
                     self._session = None
+                if self._session_ctx:
+                    try:
+                        await self._session_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    self._session_ctx = None
 
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
                 try:
-                    await self.connect()
+                    await self._do_connect()
                     context = self.get_transcript_context(max_turns=3)
                     if context:
                         await self.inject_text(
@@ -442,17 +538,68 @@ class GeminiSession:
                     self._connected = False
                     return
 
+    async def _dispatch_tool_call(self, fc: Any) -> None:
+        """Run a tool handler and send the response back to Gemini.
+
+        Runs as a separate task so the receive loop stays free to process
+        confirm_action while tier-I/X tools await user approval. Tracked in
+        `self._dispatch_tasks` so close() can await in-flight dispatches.
+        """
+        try:
+            result = await self.tool_handler(
+                fc.name, dict(fc.args) if fc.args else {}
+            )
+        except Exception as e:
+            log.exception("Tool handler error for %s", fc.name)
+            result = f'{{"error": "{e}"}}'
+
+        if not self._session or not self._connected:
+            # The session went away while the tool was running. The side
+            # effect may have already happened (Gmail send, calendar create,
+            # filesystem write). Surface this loudly — Gemini will never see
+            # the result, but the operator must.
+            log.error(
+                "ORPHAN TOOL RESULT: %s (id=%s) completed but session closed "
+                "before response could be sent. Result preview: %s",
+                fc.name, getattr(fc, "id", "?"), str(result)[:300],
+            )
+            if self.orphan_callback:
+                try:
+                    await self.orphan_callback(fc.name, getattr(fc, "id", ""), str(result))
+                except Exception:
+                    log.exception("orphan_callback failed for %s", fc.name)
+            return
+
+        try:
+            await self._session.send_tool_response(
+                function_responses=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": result},
+                    id=fc.id,
+                )
+            )
+        except Exception:
+            log.exception("Failed to send tool response for %s", fc.name)
+            if self.orphan_callback:
+                try:
+                    await self.orphan_callback(fc.name, getattr(fc, "id", ""), str(result))
+                except Exception:
+                    log.exception("orphan_callback failed (send-tool-response branch) for %s", fc.name)
+
     async def reconnect(self) -> None:
         """Gracefully close and reopen the session with fresh prompts.
 
         Preserves recent transcript context across the reconnect so
         the conversation feels continuous.
         """
-        from .prompts import clear_cache
-        clear_cache()
-        context = self.get_transcript_context(max_turns=5)
-        await self.close()
-        await self.connect()
+        async with self._lifecycle_lock:
+            from .prompts import clear_cache
+            clear_cache()
+            self._served_fc_ids.clear()
+            context = self.get_transcript_context(max_turns=5)
+            await self._do_close()
+            await self._do_connect()
+            self._receive_task = asyncio.create_task(self._receive_loop())
         if context:
             await self.inject_text(
                 f"Session resumed after prompt reload. Recent context:\n{context}",
@@ -461,8 +608,39 @@ class GeminiSession:
         log.info("Gemini session reconnected after prompt reload")
 
     async def close(self) -> None:
-        """Close the Gemini session."""
+        """Close the Gemini session. Idempotent."""
+        async with self._lifecycle_lock:
+            await self._do_close()
+
+    async def _do_close(self) -> None:
+        """Internal close. Caller must hold _lifecycle_lock."""
+        if not self._connected and not self._session and not self._session_ctx:
+            return
         self._connected = False
+        try:
+            await self._flush_turn_accumulators()
+        except Exception:
+            log.exception("Error flushing turn accumulators on close")
+
+        # Wait briefly for in-flight tool dispatches to finish so their
+        # results can be sent back to Gemini before the session closes.
+        # Bounded by 5s — beyond that we accept orphan-tool-result loss
+        # and surface it via orphan_callback. Without this wait, every
+        # in-flight tool at close time becomes a silent loss (L1).
+        in_flight = {t for t in self._dispatch_tasks if not t.done()}
+        if in_flight:
+            log.info(
+                "Waiting up to 5s for %d in-flight tool dispatch(es) before close",
+                len(in_flight),
+            )
+            done, pending = await asyncio.wait(in_flight, timeout=5.0)
+            for t in pending:
+                log.error(
+                    "Tool dispatch did not finish within close window — cancelling. "
+                    "Side effect may have completed without a model-visible response."
+                )
+                t.cancel()
+
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
             try:

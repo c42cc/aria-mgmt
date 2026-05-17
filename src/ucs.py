@@ -59,6 +59,7 @@ class LoopResult:
     model_id: str = ""
     context_truncated: bool = False
     turns_dropped: int = 0
+    tool_trace: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +363,6 @@ class IntelligenceLoop:
         prompt_template: str = "planning",
         memories: list[dict] | None = None,
         history: list[dict[str, str]] | None = None,
-        post_callback: Any = None,
         cancel_check: Any = None,
     ) -> LoopResult:
         """Planning call: single reasoning shot."""
@@ -401,9 +401,6 @@ class IntelligenceLoop:
 
         latency = int((time.monotonic() - started_at) * 1000)
 
-        if post_callback:
-            asyncio.create_task(post_callback(result_text))
-
         return LoopResult(
             text=result_text,
             status="completed",
@@ -423,7 +420,6 @@ class IntelligenceLoop:
         session_key: str = "",
         memories: list[dict] | None = None,
         mcp_client: Any = None,
-        post_callback: Any = None,
         alert_callback: Any = None,
         cancel_check: Any = None,
     ) -> LoopResult:
@@ -463,6 +459,12 @@ class IntelligenceLoop:
         iteration = 0
         truncated = False
         turns_dropped = 0
+        tool_trace: list[dict] = []
+
+        # Cross-iteration dedup ledger. See _dedup_key in tools.py.
+        # Maps "name:args_json" -> (call_count, cached_result_str).
+        from .tools import _dedup_key  # local import to avoid cycle at module load
+        called_tools: dict[str, tuple[int, str]] = {}
 
         while iteration < profile.max_iterations:
             if cancel_check and cancel_check():
@@ -473,6 +475,7 @@ class IntelligenceLoop:
                     latency_ms=int((time.monotonic() - started_at) * 1000),
                     model_id=spec.model_id,
                     context_truncated=truncated, turns_dropped=turns_dropped,
+                    tool_trace=tool_trace or None,
                 )
 
             iteration += 1
@@ -500,8 +503,6 @@ class IntelligenceLoop:
             if response["stop_reason"] == "end_turn" or not has_tool_use:
                 text_parts = [b["text"] for b in response["content"] if b.get("type") == "text"]
                 result = "\n".join(text_parts)
-                if post_callback:
-                    asyncio.create_task(post_callback(result))
                 return LoopResult(
                     text=result, status="completed", iterations=iteration,
                     total_tokens_in=total_in, total_tokens_out=total_out,
@@ -509,6 +510,7 @@ class IntelligenceLoop:
                     latency_ms=int((time.monotonic() - started_at) * 1000),
                     model_id=response["model_id"],
                     context_truncated=truncated, turns_dropped=turns_dropped,
+                    tool_trace=tool_trace or None,
                 )
 
             messages.append({"role": "assistant", "content": response["raw_content"]})
@@ -517,15 +519,50 @@ class IntelligenceLoop:
             for block in response["content"]:
                 if block.get("type") != "tool_use":
                     continue
-                tool_result = await mcp_client.call_tool(
-                    block["name"],
-                    block.get("input", {}),
-                    session_key=session_key,
-                )
+                tool_args = block.get("input", {})
+                dedup_key = _dedup_key(block["name"], tool_args)
+                prev_count, cached_result = called_tools.get(dedup_key, (0, ""))
+
+                if prev_count >= 1:
+                    result_str = json.dumps({
+                        "_dup_hit": True,
+                        "_call_count": prev_count + 1,
+                        "_note": (
+                            f"You have already called {block['name']} with "
+                            f"these exact args earlier in this session. The "
+                            f"cached result is included below. Stop re-issuing "
+                            f"this call; if the result is insufficient, change "
+                            f"the args or pick a different tool."
+                        ),
+                        "cached_result": cached_result[:40_000],
+                    })
+                    called_tools[dedup_key] = (prev_count + 1, cached_result)
+                    log.warning(
+                        "Claude dedup hit (ucs): %s (call #%d) session=%s",
+                        block["name"], prev_count + 1, session_key,
+                    )
+                else:
+                    tool_result = await mcp_client.call_tool(
+                        block["name"],
+                        tool_args,
+                        session_key=session_key,
+                    )
+                    result_str = str(tool_result)
+                    called_tools[dedup_key] = (1, result_str)
+
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block["id"],
-                    "content": str(tool_result)[:4000],
+                    "content": result_str[:50_000],
+                })
+                tool_trace.append({
+                    "tool": block["name"],
+                    "args": {k: (str(v)[:10_000] + f"... [{len(str(v))} chars]" if len(str(v)) > 10_000 else v)
+                             for k, v in tool_args.items()},
+                    "result": result_str[:1_000_000],
+                    "result_chars": len(result_str),
+                    "result_truncated": len(result_str) > 1_000_000,
+                    "deduped": prev_count >= 1,
                 })
 
             messages.append({"role": "user", "content": tool_results})
@@ -543,6 +580,7 @@ class IntelligenceLoop:
                     latency_ms=int((time.monotonic() - started_at) * 1000),
                     model_id=spec.model_id,
                     context_truncated=truncated, turns_dropped=turns_dropped,
+                    tool_trace=tool_trace or None,
                 )
 
         final_text = f"Task reached iteration limit ({profile.max_iterations}). Partial progress made."
@@ -556,6 +594,7 @@ class IntelligenceLoop:
             latency_ms=int((time.monotonic() - started_at) * 1000),
             model_id=spec.model_id,
             context_truncated=truncated, turns_dropped=turns_dropped,
+            tool_trace=tool_trace or None,
         )
 
 

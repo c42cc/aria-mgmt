@@ -67,6 +67,18 @@ if ! .venv/bin/python -m src.preflight --no-cursor --no-gemini; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Guard 4: anchor pressure test (if ANCHOR_GATE_ENABLED=true)
+# ---------------------------------------------------------------------------
+if [[ "${ANCHOR_GATE_ENABLED:-false}" == "true" ]]; then
+    echo -e "${CYAN}Running anchor pressure test...${RESET}"
+    if ! .venv/bin/python tests/anchor_suite/run.py --gate --quick; then
+        echo -e "${RED}\u2717 anchor suite failed — fix before deploying${RESET}"
+        exit 1
+    fi
+    echo -e "  ${GREEN}\u2713${RESET} anchor suite passed"
+fi
+
 echo ""
 
 # ---------------------------------------------------------------------------

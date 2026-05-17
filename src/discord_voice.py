@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import enum
 import json
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -198,3 +201,200 @@ class VoiceBridge:
 
 
 voice_bridge = VoiceBridge()
+
+
+# ---------------------------------------------------------------------------
+# Voice lifecycle state machine
+# ---------------------------------------------------------------------------
+
+class VoiceState(enum.Enum):
+    """Typed voice-lifecycle states. The controller is always in exactly one."""
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    IN_VOICE = "in_voice"
+    DISCONNECTING = "disconnecting"
+
+
+class VoiceTransitionBusy(Exception):
+    """Raised when a voice transition is requested while another is in flight."""
+
+
+class VoiceController:
+    """Single owner of Discord-voice lifecycle. Process-singleton.
+
+    Same shape as GeminiSession / CursorBridge / MCPClient: owns its lock,
+    its state, and its watchdog task. Public methods are the only valid
+    transitions; the flag/lock/task triplet is encapsulated.
+
+    The lock is global (not per-channel) because Discord allows only one
+    voice connection per bot per guild. This is the correct asymmetry with
+    the per-session_key agent locks in tools.py: agent loops are parallel
+    across channels; voice is exclusive at the Discord layer.
+    """
+
+    def __init__(
+        self,
+        bridge: VoiceBridge,
+        *,
+        watchdog_timeout_sec: float = 600,
+    ) -> None:
+        self._bridge = bridge
+        self._state = VoiceState.DISCONNECTED
+        self._lock = asyncio.Lock()
+        self._watchdog_task: asyncio.Task | None = None
+        self._channel_id: str | None = None
+        self._last_activity_at: float = 0.0
+        self._watchdog_timeout_sec = watchdog_timeout_sec
+        self._on_watchdog_expire: Callable[[], Awaitable[None]] | None = None
+
+    @property
+    def in_voice(self) -> bool:
+        return self._state is VoiceState.IN_VOICE
+
+    @property
+    def state(self) -> VoiceState:
+        return self._state
+
+    @property
+    def channel_id(self) -> str | None:
+        return self._channel_id
+
+    @property
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def touch(self) -> None:
+        """Record user activity. Resets the exit-watchdog idle timer."""
+        self._last_activity_at = time.monotonic()
+
+    async def join(
+        self,
+        channel_id: str,
+        *,
+        audio_callback: AudioCallback,
+        on_watchdog_expire: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
+        """DISCONNECTED -> IN_VOICE. Idempotent, serialized.
+
+        Returns True if the join was performed, False if already in the
+        requested state or a transition is in flight.
+        """
+        if self._lock.locked():
+            return False
+        async with self._lock:
+            if self._state is VoiceState.IN_VOICE and self._channel_id == channel_id:
+                return False
+            self._state = VoiceState.CONNECTING
+            try:
+                self._bridge.register_audio_callback(audio_callback)
+                await self._bridge.join(channel_id)
+                self._channel_id = channel_id
+                self._state = VoiceState.IN_VOICE
+                self._on_watchdog_expire = on_watchdog_expire
+                self._last_activity_at = time.monotonic()
+                self._spawn_watchdog()
+                return True
+            except Exception:
+                self._state = VoiceState.DISCONNECTED
+                raise
+
+    async def leave(self) -> bool:
+        """IN_VOICE -> DISCONNECTED. Calls bridge.leave(). Idempotent."""
+        if self._state is VoiceState.DISCONNECTED:
+            return False
+        async with self._lock:
+            return await self._do_leave()
+
+    async def note_external_disconnect(self) -> None:
+        """Handle the user leaving voice. The bot leaves the channel too.
+
+        Waits for any in-progress transition to complete, then disconnects.
+        Unlike leave(), this is always called from on_voice_state_update
+        where the user has already departed — the bridge.leave() tells the
+        sidecar to depart as well.
+        """
+        async with self._lock:
+            self._cancel_watchdog()
+            if self._state is not VoiceState.DISCONNECTED:
+                try:
+                    await self._bridge.leave()
+                except Exception:
+                    log.exception("Error leaving voice channel on external disconnect")
+            self._state = VoiceState.DISCONNECTED
+            self._channel_id = None
+            self._last_activity_at = 0.0
+
+    @asynccontextmanager
+    async def pipeline_switch(self):
+        """Context manager for pipeline switches that need the transition
+        lock but don't change voice channel state (e.g. !spicylit, !back).
+
+        Raises VoiceTransitionBusy if a transition is already in flight.
+        Respawns the exit watchdog on clean context-manager exit.
+        """
+        if self._lock.locked():
+            raise VoiceTransitionBusy()
+        async with self._lock:
+            yield
+            self._spawn_watchdog()
+
+    async def _do_leave(self) -> bool:
+        """Internal leave. Caller must hold _lock."""
+        if self._state is VoiceState.DISCONNECTED:
+            return False
+        self._state = VoiceState.DISCONNECTING
+        self._cancel_watchdog()
+        try:
+            await self._bridge.leave()
+        except Exception:
+            log.exception("Error leaving voice channel")
+        self._state = VoiceState.DISCONNECTED
+        self._channel_id = None
+        self._last_activity_at = 0.0
+        return True
+
+    def _spawn_watchdog(self) -> None:
+        """Start (or restart) the voice-exit watchdog. Categorically
+        prevents stacking: any existing watchdog is cancelled first."""
+        self._cancel_watchdog()
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog(), name="voice_exit_watchdog"
+        )
+
+    def _cancel_watchdog(self) -> None:
+        if self._watchdog_task and not self._watchdog_task.done():
+            if self._watchdog_task is not asyncio.current_task():
+                self._watchdog_task.cancel()
+        self._watchdog_task = None
+
+    async def _watchdog(self) -> None:
+        """Leave voice after sustained user silence."""
+        try:
+            while True:
+                await asyncio.sleep(30)
+                if self._state is not VoiceState.IN_VOICE:
+                    return
+                if self._last_activity_at == 0:
+                    continue
+                idle = time.monotonic() - self._last_activity_at
+                if idle < self._watchdog_timeout_sec:
+                    continue
+                if self._lock.locked():
+                    continue
+
+                async with self._lock:
+                    if self._state is not VoiceState.IN_VOICE:
+                        return
+                    log.info("%.0fs silence — auto-leaving voice channel", idle)
+                    if self._on_watchdog_expire:
+                        try:
+                            await self._on_watchdog_expire()
+                        except Exception:
+                            log.exception("voice exit watchdog on_expire callback failed")
+                    await self._do_leave()
+                    return
+        except asyncio.CancelledError:
+            pass
+
+
+voice_controller = VoiceController(voice_bridge)

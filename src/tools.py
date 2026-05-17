@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
@@ -42,18 +43,89 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _get_model_costs() -> tuple[float, float]:
-    """Read cost_per_m_input/output for the active Claude model from models.yaml."""
-    import yaml
+_TRACE_ARG_MAX_CHARS = 10_000
+_TRACE_RESULT_MAX_CHARS = 1_000_000
+_TRACE_SESSION_MAX_BYTES = 5_000_000
+
+
+def _dedup_key(tool_name: str, args: dict) -> str:
+    """Stable hash for (tool, args) pairs.
+
+    Used by `_do_with_claude` (and the UCS variant) to detect when Claude
+    re-emits an identical tool call inside one agent loop. Args are normalized
+    to JSON with sorted keys so `{"a": 1, "b": 2}` and `{"b": 2, "a": 1}` hash
+    to the same key.
+    """
     try:
-        with open(config.models_config) as f:
-            data = yaml.safe_load(f)
-        for spec in (data or {}).get("models", {}).values():
-            if spec.get("model_id") == config.claude_model:
-                return spec.get("cost_per_m_input", 15.0), spec.get("cost_per_m_output", 75.0)
+        args_json = json.dumps(args, sort_keys=True, default=str)
     except Exception:
-        pass
-    return 15.0, 75.0
+        args_json = repr(args)
+    return f"{tool_name}:{args_json}"
+
+
+def _truncate_trace_args(args: dict, max_chars: int = _TRACE_ARG_MAX_CHARS) -> dict:
+    """Truncate tool arg values for trace storage. Preserves keys and types."""
+    out = {}
+    for k, v in args.items():
+        sv = str(v)
+        if len(sv) > max_chars:
+            out[k] = sv[:max_chars] + f"... [{len(sv)} chars total]"
+        else:
+            out[k] = v
+    return out
+
+
+def _cap_trace_size(trace: list[dict], max_bytes: int = _TRACE_SESSION_MAX_BYTES) -> list[dict]:
+    """If total trace JSON exceeds max_bytes, drop oldest entries but keep a dropped count."""
+    total = sum(len(json.dumps(e, default=str)) for e in trace)
+    if total <= max_bytes:
+        return trace
+    dropped = 0
+    while total > max_bytes and len(trace) > 1:
+        removed = trace.pop(0)
+        total -= len(json.dumps(removed, default=str))
+        dropped += 1
+    if dropped:
+        trace.insert(0, {"_dropped_tool_calls": dropped, "_reason": "session trace exceeded 50KB cap"})
+    return trace
+
+
+_model_costs_cache: tuple[float, float] | None = None
+
+
+def _get_model_costs() -> tuple[float, float]:
+    """Read cost_per_m_input/output for the active Claude model from models.yaml.
+
+    No silent fallback. If models.yaml is missing/unparseable or the active
+    model isn't listed, raise — the daily-spend cap is computed off this and
+    must not be fed lies. preflight `probe_models_yaml` is the boot-time
+    check; this is the runtime version.
+
+    Cached after first successful read. Invalidated by `_reload_prompts`
+    (which is the user-facing "reload runtime config" hook) so a model
+    swap via .env + !reload picks up new costs.
+    """
+    global _model_costs_cache
+    if _model_costs_cache is not None:
+        return _model_costs_cache
+    import yaml
+    with open(config.models_config) as f:
+        data = yaml.safe_load(f)
+    for spec in (data or {}).get("models", {}).values():
+        if spec.get("model_id") == config.claude_model:
+            cost_in = spec.get("cost_per_m_input")
+            cost_out = spec.get("cost_per_m_output")
+            if cost_in is None or cost_out is None:
+                raise RuntimeError(
+                    f"models.yaml entry for {config.claude_model} is missing "
+                    f"cost_per_m_input or cost_per_m_output"
+                )
+            _model_costs_cache = (cost_in, cost_out)
+            return _model_costs_cache
+    raise RuntimeError(
+        f"models.yaml has no entry whose model_id == {config.claude_model!r}. "
+        f"Edit models.yaml or change CLAUDE_MODEL in .env."
+    )
 
 
 def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
@@ -70,9 +142,48 @@ _thread_callback: Callable[..., Coroutine] | None = None
 _cursor_event_callback: Callable[..., Coroutine] | None = None
 _reconnect_callback: Callable[..., Coroutine] | None = None
 _transcript_provider: Callable[[], list[dict[str, str]]] | None = None
-_cancel = False
-_session_claude_calls = 0
-_session_cursor_runs = 0
+
+
+@dataclass
+class SessionState:
+    """Per-session mutable state for the tool dispatch loop.
+
+    Pre-L2 these were module globals (`_cancel`, `_session_claude_calls`,
+    `_session_cursor_runs`, `_last_tool_trace`, plus the agent lock). Two
+    concurrent sessions (voice + text, or two channels) would clobber each
+    other: A's `!stop` was silently cleared by B's loop entry, B's call
+    counter inherited A's tail, B's `_last_tool_trace` overwrote A's right
+    before A recorded its session row.
+
+    Keyed by `session_key` (Discord channel/thread ID) because agent loops
+    are parallel across channels. This is the correct asymmetry with
+    VoiceController's global lock in discord_voice.py: Discord allows only
+    one voice connection per bot, so voice is exclusive at the process level.
+
+    Lives for the process lifetime; if memory pressure becomes an issue,
+    prune on a timer — for now we expect O(few) sessions.
+    """
+    cancel: bool = False
+    claude_calls: int = 0
+    cursor_runs: int = 0
+    last_tool_trace: list[dict] | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+_session_states: dict[str, SessionState] = {}
+
+
+def _state_for(session_key: str) -> SessionState:
+    """Get-or-create per-session state. `session_key=""` is the global bucket."""
+    key = session_key or "__global__"
+    if key not in _session_states:
+        _session_states[key] = SessionState()
+    return _session_states[key]
+
+
+def _agent_lock_for(session_key: str) -> asyncio.Lock:
+    """Per-session asyncio.Lock to serialize agent loops for the same channel."""
+    return _state_for(session_key).lock
 
 PROJECT_REGISTRY: dict[str, str] = {}
 
@@ -106,9 +217,17 @@ def set_transcript_provider(provider: Callable[[], list[dict[str, str]]]) -> Non
     _transcript_provider = provider
 
 
-def set_cancel_flag(value: bool) -> None:
-    global _cancel
-    _cancel = value
+def set_cancel_flag(value: bool, session_key: str | None = None) -> None:
+    """Set the cancel flag for one session, or for all sessions when `session_key` is None.
+
+    `!stop` (emergency-stop) flips all sessions. A per-session cancel
+    (e.g. `cancel_current_task` invoked via voice) flips only that one.
+    """
+    if session_key is None:
+        for s in _session_states.values():
+            s.cancel = value
+    else:
+        _state_for(session_key).cancel = value
 
 
 def _load_project_registry() -> None:
@@ -166,26 +285,34 @@ async def handle_tool_call(name: str, args: dict) -> str:
 
     transcript = _transcript_provider() if _transcript_provider else []
     session_key = args.get("session_key", "")
+    state = _state_for(session_key)
+    state.last_tool_trace = None
 
     start = time.monotonic()
     try:
         result = await handler(**args)
         duration_ms = int((time.monotonic() - start) * 1000)
-        log_event(name, args, str(result)[:500], duration_ms)
+        log_event(name, args, str(result)[:10_000], duration_ms)
         result_str = result if isinstance(result, str) else json.dumps(result)
 
+        trace = state.last_tool_trace
+        state.last_tool_trace = None
         _emit_session_record(
             name, args, session_key, transcript,
             result_str, duration_ms, status="ok",
+            tool_trace=trace,
         )
         return result_str
     except Exception as e:
         duration_ms = int((time.monotonic() - start) * 1000)
         log.exception("Tool call %s failed", name)
         error_result = json.dumps({"error": str(e)})
+        trace = state.last_tool_trace
+        state.last_tool_trace = None
         _emit_session_record(
             name, args, session_key, transcript,
             error_result, duration_ms, status="error",
+            tool_trace=trace,
         )
         return error_result
 
@@ -198,20 +325,29 @@ def _emit_session_record(
     result: str,
     duration_ms: int,
     status: str,
+    tool_trace: list[dict] | None = None,
 ) -> None:
-    """Write a session record and optionally fire the judge (EMIT layer)."""
+    """Write a session record and optionally fire the judge (EMIT layer).
+
+    tool_trace, when provided, is a list of MCP tool calls that happened
+    during the agent loop. Each entry has {tool, args_summary, result_preview}.
+    This goes into context_json so the judge can verify spec properties like
+    'Tool execution required' and 'No fabricated results'.
+    """
     product = tool_to_product(tool_name)
     if product == "system":
         return
 
     inputs = {"args": args, "transcript": transcript}
-    outputs = {"result": result[:10_000], "duration_ms": duration_ms, "status": status}
+    outputs = {"result": result[:1_000_000], "duration_ms": duration_ms, "status": status}
+    context = {"tool_trace": tool_trace} if tool_trace else None
 
     record_id = record_session(
         session_key=session_key or "unknown",
         tool_name=tool_name,
         inputs=inputs,
         outputs=outputs,
+        context=context,
     )
 
     if record_id and product in JUDGE_WORTHY_PRODUCTS:
@@ -257,10 +393,10 @@ async def _plan_with_claude_legacy(
     session_key: str,
     prompt_template: str = "planning",
 ) -> str:
-    global _cancel, _session_claude_calls
-    _cancel = False
-    _session_claude_calls += 1
-    if _session_claude_calls > config.per_session_claude_calls_max:
+    state = _state_for(session_key)
+    state.cancel = False
+    state.claude_calls += 1
+    if state.claude_calls > config.per_session_claude_calls_max:
         return json.dumps({"error": f"Per-session Claude call limit ({config.per_session_claude_calls_max}) reached"})
     if not _anthropic_client:
         return json.dumps({"error": "Anthropic client not initialized"})
@@ -278,7 +414,8 @@ async def _plan_with_claude_legacy(
     started_at = time.monotonic()
     started_at_iso = _now_iso()
 
-    response = _anthropic_client.messages.create(
+    response = await asyncio.to_thread(
+        _anthropic_client.messages.create,
         model=config.claude_model,
         system=template,
         messages=messages,
@@ -309,9 +446,6 @@ async def _plan_with_claude_legacy(
         started_at=started_at_iso,
     )
 
-    if _post_callback:
-        asyncio.create_task(_post_callback(result_text))
-
     return result_text
 
 
@@ -320,10 +454,10 @@ async def _plan_with_claude_ucs(
     session_key: str,
     prompt_template: str = "planning",
 ) -> str:
-    global _cancel, _session_claude_calls
-    _cancel = False
-    _session_claude_calls += 1
-    if _session_claude_calls > config.per_session_claude_calls_max:
+    state = _state_for(session_key)
+    state.cancel = False
+    state.claude_calls += 1
+    if state.claude_calls > config.per_session_claude_calls_max:
         return json.dumps({"error": f"Per-session Claude call limit ({config.per_session_claude_calls_max}) reached"})
 
     from .ucs import get_loop
@@ -338,13 +472,11 @@ async def _plan_with_claude_ucs(
         prompt_template=prompt_template,
         memories=memories if memories else None,
         history=history if history else None,
-        post_callback=_post_callback,
-        cancel_check=lambda: _cancel,
+        cancel_check=lambda: state.cancel,
     )
 
-    memories_for_history = mem_recall(context, limit=3)
-    if memories_for_history:
-        memory_context = "\n".join(f"- {m.get('memory', m.get('text', ''))}" for m in memories_for_history)
+    if memories:
+        memory_context = "\n".join(f"- {m.get('memory', m.get('text', ''))}" for m in memories)
         history_context = f"Relevant memories:\n{memory_context}\n\n{context}"
     else:
         history_context = context
@@ -380,10 +512,11 @@ async def _build_with_cursor(
     project: str,
     instruction: str,
     background: bool = True,
+    session_key: str = "",
 ) -> dict[str, Any]:
-    global _session_cursor_runs
-    _session_cursor_runs += 1
-    if _session_cursor_runs > config.per_session_cursor_runs_max:
+    state = _state_for(session_key)
+    state.cursor_runs += 1
+    if state.cursor_runs > config.per_session_cursor_runs_max:
         return {"error": f"Per-session Cursor run limit ({config.per_session_cursor_runs_max}) reached"}
     if not _cursor_bridge:
         return {"error": "Cursor bridge not initialized"}
@@ -433,17 +566,21 @@ async def _do_with_claude(
     task: str,
     session_key: str = "",
 ) -> str:
-    if config.ucs_enabled:
-        return await _do_with_claude_ucs(task, session_key)
-    return await _do_with_claude_legacy(task, session_key)
+    lock = _agent_lock_for(session_key or "global")
+    if lock.locked():
+        return json.dumps({"error": "An agent loop is already running for this session. Wait for it to finish or use !stop."})
+    async with lock:
+        if config.ucs_enabled:
+            return await _do_with_claude_ucs(task, session_key)
+        return await _do_with_claude_legacy(task, session_key)
 
 
 async def _do_with_claude_legacy(
     task: str,
     session_key: str = "",
 ) -> str:
-    global _cancel
-    _cancel = False
+    state = _state_for(session_key)
+    state.cancel = False
     if not _anthropic_client:
         return json.dumps({"error": "Anthropic client not initialized"})
 
@@ -475,11 +612,21 @@ async def _do_with_claude_legacy(
     started_at = time.monotonic()
     started_at_iso = _now_iso()
     final_status = "completed"
+    tool_trace: list[dict] = []
 
-    while iteration < max_iterations and not _cancel:
+    # Cross-iteration (and in-batch) dedup ledger.
+    # Maps (tool_name, args_hash) -> (call_count, cached_result_str). When
+    # Claude re-emits the same tool call inside this agent loop, we short-
+    # circuit with the cached result and a "_dup_hit" marker so the model
+    # sees a clear signal it has already asked this. This is the L5 fix from
+    # the audit (the 6x search_emails-in-15s case).
+    called_tools: dict[str, tuple[int, str]] = {}
+
+    while iteration < max_iterations and not state.cancel:
         iteration += 1
 
-        response = _anthropic_client.messages.create(
+        response = await asyncio.to_thread(
+            _anthropic_client.messages.create,
             model=config.claude_model,
             system=system_prompt,
             messages=messages,
@@ -500,8 +647,6 @@ async def _do_with_claude_legacy(
         ):
             text_parts = [b.text for b in response.content if hasattr(b, "text") and b.text]
             result = "\n".join(text_parts)
-            if _post_callback:
-                asyncio.create_task(_post_callback(result))
             log_loop_execution(
                 tool_name="do_with_claude",
                 session_key=session_key,
@@ -515,6 +660,7 @@ async def _do_with_claude_legacy(
                 status="completed",
                 started_at=started_at_iso,
             )
+            state.last_tool_trace = _cap_trace_size(tool_trace) or None
             return result
 
         messages.append({"role": "assistant", "content": response.content})
@@ -524,13 +670,51 @@ async def _do_with_claude_legacy(
             if block.type != "tool_use":
                 continue
 
-            tool_result = await mcp_client.call_tool(
-                block.name, dict(block.input) if block.input else {}, session_key=session_key,
-            )
+            tool_args = dict(block.input) if block.input else {}
+            dedup_key = _dedup_key(block.name, tool_args)
+            prev_count, cached_result = called_tools.get(dedup_key, (0, ""))
+
+            if prev_count >= 1:
+                # Loud signal back to the model: the call is unchanged, and
+                # we are NOT going to spend another upstream round-trip on it.
+                # If Claude is iterating because the result wasn't sufficient,
+                # this forces a different next move.
+                result_str = json.dumps({
+                    "_dup_hit": True,
+                    "_call_count": prev_count + 1,
+                    "_note": (
+                        f"You have already called {block.name} with these "
+                        f"exact args earlier in this session. The cached "
+                        f"result is included below. Stop re-issuing this "
+                        f"call; if the result is insufficient, change the "
+                        f"args or pick a different tool."
+                    ),
+                    "cached_result": cached_result[:40_000],
+                })
+                called_tools[dedup_key] = (prev_count + 1, cached_result)
+                log.warning(
+                    "Claude dedup hit: %s (call #%d) session=%s",
+                    block.name, prev_count + 1, session_key,
+                )
+            else:
+                tool_result = await mcp_client.call_tool(
+                    block.name, tool_args, session_key=session_key,
+                )
+                result_str = str(tool_result)
+                called_tools[dedup_key] = (1, result_str)
+
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": str(tool_result)[:4000],
+                "content": result_str[:50_000],
+            })
+            tool_trace.append({
+                "tool": block.name,
+                "args": _truncate_trace_args(tool_args),
+                "result": result_str[:1_000_000],
+                "result_chars": len(result_str),
+                "result_truncated": len(result_str) > 1_000_000,
+                "deduped": prev_count >= 1,
             })
 
         messages.append({"role": "user", "content": tool_results})
@@ -543,7 +727,7 @@ async def _do_with_claude_legacy(
                 ))
             break
 
-    if _cancel:
+    if state.cancel:
         final_status = "cancelled"
     elif final_status != "token_budget":
         final_status = "iteration_limit"
@@ -562,7 +746,9 @@ async def _do_with_claude_legacy(
         started_at=started_at_iso,
     )
 
-    if _cancel:
+    state.last_tool_trace = _cap_trace_size(tool_trace) or None
+
+    if state.cancel:
         return "Task cancelled by user."
 
     partial = f"Task reached iteration limit ({max_iterations}). Partial progress made."
@@ -575,8 +761,8 @@ async def _do_with_claude_ucs(
     task: str,
     session_key: str = "",
 ) -> str:
-    global _cancel
-    _cancel = False
+    state = _state_for(session_key)
+    state.cancel = False
 
     try:
         from .mcp import mcp_client
@@ -595,9 +781,8 @@ async def _do_with_claude_ucs(
         session_key=session_key,
         memories=memories if memories else None,
         mcp_client=mcp_client,
-        post_callback=_post_callback,
         alert_callback=_alert_callback,
-        cancel_check=lambda: _cancel,
+        cancel_check=lambda: state.cancel,
     )
 
     log_loop_execution(
@@ -617,6 +802,7 @@ async def _do_with_claude_ucs(
         started_at=started_at_iso,
     )
 
+    state.last_tool_trace = _cap_trace_size(result.tool_trace) if result.tool_trace else None
     return result.text
 
 
@@ -639,12 +825,25 @@ async def _recall(query: str) -> str:
 # Cancel / Confirm
 # ---------------------------------------------------------------------------
 
-async def _cancel_current_task() -> str:
-    global _cancel
-    _cancel = True
+async def _cancel_current_task(session_key: str = "") -> str:
+    """Cancel the agent loop. Broadcasts across every session by default.
+
+    Called via Gemini tool dispatch when the user says stop/abort. The
+    voice user typically has one active loop, but text users could have
+    another running in parallel — we treat "stop" as the same emergency
+    semantics as `!stop`: kill everything. If a future caller wants to
+    target a single session, pass session_key explicitly.
+    """
+    if session_key:
+        _state_for(session_key).cancel = True
+        target = session_key
+    else:
+        for s in _session_states.values():
+            s.cancel = True
+        target = "all"
     if _alert_callback:
         asyncio.create_task(_alert_callback("Task cancelled via voice command."))
-    return json.dumps({"ok": True, "cancelled": True})
+    return json.dumps({"ok": True, "cancelled": True, "target": target})
 
 
 async def _confirm_action_noop(**kwargs) -> str:
@@ -732,16 +931,21 @@ async def _show_prompt(name: str) -> str:
     return json.dumps({"name": name, "length": len(content), "summary": summary})
 
 
-async def _edit_prompt(name: str, instruction: str) -> str:
+async def _edit_prompt(name: str, instruction: str, session_key: str = "") -> str:
     if not _anthropic_client:
         return json.dumps({"error": "Anthropic client not initialized"})
+    state = _state_for(session_key)
+    state.claude_calls += 1
+    if state.claude_calls > config.per_session_claude_calls_max:
+        return json.dumps({"error": f"Per-session Claude call limit ({config.per_session_claude_calls_max}) reached"})
 
     try:
         current = read_raw(name)
     except FileNotFoundError:
         return json.dumps({"error": f"Prompt '{name}' not found. Available: {list_templates()}"})
 
-    response = _anthropic_client.messages.create(
+    response = await asyncio.to_thread(
+        _anthropic_client.messages.create,
         model=config.claude_model,
         system=(
             "You are editing a prompt template. Return ONLY the complete "
@@ -818,15 +1022,17 @@ async def _prompt_versions(name: str) -> str:
 
 
 async def _reload_prompts() -> str:
+    global _model_costs_cache
     prompts_clear_cache()
+    _model_costs_cache = None
 
     if _reconnect_callback:
-        asyncio.create_task(_reconnect_callback())
+        await _reconnect_callback()
 
     if _alert_callback:
-        asyncio.create_task(_alert_callback("Prompts reloaded. Gemini session reconnecting."))
+        asyncio.create_task(_alert_callback("Prompts reloaded. Gemini session reconnected."))
 
-    return json.dumps({"ok": True, "message": "Prompt cache cleared. Session reconnecting."})
+    return json.dumps({"ok": True, "message": "Prompt cache cleared. Session reconnected."})
 
 
 # ---------------------------------------------------------------------------

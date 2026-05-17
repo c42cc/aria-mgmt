@@ -25,26 +25,50 @@ from .db import get_connection, get_session_record, write_verdict
 
 log = logging.getLogger(__name__)
 
+SNAPSHOTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data", "anchor_snapshots"
+)
+
 SPECS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "specs", "correctness")
 VERDICTS_PATH = os.path.join(config.data_dir, "verdicts.ndjson")
 
 JUDGE_SYSTEM_PROMPT = """\
-You are a correctness judge. You receive a CORRECTNESS SPEC and a SESSION RECORD.
+You are a strict correctness judge. You receive a CORRECTNESS SPEC, a SESSION RECORD \
+(including tool trace with every MCP tool call the agent made), and optionally \
+ANCHOR GROUND-TRUTH REPORTS from deterministic re-verification of the same data sources.
 
-Your job: determine whether the session outputs satisfy the spec given the inputs.
+Your job: determine whether the session outputs satisfy EVERY property in the spec.
 
-Rules:
-- Judge ONLY the properties declared in the spec. Do not invent criteria.
-- Be objective. If a property cannot be verified from the record, note it but do not penalize.
-- "degraded" means partially correct — some properties hold, others violated.
-- "failed" means the output fundamentally does not satisfy the spec.
-- "correct" means all verifiable spec properties are satisfied.
+## Mandatory procedure
 
-Respond with ONLY valid JSON matching this schema:
+1. COUNT the tool calls in the Tool Trace section. State the exact count. \
+Do not estimate or assume — count the ### Call headers.
+2. For each spec property, quote the specific evidence from the record that \
+confirms or violates it. If you cannot find evidence, say "NOT VERIFIABLE" — \
+do not guess or infer.
+3. When Anchor Ground-Truth Reports are present, treat anchor facts as \
+authoritative. If an anchor says count=501 and the agent claimed count=22, \
+the agent is wrong. Do not rationalize the discrepancy.
+4. Check every numeric claim in the agent's output against the tool trace. \
+If the agent says "13 receipts" but the trace shows 8 matching items, cite \
+the mismatch.
+
+## Verdicts
+
+- "correct" — ALL spec properties verified and satisfied. No anchor violations.
+- "degraded" — Some properties satisfied, some violated or unverifiable.
+- "failed" — Any HARD anchor violation, OR the core task was not accomplished, \
+OR the agent fabricated results not grounded in the tool trace.
+
+## Output format
+
+Respond with ONLY valid JSON:
 {"verdict": "correct | degraded | failed", "score": 0.0-1.0, "reasons": ["..."]}
 
-score guide: 1.0 = fully correct, 0.5 = degraded with significant issues, 0.0 = total failure.
-reasons: list specific violations or confirmations. Be concrete, cite evidence from the record."""
+score: 1.0 = fully correct, 0.5 = degraded, 0.0 = total failure.
+reasons: one string per spec property evaluated. Each MUST cite specific evidence \
+(quote tool call numbers, arg values, result excerpts, anchor facts). \
+Never write a reason without a citation."""
 
 
 @dataclass
@@ -78,22 +102,40 @@ def _serialize_record(record: dict[str, Any]) -> str:
     if isinstance(inputs, str):
         inputs = json.loads(inputs)
     if inputs:
-        parts.append(f"\n## Inputs\n```json\n{json.dumps(inputs, indent=2, default=str)[:6000]}\n```")
+        parts.append(f"\n## Inputs\n```json\n{json.dumps(inputs, indent=2, default=str)[:1_000_000]}\n```")
 
     outputs = record.get("outputs_json")
     if isinstance(outputs, str):
         outputs = json.loads(outputs)
     if outputs:
         result = outputs.get("result", "")
-        if isinstance(result, str) and len(result) > 4000:
-            outputs = {**outputs, "result": result[:4000] + "\n... [truncated]"}
-        parts.append(f"\n## Outputs\n```json\n{json.dumps(outputs, indent=2, default=str)[:6000]}\n```")
+        if isinstance(result, str) and len(result) > 1_000_000:
+            outputs = {**outputs, "result": result[:1_000_000] + "\n... [truncated]"}
+        parts.append(f"\n## Outputs\n```json\n{json.dumps(outputs, indent=2, default=str)[:1_000_000]}\n```")
 
     context = record.get("context_json")
     if isinstance(context, str) and context:
         context = json.loads(context)
     if context:
-        parts.append(f"\n## Context\n```json\n{json.dumps(context, indent=2, default=str)[:2000]}\n```")
+        tool_trace = context.get("tool_trace", [])
+        if tool_trace:
+            parts.append(f"\n## Tool Trace ({len(tool_trace)} tool calls)\n")
+            for i, tc in enumerate(tool_trace):
+                tool_name = tc.get("tool", "unknown")
+                args = tc.get("args", tc.get("args_summary", {}))
+                result_chars = tc.get("result_chars", 0)
+                truncated = tc.get("result_truncated", False)
+                result = tc.get("result", tc.get("result_preview", ""))
+                result_preview = result[:1_000_000] if isinstance(result, str) else str(result)[:1_000_000]
+
+                parts.append(f"### Call {i+1}: `{tool_name}`")
+                parts.append(f"Args: `{json.dumps(args, default=str)[:100_000]}`")
+                parts.append(f"Result size: {result_chars} chars (truncated: {truncated})")
+                parts.append(f"Result preview:\n```\n{result_preview}\n```\n")
+
+        other_context = {k: v for k, v in context.items() if k != "tool_trace"}
+        if other_context:
+            parts.append(f"\n## Other Context\n```json\n{json.dumps(other_context, indent=2, default=str)[:1_000_000]}\n```")
 
     return "\n".join(parts)
 
@@ -133,13 +175,116 @@ def _parse_judge_response(text: str) -> dict[str, Any]:
         raise
 
 
-async def evaluate(spec: str, record: dict[str, Any], product: str, session_id: str) -> Verdict:
-    """Product-agnostic correctness judge. Core harness function."""
+async def _run_anchors(record: dict[str, Any]) -> list[dict]:
+    """Run deterministic anchors on every tool call in the session trace.
+
+    Routes through `registry.check_with_cache` so concurrent judge runs that
+    happen to cover the same `(tool, args)` share a single upstream API
+    call. Without this, every parallel agent loop doubled Gmail / Calendar /
+    GitHub traffic per anchor (audit gap L6).
+    """
+    from .anchors import anchor_for
+    from .anchors.base import AnchorReport
+    from .anchors.registry import check_with_cache
+
+    context = record.get("context_json")
+    if isinstance(context, str) and context:
+        context = json.loads(context)
+    if not context or not isinstance(context, dict):
+        return []
+
+    tool_trace = context.get("tool_trace", [])
+    if not tool_trace:
+        return []
+
+    outputs = record.get("outputs_json")
+    if isinstance(outputs, str):
+        outputs = json.loads(outputs)
+    aria_result = (outputs or {}).get("result", "")
+
+    reports = []
+    for tc in tool_trace:
+        tool_name = tc.get("tool", "")
+        anchor = anchor_for(tool_name)
+        if not anchor:
+            continue
+        try:
+            report = await check_with_cache(anchor, tool_name, tc, aria_result)
+            reports.append(report.to_dict())
+        except Exception:
+            log.warning("Anchor check failed for %s", tool_name, exc_info=True)
+            reports.append(AnchorReport(tool=tool_name, unverified=True).to_dict())
+
+    return reports
+
+
+def _format_anchor_section(reports: list[dict]) -> str:
+    if not reports:
+        return ""
+    lines = ["\n## Anchor Ground-Truth Reports\n"]
+    lines.append("These are deterministic facts obtained by independently re-querying the ")
+    lines.append("source of truth. Use them to verify Aria's claims. If an anchor says ")
+    lines.append("a count is X and Aria claimed Y, trust the anchor.\n")
+    for r in reports:
+        if r.get("unverified"):
+            lines.append(f"\n### {r['tool']} — UNVERIFIED (anchor's source was unreachable)\n")
+            continue
+        lines.append(f"\n### {r['tool']} — anchor verdict: **{r['binary']}**")
+        for f in r.get("facts", []):
+            val = f["value"]
+            if isinstance(val, list) and len(str(val)) > 200:
+                val = f"[{len(val)} items]"
+            lines.append(f"- {f['key']}: {val} (source: {f['source']})")
+        for v in r.get("violations", []):
+            lines.append(f"- **VIOLATION** spec#{v['prop']} [{v['severity']}]: {v['detail']}")
+    return "\n".join(lines)
+
+
+def _save_snapshot(session_id: str, reports: list[dict]) -> None:
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    path = os.path.join(SNAPSHOTS_DIR, f"{session_id}.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(reports, f, indent=2, default=str)
+    except Exception:
+        log.warning("Failed to save anchor snapshot for %s", session_id, exc_info=True)
+
+
+async def evaluate(
+    spec: str, record: dict[str, Any], product: str, session_id: str
+) -> Verdict:
+    """Correctness judge with deterministic anchor floor.
+
+    1. Run anchors on every tool call → structured facts + binary verdict.
+    2. Compute anchor floor = worst(all anchor binaries).
+    3. Run LLM judge with anchor facts injected into the prompt.
+    4. Apply floor rule: final = min(anchor_floor, llm_verdict).
+    """
     from google import genai
+    from .anchors.base import verdict_min
+
+    anchor_reports = await _run_anchors(record)
+    _save_snapshot(session_id, anchor_reports)
+
+    # Anchor floor: worst-binary verdict across all verified anchor reports.
+    # `None` means we have no verified anchors (every one was unreachable),
+    # in which case `evaluate()` falls through to the LLM verdict only.
+    verified = [r for r in anchor_reports if not r.get("unverified")]
+    if verified:
+        from .anchors.base import VERDICT_RANK
+        worst = "correct"
+        for r in verified:
+            b = r.get("binary", "correct")
+            if VERDICT_RANK.get(b, 0) < VERDICT_RANK.get(worst, 0):
+                worst = b
+        anchor_floor = worst
+    else:
+        anchor_floor = None
 
     record_text = _serialize_record(record)
+    anchor_section = _format_anchor_section(anchor_reports)
 
-    prompt = f"## Correctness Spec\n\n{spec}\n\n## Session Record\n\n{record_text}"
+    prompt = f"## Correctness Spec\n\n{spec}\n\n## Session Record\n\n{record_text}{anchor_section}"
 
     client = genai.Client(api_key=config.google_api_key)
     response = await client.aio.models.generate_content(
@@ -153,29 +298,41 @@ async def evaluate(spec: str, record: dict[str, Any], product: str, session_id: 
 
     try:
         parsed = _parse_judge_response(response.text)
-        verdict_str = parsed.get("verdict", "failed")
-        if verdict_str not in ("correct", "degraded", "failed"):
-            verdict_str = "failed"
+        llm_verdict = parsed.get("verdict", "failed")
+        if llm_verdict not in ("correct", "degraded", "failed"):
+            llm_verdict = "failed"
         score = float(parsed.get("score", 0.0))
         reasons = parsed.get("reasons", [])
         if isinstance(reasons, str):
             reasons = [reasons]
     except (json.JSONDecodeError, ValueError):
         log.warning("Judge returned unparseable response: %s", response.text[:200])
-        verdict_str = "degraded"
+        llm_verdict = "degraded"
         score = 0.5
         reasons = [f"Judge response unparseable: {response.text[:200]}"]
+
+    if anchor_floor is not None:
+        final_verdict = verdict_min(anchor_floor, llm_verdict)
+        if final_verdict != llm_verdict:
+            reasons.insert(0, f"[ANCHOR FLOOR] LLM judged '{llm_verdict}' but anchor floor is '{anchor_floor}' — capped to '{final_verdict}'")
+            score = min(score, {"correct": 1.0, "degraded": 0.5, "failed": 0.0}[final_verdict])
+    else:
+        final_verdict = llm_verdict
 
     verdict = Verdict(
         product=product,
         session_id=session_id,
-        verdict=verdict_str,
+        verdict=final_verdict,
         score=score,
         reasons=reasons,
         judged_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    write_verdict(verdict.product, verdict.session_id, verdict.verdict, verdict.score, verdict.reasons)
+    anchor_reports_json = json.dumps(anchor_reports, default=str) if anchor_reports else None
+    write_verdict(
+        verdict.product, verdict.session_id, verdict.verdict, verdict.score, verdict.reasons,
+        anchor_floor=anchor_floor, anchor_reports_json=anchor_reports_json,
+    )
     _write_verdict_ndjson(verdict)
 
     if verdict.verdict == "failed":

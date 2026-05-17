@@ -280,6 +280,85 @@ async def probe_mcp_gcal(mcp_client: Any) -> tuple[bool, str, str, str]:
     return True, "", "", f"{len(tools)} tools, OAuth verified"
 
 
+async def probe_mcp_gmail(mcp_client: Any) -> tuple[bool, str, str, str]:
+    """Gmail MCP server connected and can actually search mail (not just connect)."""
+    if mcp_client is None or "gmail" not in mcp_client._servers:
+        return (
+            False,
+            "gmail MCP not running (OAuth keys missing or npm package not installed)",
+            ".venv/bin/python scripts/gmail_oauth.py",
+            "Run the OAuth bootstrap to grant Gmail API access",
+        )
+    gmail_tools = [t for t in mcp_client._tools if mcp_client._tool_to_server.get(t) == "gmail"]
+    if not gmail_tools:
+        return False, "gmail server connected but has no tools", "", ""
+
+    search_tool = None
+    for t in gmail_tools:
+        if "search" in t.lower() or "list" in t.lower() or "inbox" in t.lower():
+            search_tool = t
+            break
+
+    if not search_tool:
+        return False, "gmail has no search/list tool — cannot verify live access", "", f"tools: {gmail_tools[:5]}"
+
+    try:
+        result = await mcp_client.call_tool(search_tool, {"query": "newer_than:7d", "maxResults": 3})
+        text = str(result)
+        if "error" in text.lower()[:100] or "no access" in text.lower()[:100]:
+            return False, "Gmail auth failed — re-run OAuth", ".venv/bin/python scripts/gmail_oauth.py", text[:200]
+        if not text.strip() or text.strip() == "[]" or "no messages" in text.lower()[:100]:
+            return False, "Gmail returned empty results for last 7 days — OAuth may be for wrong account", "", text[:200]
+        return True, "", "", f"Gmail live — {text[:120]}"
+    except Exception as e:
+        return False, f"Gmail probe failed: {e}", "", ""
+
+
+async def probe_anchor_smoke() -> tuple[bool, str, str, str]:
+    """Verify that anchor dependencies (Gmail API, Calendar API, filesystem, GitHub) are reachable.
+
+    Fast health check (~5s). An ImportError here means the anchor module is
+    broken (e.g. a missing dependency) — surface it loudly rather than
+    masking it as "skipped." Live-API reachability per anchor is still
+    bounded by per-anchor timeouts and downgraded to WARN at probe level.
+    """
+    try:
+        from .anchors.gmail import GmailSearchAnchor
+        from .anchors.calendar_google import GoogleCalendarAnchor
+        from .anchors.filesystem import FilesystemSearchAnchor
+        from .anchors.github_anchor import GithubAnchor
+    except ImportError as e:
+        return (
+            False,
+            f"anchor module failed to import: {e}",
+            ".venv/bin/pip install -e . && python -c 'from src.anchors import gmail'",
+            "Anchor smoke probe cannot run; the judge floor will be disabled.",
+        )
+
+    anchors = {
+        "gmail": GmailSearchAnchor(),
+        "calendar": GoogleCalendarAnchor(),
+        "filesystem": FilesystemSearchAnchor(),
+        "github": GithubAnchor(),
+    }
+
+    results = {}
+    for name, anchor in anchors.items():
+        try:
+            ok = await asyncio.wait_for(anchor.health_check(), timeout=5)
+            results[name] = "ok" if ok else "down"
+        except asyncio.TimeoutError:
+            results[name] = "timeout"
+        except Exception as e:
+            results[name] = f"err:{str(e)[:30]}"
+
+    healthy = [k for k, v in results.items() if v == "ok"]
+    summary = ", ".join(f"{k}={v}" for k, v in results.items())
+    if not healthy:
+        return False, "no anchor deps reachable", "", summary
+    return True, "", "", f"{len(healthy)}/{len(anchors)} anchors: {summary}"
+
+
 async def probe_cursor_bridge(cursor_bridge: Any) -> tuple[bool, str, str, str]:
     """Cursor bridge subprocess alive and responds to a ping."""
     if cursor_bridge is None or not cursor_bridge.alive:
@@ -537,6 +616,8 @@ async def probe_judge_available() -> tuple[bool, str, str, str]:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+_preflight_inflight = asyncio.Lock()
+
 
 async def run_all(
     *,
@@ -550,7 +631,38 @@ async def run_all(
 
     Probes run sequentially (most are cheap; isolating failures matters more
     than parallelism). MCP probes are skipped if mcp_client wasn't passed.
+    Serialized by _preflight_inflight to prevent concurrent runs.
     """
+    if _preflight_inflight.locked():
+        report = PreflightReport(started_at=datetime.now(timezone.utc).isoformat())
+        report.results.append(ProbeResult(
+            name="preflight_concurrent",
+            ok=True,
+            severity=INFO,
+            detail="Another preflight run is in progress — skipped",
+        ))
+        report.finished_at = datetime.now(timezone.utc).isoformat()
+        return report
+
+    async with _preflight_inflight:
+        return await _run_all_inner(
+            mcp_client=mcp_client,
+            cursor_bridge=cursor_bridge,
+            alert_callback=alert_callback,
+            include_gemini=include_gemini,
+            include_cursor=include_cursor,
+        )
+
+
+async def _run_all_inner(
+    *,
+    mcp_client: Any = None,
+    cursor_bridge: Any = None,
+    alert_callback: Callable | None = None,
+    include_gemini: bool = True,
+    include_cursor: bool = True,
+) -> PreflightReport:
+    """Inner implementation of run_all, called under _preflight_inflight lock."""
     report = PreflightReport(started_at=datetime.now(timezone.utc).isoformat())
 
     # Probes that don't need outside services
@@ -592,6 +704,14 @@ async def run_all(
         report.results.append(
             await _run_probe("mcp_google_calendar", WARN, lambda: probe_mcp_gcal(mcp_client))
         )
+        report.results.append(
+            await _run_probe("mcp_gmail", WARN, lambda: probe_mcp_gmail(mcp_client))
+        )
+
+    # Anchor health checks
+    report.results.append(
+        await _run_probe("anchor_smoke", WARN, probe_anchor_smoke)
+    )
 
     # Cursor bridge
     if include_cursor and cursor_bridge is not None:

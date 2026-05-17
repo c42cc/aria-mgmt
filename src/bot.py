@@ -12,9 +12,10 @@ import discord
 from discord.ext import commands
 
 from .config import config
+from .conversation import conversation
 from .cursor_bridge import CursorBridge
 from .db import init_db, get_daily_spend, log_event, upsert_cursor_session, update_cursor_session_event
-from .discord_voice import voice_bridge
+from .discord_voice import VoiceTransitionBusy, voice_bridge, voice_controller
 from .gemini_session import GeminiSession
 from .local_audio import SpeakerOutput
 from .memory import init_memory, remember, recall
@@ -38,7 +39,6 @@ gemini: GeminiSession | None = None
 _cancel_flag = False
 _audio_tasks: list[asyncio.Task] = []
 _last_audio_received_at: float = 0.0
-_last_user_activity_at: float = 0.0
 _session_paused: bool = False
 _pause_transcript: str = ""
 
@@ -51,12 +51,13 @@ _grok_session_started_at: float = 0.0
 _grok_paused: bool = False
 
 _pending_voice_channel_id: str | None = None
-_in_discord_voice: bool = False
 
 _wake_listener = None          # WakeWordListener | None (typed loosely to avoid import at module level)
 _local_speaker: SpeakerOutput | None = None
 _local_session_active: bool = False
 _local_silence_task: asyncio.Task | None = None
+
+_on_ready_done = False
 
 IDLE_TIMEOUT_SEC = 25
 GROK_IDLE_TIMEOUT_SEC = 25
@@ -75,7 +76,7 @@ async def _on_wake_word() -> None:
 
     if _local_session_active:
         return
-    if _in_discord_voice:
+    if voice_controller.in_voice:
         log.debug("Wake word heard but Discord voice is active — ignoring")
         return
     if not gemini:
@@ -178,7 +179,15 @@ def _split_at_paragraphs(text: str, max_len: int = 1900) -> list[str]:
 
 
 async def post_to_text(content: str, thread: discord.Thread | None = None) -> None:
-    """Post content to #ucs (or a thread). Handles chunking and file fallback."""
+    """Post content to #ucs (or a thread). Handles chunking and file fallback.
+
+    This is a low-level Discord posting function used by many callers
+    (build threads, tool results, plan outputs, etc.). It does NOT record
+    into the conversation buffer — callers that represent actual
+    conversational replies (like _handle_text_conversation and _run_ask)
+    are responsible for recording their own turns. This prevents build
+    thread noise and tool dumps from polluting the buffer.
+    """
     ch = bot.get_channel(int(config.discord_text_channel_id))
     if not ch:
         raise RuntimeError(f"Text channel {config.discord_text_channel_id} not found — bot cannot post")
@@ -194,12 +203,63 @@ async def post_to_text(content: str, thread: discord.Thread | None = None) -> No
 
 
 async def post_to_alerts(content: str) -> None:
-    """Post to #ucs-alerts."""
+    """Post to #ucs-alerts. Recorded in the conversation buffer as a
+    system alert so text-Aria can answer 'what was that error?' from
+    `#ucs`."""
     ch = bot.get_channel(int(config.discord_log_channel_id))
     if not ch:
         raise RuntimeError(f"Alert channel {config.discord_log_channel_id} not found — bot cannot post alerts")
     for chunk in _split_at_paragraphs(content):
         await ch.send(chunk)
+    conversation.add_alert(content)
+
+
+async def _mirror_to_voice_chat(prefix: str, text: str) -> None:
+    """Post text to the currently-active voice channel's text-in-voice chat.
+
+    No-op when the bot is not in a voice channel. Used to mirror Aria's
+    spoken replies (and the user's transcribed utterances) so the voice
+    session has a scrollable transcript visible in the same Discord
+    channel as the audio.
+    """
+    if not voice_controller.channel_id:
+        return
+    ch = bot.get_channel(int(voice_controller.channel_id))
+    if not ch or not isinstance(ch, discord.VoiceChannel):
+        return
+    body = f"**{prefix}** {text}" if prefix else text
+    for chunk in _split_at_paragraphs(body):
+        try:
+            await ch.send(chunk)
+        except discord.HTTPException:
+            log.exception("Failed to mirror transcript to voice chat %s", ch.name)
+            return
+
+
+async def _on_voice_transcript(role: str, text: str) -> None:
+    """Callback from GeminiSession on every completed voice turn.
+
+    Records the turn in the shared conversation buffer (so text-Aria
+    keeps continuity) and mirrors it to the voice channel's text chat
+    (so the user has a scrollable transcript alongside the audio).
+    """
+    if not text:
+        return
+
+    channel_name = "voice"
+    if voice_controller.channel_id:
+        ch = bot.get_channel(int(voice_controller.channel_id))
+        if ch is not None:
+            channel_name = f"#{getattr(ch, 'name', voice_controller.channel_id)}"
+
+    if role == "user":
+        conversation.add_user_voice(channel=channel_name, text=text)
+        await _mirror_to_voice_chat("You said:", text)
+    elif role == "aria":
+        conversation.add_aria_voice(channel=channel_name, text=text)
+        await _mirror_to_voice_chat("Aria:", text)
+    else:
+        log.warning("Unknown transcript role %r — dropping", role)
 
 
 async def create_build_thread(session_id: str, project: str) -> discord.Thread | None:
@@ -218,10 +278,22 @@ async def create_build_thread(session_id: str, project: str) -> discord.Thread |
 # Tool handler callback injection
 # ---------------------------------------------------------------------------
 
+_VOICE_VISIBLE_TOOLS = frozenset({"do_with_claude", "plan_with_claude"})
+
 async def _handle_tool_call(name: str, args: dict) -> str:
-    """Dispatch a tool call, injecting bot-level callbacks."""
+    """Dispatch a Gemini Live tool call and mirror long results to #ucs.
+
+    Gemini speaks the result; for long outputs the user also wants the
+    verbatim text in #ucs.  That side effect lives here, at the voice-
+    entry boundary, so text callers (_handle_text_conversation, _run_ask)
+    that already send the result to message.channel do not trigger a
+    duplicate post.
+    """
     from .tools import handle_tool_call
-    return await handle_tool_call(name, args)
+    result = await handle_tool_call(name, args)
+    if name in _VOICE_VISIBLE_TOOLS and result:
+        asyncio.create_task(post_to_text(result))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +306,10 @@ async def _on_voice_audio(pcm: bytes) -> None:
     If a session was paused due to idle timeout, reconnect it transparently
     and resume with the saved transcript context.
     """
-    global _last_audio_received_at, _last_user_activity_at
+    global _last_audio_received_at
     global _session_paused, _pause_transcript, _grok_paused
     _last_audio_received_at = time.monotonic()
-    _last_user_activity_at = time.monotonic()
+    voice_controller.touch()
 
     if _spicylit_active:
         if _grok_paused and _grok_session:
@@ -251,7 +323,6 @@ async def _on_voice_audio(pcm: bytes) -> None:
             _cancel_audio_tasks()
             _audio_tasks.append(asyncio.create_task(_drain_grok_to_voice()))
             _audio_tasks.append(asyncio.create_task(_grok_watchdog_task()))
-            _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
         if _grok_session and _grok_session.connected:
             await _grok_session.send_audio(pcm)
     else:
@@ -266,7 +337,6 @@ async def _on_voice_audio(pcm: bytes) -> None:
             _cancel_audio_tasks()
             _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
             _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
-            _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
             if _pause_transcript:
                 try:
                     await gemini.inject_text(
@@ -276,6 +346,13 @@ async def _on_voice_audio(pcm: bytes) -> None:
                 except Exception:
                     log.exception("Failed to inject resume transcript into Gemini")
                 _pause_transcript = ""
+
+            try:
+                buffer_ctx = conversation.as_gemini_injection(max_turns=10)
+                if buffer_ctx:
+                    await gemini.inject_text(buffer_ctx, turn_complete=False)
+            except Exception:
+                log.exception("Failed to inject conversation buffer on resume")
         if gemini and gemini.connected:
             await gemini.send_audio(pcm)
 
@@ -327,68 +404,42 @@ def _cancel_audio_tasks() -> None:
     _audio_tasks.clear()
 
 
-async def _voice_exit_watchdog_task() -> None:
-    """Leave voice channel after VOICE_EXIT_TIMEOUT_SEC of total user silence.
+async def _on_voice_exit_timeout() -> None:
+    """Callback from VoiceController when the exit watchdog fires.
 
-    Unlike the per-session pause watchdogs, this fires even while sessions are
-    already paused and triggers a full disconnect from the voice channel.
+    Handles app-level cleanup (cancel audio tasks, close sessions, post
+    alert). The controller handles bridge.leave() and state transition.
     """
     global _spicylit_active, _grok_session, _session_paused, _grok_paused
-    global _pause_transcript, _last_user_activity_at, _in_discord_voice
+    global _pause_transcript
+    _cancel_audio_tasks()
+
+    _session_paused = False
+    _grok_paused = False
+    _pause_transcript = ""
+
+    if _spicylit_active and _grok_session:
+        _log_grok_cost()
+        try:
+            if _grok_session.connected:
+                await _grok_session.close()
+        except Exception:
+            log.exception("Error closing Grok on voice exit")
+        _grok_session = None
+        _spicylit_active = False
+
+    if gemini and gemini.connected:
+        try:
+            await gemini.close()
+        except Exception:
+            log.exception("Error closing Gemini on voice exit")
+
     try:
-        while True:
-            await asyncio.sleep(30)
-            if _last_user_activity_at == 0:
-                continue
-            idle = time.monotonic() - _last_user_activity_at
-            if idle < VOICE_EXIT_TIMEOUT_SEC:
-                continue
-
-            log.info("%.0fs silence — auto-leaving voice channel", idle)
-            _in_discord_voice = False
-
-            current = asyncio.current_task()
-            for task in _audio_tasks:
-                if task is not current and not task.done():
-                    task.cancel()
-            _audio_tasks.clear()
-
-            _session_paused = False
-            _grok_paused = False
-            _pause_transcript = ""
-            _last_user_activity_at = 0.0
-
-            if _spicylit_active and _grok_session:
-                _log_grok_cost()
-                try:
-                    if _grok_session.connected:
-                        await _grok_session.close()
-                except Exception:
-                    log.exception("Error closing Grok on voice exit")
-                _grok_session = None
-                _spicylit_active = False
-
-            if gemini and gemini.connected:
-                try:
-                    await gemini.close()
-                except Exception:
-                    log.exception("Error closing Gemini on voice exit")
-
-            try:
-                await voice_bridge.leave()
-            except Exception:
-                log.exception("Error leaving voice channel on timeout")
-
-            try:
-                await post_to_alerts(
-                    "Left voice channel after 10 minutes of silence."
-                )
-            except Exception:
-                log.exception("Failed to post voice exit alert")
-
-            return
-    except asyncio.CancelledError:
-        pass
+        await post_to_alerts(
+            "Left voice channel after 10 minutes of silence."
+        )
+    except Exception:
+        log.exception("Failed to post voice exit alert")
 
 
 async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
@@ -402,19 +453,14 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
     DISCORD_SPICYLIT_CHANNEL_ID, otherwise the Gemini/Aria pipeline.
     """
     global _spicylit_active, _grok_session, _grok_session_started_at
-    global _last_audio_received_at, _last_user_activity_at
-    global _in_discord_voice
-
-    if not voice_bridge.alive:
-        log.warning("Asked to auto-join %s but voice bridge not alive", channel.name)
-        return
+    global _last_audio_received_at
 
     is_spicylit = (
         config.discord_spicylit_channel_id
         and str(channel.id) == config.discord_spicylit_channel_id
     )
 
-    if _in_discord_voice:
+    if voice_controller.in_voice:
         if is_spicylit and _spicylit_active and _grok_session and _grok_session.connected:
             log.info("SpicyLit already active in %s — skipping duplicate join", channel.name)
             return
@@ -422,16 +468,26 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
             log.info("Gemini already active in voice — skipping duplicate join")
             return
 
+    if not voice_bridge.alive:
+        log.warning("Asked to auto-join %s but voice bridge not alive", channel.name)
+        return
+
     if _local_session_active:
         await _close_local_session()
+    if _wake_listener:
+        _wake_listener.pause()
 
-    log.info("Auto-joining voice channel %s", channel.name)
-    voice_bridge.register_audio_callback(_on_voice_audio)
-    await voice_bridge.join(str(channel.id))
-    _in_discord_voice = True
+    joined = await voice_controller.join(
+        str(channel.id),
+        audio_callback=_on_voice_audio,
+        on_watchdog_expire=_on_voice_exit_timeout,
+    )
+    if not joined:
+        log.info("Voice join skipped for %s (already in voice or transition in progress)", channel.name)
+        return
 
+    log.info("Joined voice channel %s", channel.name)
     _last_audio_received_at = 0.0
-    _last_user_activity_at = time.monotonic()
     _cancel_audio_tasks()
 
     if is_spicylit:
@@ -470,7 +526,6 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
 
         _audio_tasks.append(asyncio.create_task(_drain_grok_to_voice()))
         _audio_tasks.append(asyncio.create_task(_grok_watchdog_task()))
-        _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
         log.info("Grok voice pipeline active for #spicy-lit (mode=%s)", STORY)
     else:
         if gemini and not gemini.connected:
@@ -482,20 +537,13 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
 
         _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
         _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
-        _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
 
-        # Inject join context with turn_complete=False so Gemini knows the
-        # user just joined but does NOT auto-speak a greeting. The user's
-        # first utterance is the only thing that should trigger Aria's first
-        # spoken turn. A `turn_complete=True` greeting here used to collide
-        # with the user's first request (Gemini queued both turns) and
-        # produced the "double response" the user reported.
         if gemini and gemini.connected:
             try:
-                await gemini.inject_text(
-                    "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]",
-                    turn_complete=False,
-                )
+                buffer_ctx = conversation.as_gemini_injection(max_turns=10)
+                preamble = "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]"
+                injection = f"{preamble}\n\n{buffer_ctx}" if buffer_ctx else preamble
+                await gemini.inject_text(injection, turn_complete=False)
             except Exception:
                 log.exception("Failed to inject join context into Gemini")
 
@@ -567,98 +615,123 @@ async def _cursor_event_consumer(
 @bot.event
 async def on_ready():
     global gemini, _preflight_passed, _last_preflight_report
-    global _last_user_activity_at, _pending_voice_channel_id
+    global _pending_voice_channel_id
+    global _on_ready_done
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
 
-    init_db()
-    init_memory()
+    if not _on_ready_done:
+        init_db()
+        init_memory()
 
-    async def _gemini_reconnect() -> None:
-        if gemini:
-            await gemini.reconnect()
+        async def _gemini_reconnect() -> None:
+            if gemini:
+                await gemini.reconnect()
 
-    from .tools import init_tools
-    init_tools(
-        cursor_bridge=cursor_bridge,
-        post_callback=post_to_text,
-        alert_callback=post_to_alerts,
-        thread_callback=create_build_thread,
-        cursor_event_callback=_cursor_event_consumer,
-        reconnect_callback=_gemini_reconnect,
-    )
-
-    await cursor_bridge.start()
-
-    try:
-        await voice_bridge.start()
-    except Exception:
-        log.exception("voice bridge failed to start — !join will not work")
-
-    gemini = GeminiSession(tool_handler=_handle_tool_call)
-
-    from .tools import set_transcript_provider
-    set_transcript_provider(lambda: gemini.get_recent_transcript(3) if gemini else [])
-
-    # Bring up MCP and run preflight *before* declaring ready
-    from .mcp import init_mcp
-    mcp = None
-    try:
-        mcp = await init_mcp()
-        log.info("MCP fleet started")
-
-        async def _confirm_callback(action_id: str, tool_name: str, summary: str) -> dict:
-            await post_to_alerts(f"**Confirmation required:**\n`{tool_name}`: {summary}")
-            if gemini and gemini.connected:
-                await gemini.inject_text(
-                    f"I need your approval. About to run: {tool_name}. Details: {summary}. "
-                    "Do you approve? Say yes or no.",
-                    turn_complete=True,
-                )
-            return await gemini.wait_for_confirmation(action_id, timeout=60.0)
-
-        mcp.set_confirm_callback(_confirm_callback)
-    except Exception:
-        log.exception("MCP fleet failed to start — preflight will flag MCP probes")
-
-    # Run preflight contract
-    from .preflight import run_all, format_report
-    report = await run_all(
-        mcp_client=mcp,
-        cursor_bridge=cursor_bridge,
-        alert_callback=post_to_alerts,
-        include_gemini=True,
-        include_cursor=True,
-    )
-    _last_preflight_report = report
-    _preflight_passed = report.ok
-
-    formatted = format_report(report, markdown=True)
-    try:
-        await post_to_alerts(formatted)
-    except Exception:
-        log.exception("Failed to post preflight report to alerts channel")
-
-    if not report.ok:
-        log.error(
-            "PREFLIGHT FAILED: %d critical / %d warnings. Bot will NOT accept !join.",
-            len(report.critical_failures), len(report.warnings),
+        from .tools import init_tools
+        init_tools(
+            cursor_bridge=cursor_bridge,
+            post_callback=post_to_text,
+            alert_callback=post_to_alerts,
+            thread_callback=create_build_thread,
+            cursor_event_callback=_cursor_event_consumer,
+            reconnect_callback=_gemini_reconnect,
         )
-        for r in report.critical_failures:
-            log.error("  [CRIT] %s: %s | fix: %s", r.name, r.error, r.fix_command)
-        return
 
-    log.info("Preflight passed (%d probes). Gemini will connect on !join.", len(report.results))
+        await cursor_bridge.start()
 
-    # Start wake-word listener for local Mac voice
-    global _wake_listener
-    try:
-        from .wake_word import WakeWordListener
-        _wake_listener = WakeWordListener(on_wake=_on_wake_word)
-        await _wake_listener.start()
-        log.info("Wake-word listener active")
-    except Exception:
-        log.exception("Wake-word listener failed to start — local voice unavailable")
-        _wake_listener = None
+        try:
+            await voice_bridge.start()
+        except Exception:
+            log.exception("voice bridge failed to start — !join will not work")
+
+        async def _on_orphan_tool_result(tool_name: str, fc_id: str, result: str) -> None:
+            """Loud failure for L1: tool ran but session closed before response sent."""
+            preview = result[:500].replace("\n", " ")
+            try:
+                await post_to_alerts(
+                    f"**ORPHAN TOOL RESULT** `{tool_name}` (id={fc_id[:12]}) — "
+                    f"the tool finished but the Gemini session closed before the "
+                    f"result could be returned to the model. "
+                    f"Side effects may have completed. Preview: `{preview}`"
+                )
+            except Exception:
+                log.exception("Failed to post orphan-tool alert")
+
+        gemini = GeminiSession(
+            tool_handler=_handle_tool_call,
+            transcript_callback=_on_voice_transcript,
+            orphan_callback=_on_orphan_tool_result,
+        )
+
+        from .tools import set_transcript_provider
+        set_transcript_provider(lambda: gemini.get_recent_transcript(3) if gemini else [])
+
+        from .mcp import init_mcp
+        mcp = None
+        try:
+            mcp = await init_mcp()
+            log.info("MCP fleet started")
+
+            async def _confirm_callback(action_id: str, tool_name: str, summary: str) -> dict:
+                await post_to_alerts(f"**Confirmation required:**\n`{tool_name}`: {summary}")
+                if gemini and gemini.connected:
+                    await gemini.inject_text(
+                        f"I need your approval. About to run: {tool_name}. Details: {summary}. "
+                        "Do you approve? Say yes or no.",
+                        turn_complete=True,
+                    )
+                return await gemini.wait_for_confirmation(action_id, timeout=60.0)
+
+            mcp.set_confirm_callback(_confirm_callback)
+        except Exception:
+            log.exception("MCP fleet failed to start — preflight will flag MCP probes")
+
+        from .preflight import run_all, format_report
+        report = await run_all(
+            mcp_client=mcp,
+            cursor_bridge=cursor_bridge,
+            alert_callback=post_to_alerts,
+            include_gemini=True,
+            include_cursor=True,
+        )
+        _last_preflight_report = report
+        _preflight_passed = report.ok
+
+        formatted = format_report(report, markdown=True)
+        try:
+            await post_to_alerts(formatted)
+        except Exception:
+            log.exception("Failed to post preflight report to alerts channel")
+
+        if not report.ok:
+            log.error(
+                "PREFLIGHT FAILED: %d critical / %d warnings. Bot will NOT accept !join.",
+                len(report.critical_failures), len(report.warnings),
+            )
+            for r in report.critical_failures:
+                log.error("  [CRIT] %s: %s | fix: %s", r.name, r.error, r.fix_command)
+            return
+
+        log.info("Preflight passed (%d probes). Gemini will connect on !join.", len(report.results))
+
+        global _wake_listener
+        if _wake_listener is not None:
+            try:
+                _wake_listener.stop()
+            except Exception:
+                pass
+        try:
+            from .wake_word import WakeWordListener
+            _wake_listener = WakeWordListener(on_wake=_on_wake_word)
+            await _wake_listener.start()
+            log.info("Wake-word listener active")
+        except Exception:
+            log.exception("Wake-word listener failed to start — local voice unavailable")
+            _wake_listener = None
+
+        _on_ready_done = True
+    else:
+        log.info("on_ready re-fired (Discord WS resume) — skipping boot-only init")
 
     target_channel: discord.VoiceChannel | None = None
 
@@ -684,8 +757,17 @@ async def on_ready():
 
 @bot.command()
 async def join(ctx: commands.Context):
-    """Join the voice channel and start Gemini session."""
-    global _last_audio_received_at, _last_user_activity_at, _in_discord_voice
+    """Join the voice channel and start Gemini session.
+
+    Idempotent: if we are already in voice with a healthy Gemini session,
+    short-circuits with a one-liner. The VoiceController serializes all
+    voice transitions so concurrent !join / auto-join cannot race.
+    """
+    global _last_audio_received_at
+
+    if voice_controller.in_voice and gemini and gemini.connected:
+        await ctx.send("Already in voice.")
+        return
 
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
@@ -703,37 +785,57 @@ async def join(ctx: commands.Context):
         await ctx.send("Voice bridge not running — check DISCORD_VOICE_BOT_TOKEN.")
         return
 
+    if voice_controller.locked:
+        await ctx.send("A voice join is already in progress — skipping duplicate.")
+        return
+
     if _local_session_active:
         await _close_local_session()
+    if _wake_listener:
+        _wake_listener.pause()
 
-    voice_bridge.register_audio_callback(_on_voice_audio)
-    await voice_bridge.join(str(ctx.author.voice.channel.id))
-    _in_discord_voice = True
+    joined = await voice_controller.join(
+        str(ctx.author.voice.channel.id),
+        audio_callback=_on_voice_audio,
+        on_watchdog_expire=_on_voice_exit_timeout,
+    )
+    if not joined:
+        if voice_controller.in_voice:
+            await ctx.send("Already in voice (resolved by auto-join while you typed `!join`).")
+        else:
+            await ctx.send("A voice transition completed — try again.")
+        return
+
+    _last_audio_received_at = 0.0
+    _cancel_audio_tasks()
+
     await ctx.send(f"Joined {ctx.author.voice.channel.name}")
 
     if gemini and not gemini.connected:
         await gemini.connect()
 
-    _last_audio_received_at = 0.0
-    _last_user_activity_at = time.monotonic()
+    if gemini and gemini.connected:
+        try:
+            buffer_ctx = conversation.as_gemini_injection(max_turns=10)
+            if buffer_ctx:
+                await gemini.inject_text(buffer_ctx, turn_complete=False)
+        except Exception:
+            log.exception("Failed to inject conversation buffer on !join")
 
     _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
     _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
-    _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
 
 
 @bot.command()
 async def leave(ctx: commands.Context):
     """Leave voice channel and close Gemini session."""
-    global _in_discord_voice
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
         return
-    _in_discord_voice = False
     _cancel_audio_tasks()
     if gemini and gemini.connected:
         await gemini.close()
-    await voice_bridge.leave()
+    await voice_controller.leave()
     await ctx.send("Left voice channel.")
 
 
@@ -865,10 +967,33 @@ async def ask(ctx: commands.Context, *, message: str):
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
         return
+    await _run_ask(ctx.channel, message)
 
-    await ctx.send(f"Working on it...")
+
+async def _run_ask(channel, message: str) -> None:
+    """Shared implementation for !ask — works for both commands and webhook messages.
+
+    This is the *programmatic* entry point (iOS Shortcuts, webhook tests,
+    automated callers). Every invocation is a clean slate: we do **not**
+    prepend conversation buffer context here. Two reasons:
+
+    1. Test reproducibility — the same `!ask` should produce the same
+       agent loop regardless of what previous text exchanges polluted
+       the buffer.
+    2. Programmatic callers do not have a 'conversation' — they have a
+       request. Borrowing context from a prior session can short-circuit
+       tool calls the new request actually requires (verified: the agent
+       once skipped `mail_messages` because the prior reply was in the
+       task body).
+
+    The natural-text-in-`#ucs` path (`_handle_text_conversation`) is
+    where conversational continuity belongs.
+    """
+    channel_name = f"#{getattr(channel, 'name', channel.id)}"
+    conversation.add_user_text(channel=channel_name, text=message)
+    await channel.send("Working on it...")
     from .tools import handle_tool_call
-    session_key = str(ctx.channel.id)
+    session_key = str(channel.id)
     try:
         result = await handle_tool_call("do_with_claude", {
             "task": message,
@@ -876,11 +1001,131 @@ async def ask(ctx: commands.Context, *, message: str):
         })
         if len(result) > 1900:
             await post_to_text(result)
-            await ctx.send("Done — full result posted to #ucs.")
+            await channel.send("Done — full result posted to #ucs.")
         else:
-            await ctx.send(result)
+            await channel.send(result)
+        conversation.add_aria_text(channel=channel_name, text=result)
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await channel.send(f"Error: {e}")
+
+
+def _augment_with_context(user_text: str) -> str:
+    """Prepend recent conversation thread to a Claude task, if any.
+
+    `exclude_last=1` drops the user turn the caller already recorded so
+    it isn't repeated in the task body.
+    """
+    ctx = conversation.as_claude_context(max_turns=10, exclude_last=1)
+    if not ctx:
+        return user_text
+    return f"{ctx}\nUser just said: {user_text}"
+
+
+async def _handle_text_conversation(message: discord.Message) -> None:
+    """Route a conversational message in #ucs through Claude.
+
+    Same dispatch as !ask but without requiring the prefix, and the
+    user's message + Aria's reply are recorded in the conversation
+    buffer so the next voice session has full context.
+
+    If a Gemini session is currently connected (user is on voice while
+    also typing), we forward the exchange into Gemini's live context so
+    voice-Aria stays in sync turn-by-turn — but the *reply* still comes
+    back as text. The user gets the medium they asked for.
+    """
+    user_text = message.content.strip()
+    if not user_text:
+        return
+
+    if message.attachments:
+        attach_names = [a.filename for a in message.attachments]
+        user_text = (
+            f"{user_text}\n\n"
+            f"[User attached {len(attach_names)} file(s): {', '.join(attach_names)}. "
+            f"Vision-on-text routing is not yet wired — describe what you'd do with the "
+            f"attachment and ask the user to share its contents inline if needed.]"
+        )
+
+    channel_name = f"#{getattr(message.channel, 'name', message.channel.id)}"
+    conversation.add_user_text(channel=channel_name, text=user_text)
+
+    if gemini and gemini.connected:
+        try:
+            await gemini.inject_text(
+                f"[Heads-up: user just sent text in {channel_name}: {user_text[:4000]}]",
+                turn_complete=False,
+            )
+        except Exception:
+            log.exception("Failed to inject user text into Gemini live context")
+
+    from .tools import handle_tool_call
+    async with message.channel.typing():
+        try:
+            result = await handle_tool_call("do_with_claude", {
+                "task": _augment_with_context(user_text),
+                "session_key": str(message.channel.id),
+            })
+        except Exception:
+            log.exception("Text conversation route failed")
+            await message.channel.send(
+                "Something went wrong handling that — check #ucs-alerts for details."
+            )
+            return
+
+    if len(result) <= 1900:
+        await message.channel.send(result)
+    else:
+        await post_to_text(result)
+        await message.channel.send("Done — full result posted to #ucs.")
+    conversation.add_aria_text(channel=channel_name, text=result)
+
+    if gemini and gemini.connected:
+        try:
+            await gemini.inject_text(
+                f"[You just replied via text in {channel_name}: {result[:4000]}]",
+                turn_complete=False,
+            )
+        except Exception:
+            log.exception("Failed to inject Aria reply into Gemini live context")
+
+
+@bot.event
+async def on_message(message):
+    """Route inbound Discord messages.
+
+    Priority order:
+      1. Bot/self messages: ignore (avoid loops).
+      2. Webhook !ask: route to _run_ask (existing iOS-Shortcut path).
+      3. Command prefix !: delegate to bot.process_commands.
+      4. Plain text from authorized user in #ucs: conversational path
+         through Claude.
+      5. Anything else: ignored, but #ucs-alerts content is already
+         recorded into the conversation buffer by post_to_alerts when
+         Aria/the bot posts it.
+    """
+    if message.author.id == bot.user.id:
+        return
+    if message.author.bot and not message.webhook_id:
+        return
+
+    if message.webhook_id and message.content.startswith("!ask "):
+        task_text = message.content[5:].strip()
+        if task_text:
+            await _run_ask(message.channel, task_text)
+        return
+
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
+
+    if (
+        config.discord_text_channel_id
+        and message.channel.id == int(config.discord_text_channel_id)
+        and _is_authorized(message.author.id)
+        and message.content.strip()
+    ):
+        await _handle_text_conversation(message)
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -979,8 +1224,17 @@ async def _post_to_spicylit(content: str) -> None:
 
 @bot.command()
 async def spicylit(ctx: commands.Context, mode: str = "story"):
-    """Switch voice to Grok SpicyLit mode.  Usage: !spicylit [story|joi]"""
+    """Switch voice to Grok SpicyLit mode.  Usage: !spicylit [story|joi]
+
+    Serialized under VoiceController.pipeline_switch() — same lock as
+    !join and _auto_join_voice_channel, so a manual !spicylit cannot
+    race with the channel-based auto-route.
+    """
     global _spicylit_active, _grok_session, _grok_session_started_at
+
+    if _spicylit_active and _grok_session and _grok_session.connected:
+        await ctx.send("SpicyLit already active. Use !back to return to Aria.")
+        return
 
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
@@ -991,9 +1245,6 @@ async def spicylit(ctx: commands.Context, mode: str = "story"):
     if not config.grok_api_key:
         await ctx.send("GROK_API_KEY not set.")
         return
-    if _spicylit_active and _grok_session and _grok_session.connected:
-        await ctx.send("SpicyLit already active. Use !back to return to Aria.")
-        return
 
     from capabilities.spicy_lit import GrokVoiceSession, init_table
     from capabilities.spicy_lit.prompts import VALID_MODES
@@ -1003,33 +1254,44 @@ async def spicylit(ctx: commands.Context, mode: str = "story"):
         await ctx.send(f"Unknown mode `{mode}`. Valid modes: {', '.join(sorted(VALID_MODES))}")
         return
 
-    init_table()
+    try:
+        async with voice_controller.pipeline_switch():
+            if _spicylit_active and _grok_session and _grok_session.connected:
+                await ctx.send("SpicyLit already active (resolved while waiting on lock).")
+                return
 
-    if gemini and gemini.connected:
-        await gemini.close()
-    _cancel_audio_tasks()
+            init_table()
 
-    _grok_session = GrokVoiceSession(
-        api_key=config.grok_api_key,
-        voice="eve",
-        user_id=str(ctx.author.id),
-        mode=mode,
-        post_text_callback=_post_to_spicylit,
-        on_disconnect=_on_grok_disconnect,
-    )
-    await _grok_session.start()
-    _spicylit_active = True
-    _grok_session_started_at = time.monotonic()
+            if gemini and gemini.connected:
+                await gemini.close()
+            _cancel_audio_tasks()
 
-    _audio_tasks.append(asyncio.create_task(_drain_grok_to_voice()))
-    _audio_tasks.append(asyncio.create_task(_grok_watchdog_task()))
-    _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
-    await ctx.send(f"SpicyLit **{mode}** mode active. Grok is listening.")
+            _grok_session = GrokVoiceSession(
+                api_key=config.grok_api_key,
+                voice="eve",
+                user_id=str(ctx.author.id),
+                mode=mode,
+                post_text_callback=_post_to_spicylit,
+                on_disconnect=_on_grok_disconnect,
+            )
+            await _grok_session.start()
+            _spicylit_active = True
+            _grok_session_started_at = time.monotonic()
+
+            _audio_tasks.append(asyncio.create_task(_drain_grok_to_voice()))
+            _audio_tasks.append(asyncio.create_task(_grok_watchdog_task()))
+            await ctx.send(f"SpicyLit **{mode}** mode active. Grok is listening.")
+    except VoiceTransitionBusy:
+        await ctx.send("A voice transition is already in progress — try again in a moment.")
 
 
 @bot.command()
 async def back(ctx: commands.Context):
-    """Switch voice back to Gemini from SpicyLit mode."""
+    """Switch voice back to Gemini from SpicyLit mode.
+
+    Serialized under VoiceController.pipeline_switch() so it cannot
+    race with !spicylit or the auto-join path.
+    """
     global _spicylit_active, _grok_session
 
     if not _is_authorized(ctx.author.id):
@@ -1039,20 +1301,27 @@ async def back(ctx: commands.Context):
         await ctx.send("Not in SpicyLit mode.")
         return
 
-    _cancel_audio_tasks()
-    _log_grok_cost()
-    if _grok_session:
-        await _grok_session.close()
-        _grok_session = None
-    _spicylit_active = False
+    try:
+        async with voice_controller.pipeline_switch():
+            if not _spicylit_active:
+                await ctx.send("SpicyLit already disabled (resolved while waiting on lock).")
+                return
 
-    if gemini and not gemini.connected:
-        await gemini.connect()
-    _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
-    _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
-    _audio_tasks.append(asyncio.create_task(_voice_exit_watchdog_task()))
+            _cancel_audio_tasks()
+            _log_grok_cost()
+            if _grok_session:
+                await _grok_session.close()
+                _grok_session = None
+            _spicylit_active = False
 
-    await ctx.send("Back to Aria.")
+            if gemini and not gemini.connected:
+                await gemini.connect()
+            _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
+            _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
+
+            await ctx.send("Back to Aria.")
+    except VoiceTransitionBusy:
+        await ctx.send("A voice transition is already in progress — try again in a moment.")
 
 
 @bot.event
@@ -1064,7 +1333,7 @@ async def on_voice_state_update(
     """Auto-join when the authorized user enters voice; clean up when they leave."""
     global _spicylit_active, _grok_session
     global _session_paused, _grok_paused, _pause_transcript
-    global _last_user_activity_at, _pending_voice_channel_id, _in_discord_voice
+    global _pending_voice_channel_id
     if str(member.id) not in config.authorized_user_ids:
         return
 
@@ -1088,11 +1357,9 @@ async def on_voice_state_update(
 
     elif left_channel:
         log.info("Authorized user left voice — cleaning up")
-        _in_discord_voice = False
         _session_paused = False
         _grok_paused = False
         _pause_transcript = ""
-        _last_user_activity_at = 0.0
         _cancel_audio_tasks()
         if _spicylit_active and _grok_session:
             if _grok_session.connected:
@@ -1101,7 +1368,7 @@ async def on_voice_state_update(
             _spicylit_active = False
         if gemini and gemini.connected:
             await gemini.close()
-        await voice_bridge.leave()
+        await voice_controller.note_external_disconnect()
 
 
 def _is_authorized(user_id: int) -> bool:

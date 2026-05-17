@@ -101,13 +101,15 @@ CREATE TABLE IF NOT EXISTS session_records (
 );
 
 CREATE TABLE IF NOT EXISTS verdicts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    product    TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    verdict    TEXT NOT NULL,
-    score      REAL NOT NULL,
-    reasons    TEXT,
-    judged_at  TEXT NOT NULL
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    product              TEXT NOT NULL,
+    session_id           TEXT NOT NULL,
+    verdict              TEXT NOT NULL,
+    score                REAL NOT NULL,
+    reasons              TEXT,
+    judged_at            TEXT NOT NULL,
+    anchor_floor         TEXT,
+    anchor_reports_json  TEXT
 );
 """
 
@@ -130,6 +132,7 @@ def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA)
         _migrate_loop_executions(conn)
+        _migrate_verdicts_anchors(conn)
 
 
 def _migrate_loop_executions(conn: sqlite3.Connection) -> None:
@@ -141,6 +144,15 @@ def _migrate_loop_executions(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE loop_executions ADD COLUMN context_truncated INTEGER NOT NULL DEFAULT 0")
     if "turns_dropped" not in cols:
         conn.execute("ALTER TABLE loop_executions ADD COLUMN turns_dropped INTEGER NOT NULL DEFAULT 0")
+
+
+def _migrate_verdicts_anchors(conn: sqlite3.Connection) -> None:
+    """Add anchor_floor and anchor_reports_json columns to verdicts table."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(verdicts)").fetchall()}
+    if "anchor_floor" not in cols:
+        conn.execute("ALTER TABLE verdicts ADD COLUMN anchor_floor TEXT")
+    if "anchor_reports_json" not in cols:
+        conn.execute("ALTER TABLE verdicts ADD COLUMN anchor_reports_json TEXT")
 
 
 def log_event(
@@ -343,14 +355,18 @@ def write_verdict(
     verdict: str,
     score: float,
     reasons: list[str],
+    anchor_floor: str | None = None,
+    anchor_reports_json: str | None = None,
 ) -> None:
     """Write one verdict row. Never propagates exceptions."""
     try:
         with get_connection() as conn:
             conn.execute(
-                "INSERT INTO verdicts (product, session_id, verdict, score, reasons, judged_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (product, session_id, verdict, score, json.dumps(reasons), _now()),
+                "INSERT INTO verdicts "
+                "(product, session_id, verdict, score, reasons, judged_at, anchor_floor, anchor_reports_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (product, session_id, verdict, score, json.dumps(reasons), _now(),
+                 anchor_floor, anchor_reports_json),
             )
     except Exception:
         log.warning("Failed to write verdict", exc_info=True)
