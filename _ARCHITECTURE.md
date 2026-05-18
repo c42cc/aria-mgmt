@@ -293,6 +293,36 @@ directly instead of Discord. Same tool surface, same prompts, same MCP
 fleet — only the transport is different. Useful for debugging and for
 running offline of Discord.
 
+### External Cursor Observer
+
+Aria's eyes on the Cursor IDE windows the user opened manually (not
+spawned by `build_with_cursor`). A small aiohttp server bound to
+127.0.0.1 receives Cursor lifecycle events from a user-level hooks
+forwarder (`hooks/cursor-event.py` registered in `~/.cursor/hooks.json`).
+The observer filters/debounces, reads transcript JSONLs and plan files
+on disk for context, and hands interesting events to a pager.
+
+Pager rungs:
+
+- **Rung A** — Gemini is connected: `inject_text(turn_complete=True)`,
+  Aria narrates the event aloud immediately.
+- **Rung B** — Gemini is not connected: Discord DM with `<@USER_ID>`
+  mention. The event is queued; when the user later joins voice, the
+  join preamble is replaced with a debrief instruction so Aria opens
+  the conversation with a one-sentence summary instead of "stay silent
+  until he speaks."
+
+The Cursor remote-control tools (`list_cursor_windows`,
+`read_cursor_window`, `focus_cursor_window`, `send_to_cursor_chat`,
+`approve_cursor_plan`, etc.) let Aria be the user's "body" on the
+workstation: she can read what each window is doing and type
+instructions back into specific windows by AppleScript-focusing them
+and pasting into the chat sidebar.
+
+Discord's bot API does not permit DM voice-call ringing; the DM-mention
+push is the loudest legal proxy. Pushover/Twilio escalation can bolt
+onto the same pager interface later if more aggressive ring is needed.
+
 ---
 
 ## Repo Map
@@ -329,6 +359,8 @@ points; cross-references inside the code are reliable.
 | MCP client and dispatch | `src/mcp.py` |
 | Cursor bridge (Python side) | `src/cursor_bridge.py` |
 | Cursor bridge (Node sidecar) | `cursor_wrapper/index.js` |
+| External Cursor observer | `src/cursor_external.py` (HTTP server + transcript reader + pager dispatch) |
+| Cursor hooks forwarder | `hooks/cursor-event.py` (+ `hooks/install.py`) |
 | Long-term memory | `src/memory.py` |
 | Structured state | `src/db.py` + `data/state.db` |
 | Audit log | `src/mcp.py` (writer) + `data/audit.jsonl` |

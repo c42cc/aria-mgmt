@@ -216,6 +216,148 @@ TOOL_DECLARATIONS = [
             required=["text"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="list_cursor_windows",
+        description=(
+            "List the titles of every Cursor IDE window currently open on the Mac. "
+            "Use when the user asks what windows are open, or before targeting a specific window. "
+            "Each entry tells you whether its title matches a registered project name."
+        ),
+        parameters=types.Schema(type="OBJECT", properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="read_cursor_window",
+        description=(
+            "Read the most recent transcript turns for a Cursor window/project. "
+            "Use to catch up on what an external Cursor agent is doing or has done — what it said, "
+            "what tools it called, and what plan files were just written. "
+            "Project may be a registered short name or an absolute path."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name (preferred) or absolute project cwd."),
+                "n_turns": types.Schema(type="INTEGER", description="How many recent turns to return (default 5, max 25)."),
+            },
+            required=["project"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_cursor_plans",
+        description=(
+            "List plan files written under ~/.cursor/plans/ in the last N minutes. "
+            "Use when the user asks 'is there a new plan?' or 'show me recent plans'."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "max_age_minutes": types.Schema(type="INTEGER", description="Plan recency window in minutes (default 60)."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="focus_cursor_window",
+        description=(
+            "Bring a specific Cursor IDE window to the front by matching its title against the project "
+            "name. Must be called before any send_to_cursor_chat / keystroke_to_cursor_window / "
+            "screenshot_cursor_window (those tools focus implicitly, but call this if you want to verify "
+            "the right window was found first)."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name (preferred) or substring matching the window title."),
+            },
+            required=["project"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="send_to_cursor_chat",
+        description=(
+            "Type a message into a specific Cursor window and send it. Aria's primary way to "
+            "relay Corbin's spoken instructions into a Cursor agent. With new_agent=True "
+            "(default) opens a fresh agent composer (Cmd+I) and starts a new agent task; "
+            "new_agent=False opens the existing chat sidebar (Cmd+L) for a follow-up. "
+            "Returns ok=True if the keystrokes fired against the focused Cursor window — "
+            "this is NOT proof the agent received them. To confirm the send actually landed, "
+            "wait 8-15 seconds and call read_cursor_window: if you see a new user turn or "
+            "an in-progress assistant turn, it worked. Only retry the send if read_cursor_window "
+            "shows no new turn after the wait. Always translate Corbin's casual voice intent "
+            "into a precise, well-formed prompt before sending."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name or substring matching the window title."),
+                "message": types.Schema(type="STRING", description="The refined, well-formed message to type into the chat input."),
+                "new_agent": types.Schema(type="BOOLEAN", description="True (default) starts a NEW agent task; False sends into the existing chat."),
+            },
+            required=["project", "message"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="keystroke_to_cursor_window",
+        description=(
+            "Escape hatch: send arbitrary keystrokes to a Cursor window after focusing it. "
+            "Use for shortcuts (Cmd+P, Cmd+Shift+L, Esc, etc.) when the dedicated tools don't fit. "
+            "For typing a chat message prefer send_to_cursor_chat."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
+                "keys": types.Schema(type="STRING", description="Literal keystrokes (System Events keystroke argument)."),
+                "modifiers": types.Schema(type="STRING", description="Comma-separated subset of {command, control, option, shift}."),
+            },
+            required=["project", "keys"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="screenshot_cursor_window",
+        description=(
+            "Take a screenshot of a Cursor window for visual context. "
+            "Use when you need to see the current state of a window — plan-mode UI, an error dialog, "
+            "or unexpected layout. Returns the saved PNG path."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
+                "save_path": types.Schema(type="STRING", description="Optional absolute path for the PNG. Defaults to data/screenshots/."),
+            },
+            required=["project"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="approve_cursor_plan",
+        description=(
+            "Approve and proceed on a Cursor plan-mode plan by typing 'Approve and proceed.' into "
+            "the target window's chat. Use after read_cursor_window shows a plan that Corbin verbally OK'd."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
+                "note": types.Schema(type="STRING", description="Optional extra context appended to the approval message."),
+            },
+            required=["project"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="reject_cursor_plan",
+        description=(
+            "Reject a Cursor plan-mode plan by typing 'Stop. Do not proceed with this plan.' Use when "
+            "Corbin verbally vetoes a plan and you need to halt the agent."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
+                "reason": types.Schema(type="STRING", description="Optional reason to communicate to the agent."),
+            },
+            required=["project"],
+        ),
+    ),
 ]
 
 TranscriptEntry = collections.namedtuple("TranscriptEntry", ["role", "text", "ts"])

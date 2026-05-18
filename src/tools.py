@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
+from zoneinfo import ZoneInfo
 
 import anthropic
 
@@ -47,6 +49,20 @@ _TRACE_ARG_MAX_CHARS = 10_000
 _TRACE_RESULT_MAX_CHARS = 1_000_000
 _TRACE_SESSION_MAX_BYTES = 5_000_000
 
+# P1 — Pre-send Grounding Gate. When Aria's draft reaches end_turn we re-run
+# the anchor system against the trace; if any anchor reports
+# `degraded`/`failed` we feed the violations back as a user message and let
+# her revise. Each retry costs one extra agent iteration; cap is independent
+# from the main iteration budget so retries can't be starved.
+_GROUND_CHECK_MAX_RETRIES = 2
+_GROUND_CHECK_VIOLATIONS_MAX_CHARS = 4_000
+
+# P3 — Deterministic context injection. We build a small `<context>` block
+# per call so Aria never has to fetch fallible facts (date, primary mail
+# source, active capabilities, remaining budget) from a tool.
+_LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+_USER_PRIMARY_EMAIL = os.getenv("DISCORD_EMAIL", "c@c42.io")
+
 
 def _dedup_key(tool_name: str, args: dict) -> str:
     """Stable hash for (tool, args) pairs.
@@ -73,6 +89,158 @@ def _truncate_trace_args(args: dict, max_chars: int = _TRACE_ARG_MAX_CHARS) -> d
         else:
             out[k] = v
     return out
+
+
+def _build_context(session_key: str = "") -> str:
+    """Compose a deterministic `<context>` block for the agent's user message.
+
+    P3: this block is recomputed every call. It supplies facts Aria
+    historically guessed (date, today, primary mail source, what tools are
+    actually available) so she never has to fetch them via a fallible
+    upstream tool. Failures here are non-fatal — we always return at least
+    the time line.
+    """
+    lines: list[str] = ["<context>"]
+
+    now_local = datetime.now(_LOCAL_TZ)
+    day_name = now_local.strftime("%A")
+    lines.append(
+        f"  now: {now_local.isoformat(timespec='seconds')}  "
+        f"({day_name}, America/Los_Angeles)"
+    )
+    lines.append(f"  user_primary_email: {_USER_PRIMARY_EMAIL}")
+    lines.append("  primary_mail_source: gmail  "
+                 "(apple mail is filtered out — do not propose mail_messages)")
+
+    try:
+        from .mcp import mcp_client
+        if mcp_client is not None and mcp_client._tools:
+            by_server: dict[str, list[str]] = {}
+            for tool_name, spec in mcp_client._tools.items():
+                server = spec.get("server", "?")
+                by_server.setdefault(server, []).append(tool_name)
+            lines.append("  capabilities:")
+            for server in sorted(by_server):
+                tools = sorted(by_server[server])
+                # Cap each server's tool list to keep tokens bounded.
+                shown = tools[:8]
+                more = f", +{len(tools)-len(shown)} more" if len(tools) > len(shown) else ""
+                lines.append(f"    - {server}: {', '.join(shown)}{more}")
+    except Exception:
+        log.debug("context: MCP capabilities omitted", exc_info=True)
+
+    try:
+        remaining = max(0.0, config.daily_spend_cap_usd - get_daily_spend())
+        lines.append(
+            f"  budget_today_remaining_usd: {remaining:.2f}  "
+            f"(cap ${config.daily_spend_cap_usd:.2f})"
+        )
+    except Exception:
+        log.debug("context: budget omitted", exc_info=True)
+
+    if session_key:
+        lines.append(f"  session_key: {session_key}")
+
+    lines.append("</context>")
+    return "\n".join(lines) + "\n\n"
+
+
+def _synth_anchor_record(
+    tool_trace: list[dict], result: str, session_key: str
+) -> dict:
+    """Build the minimal record dict that `judge._run_anchors` consumes.
+
+    `_run_anchors` reads `context_json.tool_trace` (the calls Aria made) and
+    `outputs_json.result` (Aria's draft text). Both must be JSON-encoded
+    strings — the judge always re-decodes. Everything else is metadata that
+    anchors do not read but that keeps the record shape consistent with
+    `_emit_session_record`.
+    """
+    return {
+        "tool_name": "do_with_claude",
+        "product": "agent",
+        "timestamp": _now_iso(),
+        "session_key": session_key,
+        "inputs_json": "{}",
+        "context_json": json.dumps({"tool_trace": tool_trace}, default=str),
+        "outputs_json": json.dumps({"result": result}, default=str),
+    }
+
+
+def _summarize_anchor_violations(reports: list[dict]) -> str:
+    """Render anchor reports into a fix-this block, or '' if no draft revision is needed.
+
+    Only `degraded` / `failed` reports drive a retry. `correct` and
+    `unverified` are passed through silently — `unverified` means the
+    anchor's source-of-truth was unreachable and is not Aria's fault.
+    """
+    lines: list[str] = []
+    for r in reports:
+        binary = r.get("binary")
+        if binary not in ("degraded", "failed"):
+            continue
+        tool = r.get("tool", "?")
+        lines.append(f"\n### Anchor on `{tool}` — anchor verdict: {binary}")
+        for v in r.get("violations", []):
+            prop = v.get("prop", "?")
+            sev = v.get("severity", "?")
+            detail = v.get("detail", "")
+            lines.append(f"- spec#{prop} [{sev}]: {detail}")
+        for f in r.get("facts", []):
+            key = f.get("key", "")
+            if key in (
+                "ground_truth_count",
+                "aria_claimed_count",
+                "tolerance",
+                "missing_items",
+            ):
+                val = f.get("value")
+                src = f.get("source", "")
+                lines.append(f"  - {key}: {val} (source: {src})")
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    if len(body) > _GROUND_CHECK_VIOLATIONS_MAX_CHARS:
+        body = body[:_GROUND_CHECK_VIOLATIONS_MAX_CHARS] + "\n... [violations truncated]"
+    return body
+
+
+async def _ground_check(
+    tool_trace: list[dict], result: str, session_key: str
+) -> str:
+    """Run anchors against the agent's draft. Return non-empty fix-this text iff revision is required.
+
+    Failures inside the anchor run are logged but never block delivery —
+    they are the system's bug, not the agent's. A real `degraded`/`failed`
+    anchor verdict, however, IS the agent's bug and produces a retry.
+    """
+    if not tool_trace:
+        return ""
+    try:
+        from .judge import _run_anchors
+        record = _synth_anchor_record(tool_trace, result, session_key)
+        reports = await _run_anchors(record)
+    except Exception:
+        log.exception(
+            "ground-check anchor run raised; delivering draft without gate session=%s",
+            session_key,
+        )
+        return ""
+    return _summarize_anchor_violations(reports)
+
+
+def _ground_check_user_message(violations: str) -> str:
+    """Compose the synthetic user message that asks Aria to revise."""
+    return (
+        "[GROUND-CHECK FAILED]\n\n"
+        "Deterministic anchors re-queried the source of truth and disagree "
+        "with the draft you just produced:\n"
+        f"{violations}\n\n"
+        "Revise your response so every count, date, and coverage claim "
+        "matches the anchor facts above. If a claim cannot be supported "
+        "by the tool trace or the anchor facts, remove it. Do not include "
+        "this `[GROUND-CHECK FAILED]` message in your reply."
+    )
 
 
 def _cap_trace_size(trace: list[dict], max_bytes: int = _TRACE_SESSION_MAX_BYTES) -> list[dict]:
@@ -269,6 +437,15 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "get_focused_app": _get_focused_app,
         "focus_app": _focus_app,
         "dictate_into_focused_app": _dictate_into_focused_app,
+        "list_cursor_windows": _list_cursor_windows,
+        "read_cursor_window": _read_cursor_window,
+        "list_cursor_plans": _list_cursor_plans,
+        "focus_cursor_window": _focus_cursor_window,
+        "send_to_cursor_chat": _send_to_cursor_chat,
+        "keystroke_to_cursor_window": _keystroke_to_cursor_window,
+        "screenshot_cursor_window": _screenshot_cursor_window,
+        "approve_cursor_plan": _approve_cursor_plan,
+        "reject_cursor_plan": _reject_cursor_plan,
     }
     handler = handlers.get(name)
     if not handler:
@@ -279,6 +456,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "cursor_status", "recall", "cancel_current_task", "list_prompts",
         "show_prompt", "prompt_versions", "reload_prompts",
         "get_focused_app", "focus_app", "dictate_into_focused_app",
+        "list_cursor_windows", "read_cursor_window", "list_cursor_plans",
+        "focus_cursor_window", "send_to_cursor_chat", "keystroke_to_cursor_window",
+        "screenshot_cursor_window", "approve_cursor_plan", "reject_cursor_plan",
     )
     if spend >= config.daily_spend_cap_usd and name not in _free_tools:
         return json.dumps({"error": f"Daily spend cap (${config.daily_spend_cap_usd}) reached. Current: ${spend:.2f}"})
@@ -601,7 +781,10 @@ async def _do_with_claude_legacy(
             f"- {m.get('memory', m.get('text', ''))}" for m in memories
         ) + "\n\n"
 
-    messages: list[dict[str, Any]] = [{"role": "user", "content": memory_ctx + task}]
+    context_block = _build_context(session_key)
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": context_block + memory_ctx + task}
+    ]
 
     max_iterations = config.do_with_claude_max_iterations
     iteration = 0
@@ -622,7 +805,12 @@ async def _do_with_claude_legacy(
     # the audit (the 6x search_emails-in-15s case).
     called_tools: dict[str, tuple[int, str]] = {}
 
-    while iteration < max_iterations and not state.cancel:
+    # P1 retry counter — each anchor-driven retry extends the effective
+    # iteration cap by one so a single gate failure can't starve the budget
+    # the agent legitimately needed for tool work.
+    ground_check_retries = 0
+
+    while iteration < max_iterations + ground_check_retries and not state.cancel:
         iteration += 1
 
         response = await asyncio.to_thread(
@@ -647,6 +835,27 @@ async def _do_with_claude_legacy(
         ):
             text_parts = [b.text for b in response.content if hasattr(b, "text") and b.text]
             result = "\n".join(text_parts)
+
+            # P1 — Pre-send Grounding Gate. Run anchors against the draft;
+            # if any are degraded/failed AND retry budget remains, feed
+            # violations back to Aria as a user message and continue.
+            if ground_check_retries < _GROUND_CHECK_MAX_RETRIES:
+                violations = await _ground_check(tool_trace, result, session_key)
+                if violations:
+                    ground_check_retries += 1
+                    log.warning(
+                        "ground-check retry %d/%d session=%s",
+                        ground_check_retries,
+                        _GROUND_CHECK_MAX_RETRIES,
+                        session_key,
+                    )
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({
+                        "role": "user",
+                        "content": _ground_check_user_message(violations),
+                    })
+                    continue
+
             log_loop_execution(
                 tool_name="do_with_claude",
                 session_key=session_key,
@@ -1096,3 +1305,508 @@ async def _dictate_into_focused_app(text: str) -> str:
         return json.dumps({"error": f"Paste failed: {stderr.decode().strip()}"})
 
     return json.dumps({"pasted_into": app_name, "chars": len(text)})
+
+
+# ---------------------------------------------------------------------------
+# Cursor IDE remote-control tools
+#
+# These are Aria's eyes and hands on the other Cursor windows the user
+# opened manually. Because the user is away from the workstation, every
+# input that touches a Cursor window has to be a tool Aria can call.
+#
+# Read tools (free, local-only):
+#   list_cursor_windows       - enumerate open Cursor.app windows
+#   read_cursor_window        - last N turns from the latest transcript JSONL
+#   list_cursor_plans         - recently modified plan files under ~/.cursor/plans
+#
+# Write tools (free, local-only, brittle around UI scripting):
+#   focus_cursor_window       - bring a specific Cursor window to front
+#   send_to_cursor_chat       - focus + open chat sidebar + paste + send
+#   keystroke_to_cursor_window - send arbitrary keystrokes (escape hatch)
+#   screenshot_cursor_window  - capture the focused window for visual context
+#   approve_cursor_plan       - paste "approve and proceed" into chat
+#   reject_cursor_plan        - paste "cancel" into chat
+# ---------------------------------------------------------------------------
+
+
+async def _run_osascript(script: str, timeout: float = 6.0) -> tuple[int, str, str]:
+    """Run an AppleScript and return (returncode, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, "", f"osascript timed out after {timeout}s"
+    return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+def _resolve_cursor_target(project: str | None) -> tuple[str | None, str | None]:
+    """Resolve `project` to (search_substring, registered_path).
+
+    The substring is what we'll match in window titles. If `project` is in
+    the registry, we use the short name; otherwise we use the basename of
+    the path; otherwise we use the raw string.
+    """
+    if not project:
+        return None, None
+    if project in PROJECT_REGISTRY:
+        return project, PROJECT_REGISTRY[project]
+    import os as _os
+    if "/" in project and _os.path.isdir(project):
+        return _os.path.basename(project.rstrip("/")), project
+    return project, None
+
+
+async def _list_cursor_windows() -> str:
+    """Enumerate open Cursor.app windows.
+
+    Returns JSON `{"windows": [{"title": "...", "matches_project": "name|null"}, ...]}`.
+    Empty list if Cursor isn't running or has no windows.
+    """
+    script = (
+        'tell application "System Events"\n'
+        '  if not (exists process "Cursor") then return ""\n'
+        '  set out to ""\n'
+        '  repeat with w in (every window of process "Cursor")\n'
+        '    set out to out & (name of w) & linefeed\n'
+        '  end repeat\n'
+        '  return out\n'
+        'end tell'
+    )
+    rc, stdout, stderr = await _run_osascript(script)
+    if rc != 0:
+        return json.dumps({"error": f"osascript failed: {stderr.strip()[:300]}"})
+
+    titles = [t.strip() for t in stdout.splitlines() if t.strip()]
+    out = []
+    for t in titles:
+        matched_name = None
+        for name, path in PROJECT_REGISTRY.items():
+            import os as _os
+            base = _os.path.basename(path.rstrip("/"))
+            if name and (name in t or (base and base in t)):
+                matched_name = name
+                break
+        out.append({"title": t, "matches_project": matched_name})
+    return json.dumps({"windows": out, "count": len(out)})
+
+
+async def _read_cursor_window(project: str, n_turns: int = 5) -> str:
+    """Return the last N turns of the most recent transcript for a project,
+    plus any plan files modified in the last 10 minutes.
+
+    Project may be a registered name OR an absolute path. Falls back gracefully
+    if Cursor has no data on disk for the project yet.
+    """
+    from .cursor_external import read_last_n_turns, list_recent_plans
+
+    _, cwd = _resolve_cursor_target(project)
+    if not cwd:
+        if project.startswith("/"):
+            cwd = project
+        else:
+            return json.dumps({
+                "error": f"Unknown project: {project!r}. Known: {list(PROJECT_REGISTRY.keys())}",
+            })
+
+    n = max(1, min(int(n_turns) if n_turns else 5, 25))
+    turns = read_last_n_turns(cwd, n=n)
+    plans = list_recent_plans(max_age_sec=600, limit=5)
+    return json.dumps({
+        "project": project,
+        "cwd": cwd,
+        "turns_returned": len(turns),
+        "turns": turns,
+        "recent_plans": plans,
+    })
+
+
+async def _list_cursor_plans(max_age_minutes: int = 60) -> str:
+    """List recently modified Cursor plan files across all windows."""
+    from .cursor_external import list_recent_plans
+    max_age = max(1, int(max_age_minutes)) * 60
+    plans = list_recent_plans(max_age_sec=max_age, limit=20)
+    return json.dumps({"plans": plans, "count": len(plans), "max_age_seconds": max_age})
+
+
+async def _focus_cursor_window(project: str) -> str:
+    """Bring the Cursor window whose title contains `project` to the front.
+
+    Forces focus aggressively: activates Cursor.app, sets the process
+    frontmost via System Events (more reliable than `activate` alone when
+    another app currently owns focus), raises the matching window, then
+    verifies the frontmost process is actually Cursor. If verification
+    fails we re-issue the activation once before giving up.
+    """
+    search, _path = _resolve_cursor_target(project)
+    if not search:
+        return json.dumps({"error": f"Cannot resolve project: {project!r}"})
+
+    safe = search.replace('"', '').replace('\\', '')
+    script = (
+        f'set target to "{safe}"\n'
+        'try\n'
+        '  tell application "Cursor" to activate\n'
+        'end try\n'
+        'delay 0.25\n'
+        'tell application "System Events"\n'
+        '  if not (exists process "Cursor") then return "ERR: Cursor not running"\n'
+        '  tell process "Cursor"\n'
+        '    try\n'
+        '      set frontmost to true\n'
+        '    end try\n'
+        '    set hits to {}\n'
+        '    repeat with w in (every window)\n'
+        '      if (name of w) contains target then\n'
+        '        try\n'
+        '          perform action "AXRaise" of w\n'
+        '        end try\n'
+        '        set end of hits to (name of w)\n'
+        '      end if\n'
+        '    end repeat\n'
+        '    if (count of hits) = 0 then\n'
+        '      return "NOMATCH"\n'
+        '    end if\n'
+        '  end tell\n'
+        '  delay 0.2\n'
+        '  set frontApp to name of first process whose frontmost is true\n'
+        '  if frontApp is not "Cursor" then\n'
+        '    -- Try once more, forcefully\n'
+        '    try\n'
+        '      tell application "Cursor" to activate\n'
+        '    end try\n'
+        '    tell process "Cursor" to set frontmost to true\n'
+        '    delay 0.2\n'
+        '    set frontApp to name of first process whose frontmost is true\n'
+        '  end if\n'
+        '  return (item 1 of hits) & "|" & frontApp\n'
+        'end tell'
+    )
+    rc, stdout, stderr = await _run_osascript(script, timeout=6.0)
+    if rc != 0:
+        return json.dumps({"error": f"osascript failed: {stderr.strip()[:300]}"})
+    out = stdout.strip()
+    if out == "NOMATCH":
+        return json.dumps({
+            "ok": False,
+            "matched": None,
+            "search": search,
+            "note": (
+                "No Cursor window title contained the search substring. Call "
+                "list_cursor_windows to see what's open."
+            ),
+        })
+    if out.startswith("ERR:"):
+        return json.dumps({"error": out[5:].strip()})
+    matched, _, front = out.partition("|")
+    if front and front != "Cursor":
+        return json.dumps({
+            "ok": False,
+            "matched": matched,
+            "search": search,
+            "front_app": front,
+            "note": (
+                f"AppleScript raised the window but {front!r} is still frontmost. "
+                "The user (or another app) is holding focus. Aria cannot send "
+                "keystrokes to Cursor right now. Wait and retry, or ask Corbin "
+                "to release focus."
+            ),
+        })
+    await asyncio.sleep(0.25)
+    return json.dumps({"ok": True, "matched": matched, "search": search, "front_app": front})
+
+
+async def _keystroke_to_cursor_window(project: str, keys: str, modifiers: str | None = None) -> str:
+    """Send a raw AppleScript keystroke to a Cursor window after focusing it.
+
+    `keys` is the literal text to send (System Events `keystroke "..."`).
+    `modifiers` is a comma-separated subset of {command, control, option, shift}.
+    For special keys like Return/Tab/Escape, prefer `keystroke_to_cursor_window`
+    with the named key wrapped in AppleScript: callers can use the dedicated
+    helper tools (send_to_cursor_chat, etc.) for the common cases.
+    """
+    focus_result = await _focus_cursor_window(project)
+    try:
+        parsed = json.loads(focus_result)
+    except Exception:
+        return focus_result
+    if not parsed.get("ok"):
+        return focus_result
+
+    await asyncio.sleep(0.15)
+
+    safe = keys.replace('\\', '\\\\').replace('"', '\\"')
+    using_clause = ""
+    if modifiers:
+        mods = [m.strip() for m in modifiers.split(",") if m.strip()]
+        valid = {"command", "control", "option", "shift"}
+        bad = [m for m in mods if m not in valid]
+        if bad:
+            return json.dumps({"error": f"Invalid modifiers: {bad}. Allowed: {sorted(valid)}"})
+        if mods:
+            using_clause = " using {" + ", ".join(f"{m} down" for m in mods) + "}"
+
+    script = f'tell application "System Events" to keystroke "{safe}"{using_clause}'
+    rc, _stdout, stderr = await _run_osascript(script, timeout=4.0)
+    if rc != 0:
+        return json.dumps({"error": f"keystroke failed: {stderr.strip()[:300]}"})
+    return json.dumps({"ok": True, "sent": keys, "modifiers": modifiers or ""})
+
+
+async def _send_to_cursor_chat(
+    project: str,
+    message: str,
+    new_agent: bool = True,
+    send_delay_sec: float = 0.7,
+    verify_timeout_sec: float = 0.0,
+) -> str:
+    """Type a message into the Cursor chat input for `project` and send it.
+
+    Folds focus + open-composer + paste + send into ONE atomic AppleScript
+    invocation. Between subprocess calls another app can reclaim focus
+    (Finder, the terminal, anything in the user's window order), so we
+    keep keystrokes inside a single script that re-verifies frontmost
+    immediately before each keystroke.
+
+    `verify_timeout_sec` (default 0 = disabled). When > 0, we poll the
+    Cursor JSONL transcripts for that project after the send and report
+    `verified_landed=True` if any transcript file mtime advances. This
+    is a hint, not a guarantee — Cursor can take 8-20s to start writing
+    after receiving keystrokes. The recommended pattern for callers is:
+    leave verification disabled, then call read_cursor_window after a
+    short delay (5-15s) and inspect the latest turn to confirm the agent
+    received your message. Re-sending blindly on a false-negative verify
+    risks double-firing the same task.
+
+    Sequence inside the script:
+      1. Activate Cursor.app + set process frontmost.
+      2. Find the window whose title contains the project substring.
+      3. AXRaise that window.
+      4. Re-verify Cursor is frontmost. If not, retry once.
+      5. Keystroke Cmd+I (new agent composer) or Cmd+L (existing chat).
+      6. Re-verify frontmost again before paste.
+      7. Cmd+V to paste (clipboard already loaded by Python).
+      8. Wait send_delay_sec.
+      9. Press Return to send.
+
+    Returns ok=True with the matched window title, OR ok=False with a
+    note explaining where focus got stolen.
+    """
+    search, path = _resolve_cursor_target(project)
+    if not search:
+        return json.dumps({"error": f"Cannot resolve project: {project!r}"})
+
+    from .cursor_external import cursor_project_data_dir
+
+    def _latest_jsonl_mtime(transcripts_root: str) -> float:
+        """Max mtime across every <sid>.jsonl under the agent-transcripts dir.
+
+        We need FILE mtimes here, not directory mtimes — subdir mtimes only
+        change when files are added/removed, but JSONLs are appended to in
+        place. Appending to a file updates the file's mtime but NOT the
+        parent dir's.
+        """
+        latest = 0.0
+        try:
+            for entry in os.listdir(transcripts_root):
+                sub = os.path.join(transcripts_root, entry)
+                if not os.path.isdir(sub):
+                    continue
+                for fname in os.listdir(sub):
+                    if not fname.endswith(".jsonl"):
+                        continue
+                    p = os.path.join(sub, fname)
+                    try:
+                        m = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if m > latest:
+                        latest = m
+        except OSError:
+            return 0.0
+        return latest
+
+    transcripts_dir: str | None = None
+    pre_send_mtime: float = 0.0
+    if path and os.path.isdir(path):
+        proj_data = cursor_project_data_dir(path)
+        transcripts_dir = os.path.join(proj_data, "agent-transcripts")
+        if os.path.isdir(transcripts_dir):
+            pre_send_mtime = _latest_jsonl_mtime(transcripts_dir)
+
+    proc_copy = await asyncio.create_subprocess_exec(
+        "pbcopy", stdin=asyncio.subprocess.PIPE,
+    )
+    await proc_copy.communicate(input=message.encode("utf-8"))
+
+    open_key = "i" if new_agent else "l"
+    open_label = "Cmd+I (new agent composer)" if new_agent else "Cmd+L (AI chat sidebar)"
+    safe = search.replace('"', '').replace('\\', '')
+    delay_ms = int(max(200, float(send_delay_sec) * 1000))
+
+    script = f"""
+set target to "{safe}"
+set openKey to "{open_key}"
+try
+  tell application "Cursor" to activate
+end try
+delay 0.25
+tell application "System Events"
+  if not (exists process "Cursor") then return "ERR: Cursor not running"
+  tell process "Cursor"
+    try
+      set frontmost to true
+    end try
+    set hits to {{}}
+    repeat with w in (every window)
+      if (name of w) contains target then
+        try
+          perform action "AXRaise" of w
+        end try
+        set end of hits to (name of w)
+      end if
+    end repeat
+    if (count of hits) = 0 then return "NOMATCH"
+  end tell
+  delay 0.25
+  if (name of first process whose frontmost is true) is not "Cursor" then
+    try
+      tell application "Cursor" to activate
+    end try
+    tell process "Cursor" to set frontmost to true
+    delay 0.25
+  end if
+  set frontBeforeOpen to name of first process whose frontmost is true
+  if frontBeforeOpen is not "Cursor" then
+    return "ERR: focus stolen before open by " & frontBeforeOpen
+  end if
+  keystroke openKey using {{command down}}
+  delay 0.6
+  set frontBeforePaste to name of first process whose frontmost is true
+  if frontBeforePaste is not "Cursor" then
+    return "ERR: focus stolen before paste by " & frontBeforePaste
+  end if
+  keystroke "v" using {{command down}}
+  delay 0.{delay_ms // 100}
+  set frontBeforeSend to name of first process whose frontmost is true
+  if frontBeforeSend is not "Cursor" then
+    return "ERR: focus stolen before send by " & frontBeforeSend
+  end if
+  key code 36
+end tell
+return "OK|" & (item 1 of hits)
+"""
+    rc, stdout, stderr = await _run_osascript(script, timeout=15.0)
+    if rc != 0:
+        return json.dumps({"error": f"osascript failed: {stderr.strip()[:400]}"})
+    out = stdout.strip()
+    if out == "NOMATCH":
+        return json.dumps({
+            "ok": False,
+            "matched": None,
+            "search": search,
+            "note": (
+                "No Cursor window title contained the search substring. Call "
+                "list_cursor_windows to see what's open."
+            ),
+        })
+    if out.startswith("ERR:"):
+        return json.dumps({
+            "ok": False,
+            "search": search,
+            "note": out[4:].strip(),
+            "open_method": open_label,
+        })
+    if not out.startswith("OK|"):
+        return json.dumps({"ok": False, "raw": out[:200]})
+    matched = out[3:]
+
+    landed = False
+    landed_via = ""
+    if transcripts_dir and verify_timeout_sec > 0:
+        deadline = time.monotonic() + float(verify_timeout_sec)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            if not os.path.isdir(transcripts_dir):
+                continue
+            latest = _latest_jsonl_mtime(transcripts_dir)
+            if latest > pre_send_mtime + 0.5:
+                landed = True
+                landed_via = "transcript_mtime_advanced"
+                break
+
+    return json.dumps({
+        "ok": True,
+        "matched": matched,
+        "chars_sent": len(message),
+        "open_method": open_label,
+        "verified_landed": landed,
+        "verify_signal": landed_via or ("no transcript directory observed" if not transcripts_dir else "timed out waiting for mtime change"),
+    })
+
+
+async def _screenshot_cursor_window(project: str, save_path: str | None = None) -> str:
+    """Capture the focused Cursor window to a PNG. Returns the file path.
+
+    Uses `screencapture -l` (by window ID) — needs the window to be raised
+    first, which `_focus_cursor_window` does. If `save_path` is omitted, a
+    timestamped path under `data/screenshots/` is created.
+    """
+    import os as _os
+    focus_result = await _focus_cursor_window(project)
+    try:
+        parsed = json.loads(focus_result)
+    except Exception:
+        return focus_result
+    if not parsed.get("ok"):
+        return focus_result
+    await asyncio.sleep(0.25)
+
+    if save_path is None:
+        out_dir = _os.path.join(config.data_dir, "screenshots")
+        _os.makedirs(out_dir, exist_ok=True)
+        ts = int(time.time())
+        safe_proj = "".join(c for c in project if c.isalnum() or c in "._-")[:40] or "win"
+        save_path = _os.path.join(out_dir, f"cursor-{safe_proj}-{ts}.png")
+
+    proc = await asyncio.create_subprocess_exec(
+        "screencapture", "-o", "-x", save_path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return json.dumps({"error": f"screencapture failed: {stderr.decode().strip()[:200]}"})
+
+    return json.dumps({
+        "ok": True,
+        "path": save_path,
+        "size_bytes": _os.path.getsize(save_path) if _os.path.exists(save_path) else 0,
+    })
+
+
+async def _approve_cursor_plan(project: str, note: str = "") -> str:
+    """Tell the focused Cursor plan-mode agent to proceed.
+
+    Sends "Approve and proceed." (optionally with an appended note) into
+    the chat input. This is the resilient path: it does not depend on the
+    plan-approve button's accessibility hierarchy, which shifts between
+    Cursor releases. Aria will see the agent leave plan mode in the
+    transcript JSONL.
+    """
+    message = "Approve and proceed."
+    if note:
+        message = f"{message} {note}"
+    return await _send_to_cursor_chat(project, message)
+
+
+async def _reject_cursor_plan(project: str, reason: str = "") -> str:
+    """Tell the focused Cursor plan-mode agent NOT to proceed."""
+    if reason:
+        message = f"Stop. Do not proceed with this plan. {reason}"
+    else:
+        message = "Stop. Do not proceed with this plan."
+    return await _send_to_cursor_chat(project, message)

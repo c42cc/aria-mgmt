@@ -23,6 +23,7 @@ from .filesystem import (
 )
 from .github_anchor import GithubAnchor
 from .gmail import GmailReadAnchor, GmailSearchAnchor, GmailSendAnchor
+from .plan_citation import PlanCitationAnchor
 from .shell_anchor import ShellAnchor
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,8 @@ _TOOL_MAP: dict[str, type] = {
 
     "execute_command": ShellAnchor,
     "execute-command": ShellAnchor,
+
+    "plan_with_claude": PlanCitationAnchor,
 }
 
 

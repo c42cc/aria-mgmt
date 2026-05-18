@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import sys
 import time
@@ -14,6 +15,7 @@ from discord.ext import commands
 from .config import config
 from .conversation import conversation
 from .cursor_bridge import CursorBridge
+from .cursor_external import CursorEvent, CursorExternalObserver
 from .db import init_db, get_daily_spend, log_event, upsert_cursor_session, update_cursor_session_event
 from .discord_voice import VoiceTransitionBusy, voice_bridge, voice_controller
 from .gemini_session import GeminiSession
@@ -58,6 +60,10 @@ _local_session_active: bool = False
 _local_silence_task: asyncio.Task | None = None
 
 _on_ready_done = False
+
+cursor_observer: CursorExternalObserver | None = None
+_pending_pages: list[CursorEvent] = []
+_pending_pages_max = 10
 
 IDLE_TIMEOUT_SEC = 25
 GROK_IDLE_TIMEOUT_SEC = 25
@@ -159,6 +165,51 @@ async def _close_local_session() -> None:
 # ---------------------------------------------------------------------------
 # Discord text helpers
 # ---------------------------------------------------------------------------
+
+_CONTROL_PLANE_FRIENDLY = (
+    "I hit an internal error and didn't get to your task. "
+    "Try `!retry` or `!stop` to clear state."
+)
+
+
+def _looks_like_control_plane_error(result: str) -> bool:
+    """P4: True if `result` is a host/loop error string that should NOT reach the user verbatim.
+
+    Recognises the three shapes seen in production:
+    - re-entrancy lock: `{"error": "An agent loop is already running ..."}`
+    - raw Anthropic SDK errors: `Error code: 400 - {...}`
+    - any single-line JSON whose top-level object has exactly one key, `error`
+
+    Tool-side typed errors (`_error_class`) are NOT control-plane errors —
+    those are Aria's job to handle in the loop. This matcher only catches
+    errors that escaped the loop without becoming a real reply.
+    """
+    if not result:
+        return True
+    stripped = result.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("Error code:"):
+        return True
+    if stripped.startswith("{") and "\n" not in stripped:
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if isinstance(obj, dict):
+            # Sole-key `error` envelope is the canonical control-plane shape.
+            if list(obj.keys()) == ["error"]:
+                return True
+            # _error_class envelopes are tool-typed errors — Aria should
+            # have handled these. They are NOT control-plane.
+            if "_error_class" in obj:
+                return False
+            # Some legacy paths returned `{"error": "...", "trace": "..."}`.
+            # If `error` is the dominant field, still quarantine.
+            if "error" in obj and len(obj) <= 2:
+                return True
+    return False
+
 
 def _split_at_paragraphs(text: str, max_len: int = 1900) -> list[str]:
     """Split text into chunks at paragraph boundaries."""
@@ -541,7 +592,16 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
         if gemini and gemini.connected:
             try:
                 buffer_ctx = conversation.as_gemini_injection(max_turns=10)
-                preamble = "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]"
+                briefing = _drain_pending_pages_for_briefing()
+                if briefing:
+                    preamble = (
+                        "[Context: Corbin just joined voice. While he was away, you paged him "
+                        "about the following Cursor events. When he speaks, OPEN with a "
+                        "one-sentence briefing covering these and then ask what he wants to do "
+                        f"next:\n{briefing}]"
+                    )
+                else:
+                    preamble = "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]"
                 injection = f"{preamble}\n\n{buffer_ctx}" if buffer_ctx else preamble
                 await gemini.inject_text(injection, turn_complete=False)
             except Exception:
@@ -562,50 +622,286 @@ def _find_authorized_user_voice_channel() -> discord.VoiceChannel | None:
 # Cursor event consumer
 # ---------------------------------------------------------------------------
 
+def _summarize_sdk_event(etype: str, data: dict) -> str | None:
+    """Render a single SDK event as a short thread-visible line.
+
+    Returns None for events we don't surface (system init noise, raw
+    audio, etc.). The wrapper passes `event.type` from `run.stream()`
+    verbatim; the real vocabulary is `system / user / assistant /
+    tool_call / thinking / status / request / task` plus the wrapper's
+    synthetic `completion / error`. See cursor_wrapper/index.js.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    if etype == "tool_call":
+        name = data.get("name") or data.get("tool", "?")
+        status = data.get("status", "")
+        args = data.get("args") or {}
+        hint = ""
+        if isinstance(args, dict):
+            for k in ("path", "command", "query", "file"):
+                v = args.get(k)
+                if isinstance(v, str):
+                    hint = f" `{v[:80]}`"
+                    break
+        return f"`tool` {name} ({status}){hint}" if status else f"`tool` {name}{hint}"
+
+    if etype == "assistant":
+        message = data.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = block.get("text", "")
+                    if isinstance(t, str) and t.strip():
+                        return f"`says` {t.strip()[:500]}"
+        return None
+
+    if etype == "thinking":
+        return None
+
+    if etype == "status":
+        s = (data.get("status") or "").upper()
+        if s:
+            return f"`status` {s}"
+        return None
+
+    if etype == "task":
+        sub = data.get("status") or data.get("subtype") or ""
+        text = data.get("text") or ""
+        return f"`task` {sub} {text[:200]}".strip()
+
+    if etype == "system":
+        sub = data.get("subtype") or ""
+        if sub == "init":
+            return None
+        return f"`system` {sub}"
+
+    if etype == "user":
+        return None
+
+    summary = data.get("summary") or data.get("text") or ""
+    if not summary:
+        return None
+    return f"`{etype}` {str(summary)[:500]}"
+
+
 async def _cursor_event_consumer(
     session_id: str, thread: discord.Thread | None
 ) -> None:
-    """Read Cursor build events and route to Discord + Gemini."""
+    """Read Cursor build events and route to Discord + Gemini.
+
+    Consumes the real `@cursor/sdk` event vocabulary (tool_call, assistant,
+    thinking, status, task) plus the two synthetic events the Node wrapper
+    appends (completion, error). Posts to the build thread (throttled) and
+    speaks completion / errors aloud if Aria is currently on voice.
+    """
     last_post = 0.0
+    throttle_sec = 5.0
+    finished = False
     try:
         async for event in cursor_bridge.read_events(session_id):
             if _cancel_flag:
                 break
             etype = event.get("event", "")
+            data = event.get("data") or {}
 
-            if etype in ("file_edit", "test_run"):
+            if etype == "completion" or (etype == "status" and isinstance(data, dict) and (data.get("status") or "").upper() == "FINISHED"):
+                if not finished:
+                    if thread:
+                        try:
+                            await thread.send("Build complete.")
+                        except Exception:
+                            log.exception("thread.send for completion failed")
+                    if gemini and gemini.connected:
+                        try:
+                            await gemini.inject_text(
+                                "The Cursor build has completed successfully.", turn_complete=True
+                            )
+                        except Exception:
+                            log.exception("gemini inject for completion failed")
+                    upsert_cursor_session(session_id, "", status="completed")
+                    finished = True
+                if etype == "completion":
+                    break
+                continue
+
+            if etype == "error" or (etype == "status" and isinstance(data, dict) and (data.get("status") or "").upper() in ("ERROR", "EXPIRED", "CANCELLED")):
+                msg = data.get("message") or data.get("status") or "Unknown error"
+                try:
+                    await post_to_alerts(f"Cursor error ({session_id[:8]}): {msg}")
+                except Exception:
+                    log.exception("alerts post for error failed")
+                upsert_cursor_session(session_id, "", status="error")
+                if etype == "error":
+                    break
+                continue
+
+            line = _summarize_sdk_event(etype, data)
+            if line:
                 now = time.monotonic()
-                if now - last_post > 5 and thread:
-                    summary = event.get("data", {}).get("summary", etype)
-                    await thread.send(f"`{etype}`: {str(summary)[:500]}")
+                if now - last_post > throttle_sec and thread:
+                    try:
+                        await thread.send(line)
+                    except Exception:
+                        log.exception("thread.send for SDK event failed")
                     last_post = now
                 update_cursor_session_event(session_id, etype)
-
-            elif etype == "question" and gemini:
-                question = event.get("data", {}).get("text", "Cursor has a question")
-                await gemini.inject_text(
-                    f"Cursor is asking: {question}", turn_complete=True
-                )
-
-            elif etype == "completion":
-                if thread:
-                    await thread.send("Build complete.")
-                if gemini and gemini.connected:
-                    await gemini.inject_text(
-                        "The Cursor build has completed successfully.", turn_complete=True
-                    )
-                upsert_cursor_session(session_id, "", status="completed")
-                break
-
-            elif etype == "error":
-                msg = event.get("data", {}).get("message", "Unknown error")
-                await post_to_alerts(f"Cursor error ({session_id[:8]}): {msg}")
-                upsert_cursor_session(session_id, "", status="error")
-                break
     except Exception:
         log.exception("Cursor event consumer error for %s", session_id)
     finally:
         cursor_bridge.close_session(session_id)
+
+
+# ---------------------------------------------------------------------------
+# External Cursor observer pager
+# ---------------------------------------------------------------------------
+
+def _format_brief_for_voice(evt: CursorEvent) -> str:
+    """Short, conversational version of the event for Gemini to speak."""
+    parts = [evt.brief]
+    if evt.transcript_snippet:
+        last = evt.transcript_snippet[-1]
+        if last.get("role") == "assistant":
+            parts.append(f"Last thing it said: {last.get('text', '')[:240]}")
+    if evt.recent_plans:
+        plan_names = ", ".join(p["slug"] for p in evt.recent_plans[:2])
+        parts.append(f"Recent plan file(s): {plan_names}.")
+    return " ".join(p for p in parts if p)
+
+
+def _format_brief_for_dm(evt: CursorEvent) -> str:
+    """One-shot Discord DM body. Begins with a user mention so phones buzz."""
+    mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
+    mention = f"<@{mention_id}> " if mention_id else ""
+    lines = [f"{mention}**{evt.brief}**"]
+    if evt.workspace_root:
+        lines.append(f"`{evt.workspace_root}`")
+    if evt.transcript_snippet:
+        last = evt.transcript_snippet[-1]
+        snippet = last.get("text", "")[:300].replace("\n", " ")
+        if snippet:
+            lines.append(f"Last turn ({last.get('role')}): {snippet}")
+    lines.append("Join voice when you want to debrief and pick the next move.")
+    return "\n".join(lines)
+
+
+async def _dm_authorized_user(content: str) -> bool:
+    """Send a DM to the first authorized user. Returns True on success.
+
+    Loud failure: surfaces to #ucs-alerts if the DM cannot be delivered so
+    the user knows the page didn't land.
+    """
+    if not config.authorized_user_ids:
+        log.warning("No authorized_user_ids configured — cannot DM")
+        return False
+    user_id = int(config.authorized_user_ids[0])
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+    except discord.HTTPException as exc:
+        log.exception("Could not fetch authorized user for DM")
+        try:
+            await post_to_alerts(
+                f"**Pager DM failed:** could not fetch user {user_id} ({exc.__class__.__name__})."
+            )
+        except Exception:
+            log.exception("Failed to post DM failure alert")
+        return False
+
+    try:
+        dm = user.dm_channel or await user.create_dm()
+    except discord.HTTPException:
+        log.exception("create_dm failed for %s", user_id)
+        return False
+
+    for chunk in _split_at_paragraphs(content):
+        try:
+            await dm.send(chunk)
+        except discord.Forbidden:
+            log.warning("User %s has DMs disabled — page lost", user_id)
+            try:
+                await post_to_alerts(
+                    f"**Pager DM blocked:** user {user_id} has DMs disabled. "
+                    f"Brief: {content[:300]}"
+                )
+            except Exception:
+                log.exception("Failed to post DM-blocked alert")
+            return False
+        except discord.HTTPException:
+            log.exception("DM send failed")
+            return False
+    return True
+
+
+async def _cursor_external_pager(evt: CursorEvent) -> None:
+    """Pager callback for the external observer.
+
+    Rung A: voice connected -> inject_text(turn_complete=True). Aria speaks
+            the briefing immediately, mid-conversation.
+    Rung B: voice not connected -> DM with @mention; queue the brief so the
+            next voice join preamble includes a debrief instruction.
+
+    Always mirrors a record to #ucs-alerts so the audit trail exists in
+    Discord regardless of which rung fired.
+    """
+    log.info(
+        "External cursor event: type=%s project=%s severity=%s status=%s",
+        evt.hook_type, evt.project, evt.severity, evt.status,
+    )
+
+    try:
+        await post_to_alerts(
+            f"**[Cursor watch] {evt.brief}** _(severity={evt.severity}, hook={evt.hook_type})_"
+        )
+    except Exception:
+        log.exception("Failed to post cursor watch alert")
+
+    on_voice = bool(gemini and gemini.connected)
+    if on_voice:
+        try:
+            speech = _format_brief_for_voice(evt)
+            await gemini.inject_text(
+                f"[Cursor watch heads-up — you should narrate this and ask what to do next] {speech}",
+                turn_complete=True,
+            )
+            return
+        except Exception:
+            log.exception("Failed to inject cursor watch into Gemini — falling back to DM")
+
+    if config.cursor_dm_pager_enabled and evt.severity in ("high", "low"):
+        body = _format_brief_for_dm(evt)
+        ok = await _dm_authorized_user(body)
+        if not ok:
+            log.warning("Pager DM did not land for event project=%s hook=%s", evt.project, evt.hook_type)
+
+    _queue_pending_page(evt)
+
+
+def _queue_pending_page(evt: CursorEvent) -> None:
+    """Buffer the event so the next voice join preamble can debrief on it.
+
+    Drops oldest when at capacity — recent context matters more than old.
+    """
+    _pending_pages.append(evt)
+    if len(_pending_pages) > _pending_pages_max:
+        del _pending_pages[: len(_pending_pages) - _pending_pages_max]
+
+
+def _drain_pending_pages_for_briefing() -> str:
+    """Pop pending pages and render them as a join-preamble briefing.
+
+    Empty string when nothing is pending. Drains so the same event is not
+    re-briefed on the next join.
+    """
+    if not _pending_pages:
+        return ""
+    items = list(_pending_pages)
+    _pending_pages.clear()
+    lines = []
+    for evt in items:
+        lines.append(f"- {evt.brief} (hook={evt.hook_type}, project={evt.project}, status={evt.status or 'n/a'})")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +913,7 @@ async def on_ready():
     global gemini, _preflight_passed, _last_preflight_report
     global _pending_voice_channel_id
     global _on_ready_done
+    global cursor_observer
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
 
     if not _on_ready_done:
@@ -686,10 +983,35 @@ async def on_ready():
         except Exception:
             log.exception("MCP fleet failed to start — preflight will flag MCP probes")
 
+        try:
+            from . import tools as tools_module
+            cursor_observer = CursorExternalObserver(
+                pager_callback=_cursor_external_pager,
+                registry_provider=lambda: dict(tools_module.PROJECT_REGISTRY),
+            )
+            await cursor_observer.start()
+        except OSError as exc:
+            log.exception(
+                "External Cursor observer failed to bind %s:%s — port in use?",
+                config.cursor_event_host, config.cursor_event_port,
+            )
+            cursor_observer = None
+            try:
+                await post_to_alerts(
+                    f"**External Cursor observer failed to start:** {exc}. "
+                    "Other-window watching is disabled this boot."
+                )
+            except Exception:
+                pass
+        except Exception:
+            log.exception("External Cursor observer failed to start")
+            cursor_observer = None
+
         from .preflight import run_all, format_report
         report = await run_all(
             mcp_client=mcp,
             cursor_bridge=cursor_bridge,
+            cursor_observer=cursor_observer,
             alert_callback=post_to_alerts,
             include_gemini=True,
             include_cursor=True,
@@ -926,6 +1248,7 @@ async def preflight(ctx: commands.Context):
     report = await run_all(
         mcp_client=mcp_client,
         cursor_bridge=cursor_bridge,
+        cursor_observer=cursor_observer,
         alert_callback=post_to_alerts,
         include_gemini=True,
         include_cursor=True,
@@ -999,6 +1322,11 @@ async def _run_ask(channel, message: str) -> None:
             "task": message,
             "session_key": session_key,
         })
+        # P4: never leak control-plane errors to the user. Log raw, send friendly.
+        if _looks_like_control_plane_error(result):
+            log.error("control-plane error quarantined (!ask): %s", result[:500])
+            await channel.send(_CONTROL_PLANE_FRIENDLY)
+            return
         if len(result) > 1900:
             await post_to_text(result)
             await channel.send("Done — full result posted to #ucs.")
@@ -1006,7 +1334,8 @@ async def _run_ask(channel, message: str) -> None:
             await channel.send(result)
         conversation.add_aria_text(channel=channel_name, text=result)
     except Exception as e:
-        await channel.send(f"Error: {e}")
+        log.exception("_run_ask raised")
+        await channel.send(_CONTROL_PLANE_FRIENDLY)
 
 
 def _augment_with_context(user_text: str) -> str:
@@ -1072,6 +1401,11 @@ async def _handle_text_conversation(message: discord.Message) -> None:
             )
             return
 
+    # P4: never leak control-plane errors to the user. Log raw, send friendly.
+    if _looks_like_control_plane_error(result):
+        log.error("control-plane error quarantined (text-conv): %s", result[:500])
+        await message.channel.send(_CONTROL_PLANE_FRIENDLY)
+        return
     if len(result) <= 1900:
         await message.channel.send(result)
     else:

@@ -450,7 +450,11 @@ class IntelligenceLoop:
                 f"- {m.get('memory', m.get('text', ''))}" for m in memories
             ) + "\n\n"
 
-        messages: list[dict[str, Any]] = [{"role": "user", "content": memory_ctx + task}]
+        from .tools import _build_context as _ucs_build_context
+        context_block = _ucs_build_context(session_key)
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": context_block + memory_ctx + task}
+        ]
 
         total_in = 0
         total_out = 0
@@ -463,10 +467,18 @@ class IntelligenceLoop:
 
         # Cross-iteration dedup ledger. See _dedup_key in tools.py.
         # Maps "name:args_json" -> (call_count, cached_result_str).
-        from .tools import _dedup_key  # local import to avoid cycle at module load
+        from .tools import (  # local import to avoid cycle at module load
+            _GROUND_CHECK_MAX_RETRIES,
+            _dedup_key,
+            _ground_check,
+            _ground_check_user_message,
+        )
         called_tools: dict[str, tuple[int, str]] = {}
 
-        while iteration < profile.max_iterations:
+        # P1 retry counter — see _do_with_claude_legacy for full notes.
+        ground_check_retries = 0
+
+        while iteration < profile.max_iterations + ground_check_retries:
             if cancel_check and cancel_check():
                 return LoopResult(
                     text="Task cancelled by user.", status="cancelled",
@@ -503,6 +515,25 @@ class IntelligenceLoop:
             if response["stop_reason"] == "end_turn" or not has_tool_use:
                 text_parts = [b["text"] for b in response["content"] if b.get("type") == "text"]
                 result = "\n".join(text_parts)
+
+                # P1 — Pre-send Grounding Gate (UCS variant).
+                if ground_check_retries < _GROUND_CHECK_MAX_RETRIES:
+                    violations = await _ground_check(tool_trace, result, session_key)
+                    if violations:
+                        ground_check_retries += 1
+                        log.warning(
+                            "ground-check retry %d/%d (ucs) session=%s",
+                            ground_check_retries,
+                            _GROUND_CHECK_MAX_RETRIES,
+                            session_key,
+                        )
+                        messages.append({"role": "assistant", "content": response["raw_content"]})
+                        messages.append({
+                            "role": "user",
+                            "content": _ground_check_user_message(violations),
+                        })
+                        continue
+
                 return LoopResult(
                     text=result, status="completed", iterations=iteration,
                     total_tokens_in=total_in, total_tokens_out=total_out,

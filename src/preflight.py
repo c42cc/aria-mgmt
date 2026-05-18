@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -214,11 +215,17 @@ async def probe_mcp_server(mcp_client: Any, server_name: str, severity: str) -> 
 
 
 async def probe_mcp_apple_calendar(mcp_client: Any) -> tuple[bool, str, str, str]:
-    """Apple MCP can actually read calendars (verifies EventKitCLI binary + permissions)."""
+    """Apple MCP can actually read calendars (verifies EventKitCLI binary + permissions).
+
+    A1: explicitly checks for the `write-only` mode that produced 21 audit
+    hits between 2026-05-12 and 2026-05-16 without ever turning into a
+    preflight failure. The string is canonical in mcp-macos output.
+    """
     if mcp_client is None or "apple" not in mcp_client._servers:
         return False, "apple MCP not running", "ops/bootstrap.sh", ""
     result = await mcp_client.call_tool("calendar_calendars", {})
     text = str(result)
+    lower = text.lower()
     if "EventKitCLI binary not found" in text:
         return (
             False,
@@ -226,16 +233,69 @@ async def probe_mcp_apple_calendar(mcp_client: Any) -> tuple[bool, str, str, str
             "bash ops/build_macos_swift.sh",
             text[:200],
         )
-    if "permission" in text.lower() or "not authorized" in text.lower() or "TCC" in text:
+    if "write-only" in lower:
+        return (
+            False,
+            "macOS Calendar permission is WRITE-ONLY; read access required",
+            "System Settings > Privacy & Security > Calendars > toggle Aria's host to Full Access",
+            text[:200],
+        )
+    if "permission" in lower or "not authorized" in lower or "TCC" in text:
         return (
             False,
             "macOS Calendar permission not granted",
             "bash ops/grant_permissions.sh",
             text[:200],
         )
-    if "error" in text.lower()[:40] or "failed" in text.lower()[:40]:
-        return False, f"calendar_calendars call failed", "", text[:300]
+    if "error" in lower[:40] or "failed" in lower[:40]:
+        return False, "calendar_calendars call failed", "", text[:300]
     return True, "", "", f"got {text[:120]!r}"
+
+
+async def probe_mcp_time(mcp_client: Any) -> tuple[bool, str, str, str]:
+    """A1: the `google-calendar.get-current-time` MCP returns a parseable ISO timestamp.
+
+    P3 already removes Aria's runtime dependence on this tool (date comes
+    from the host context block), but the probe is a smoke test: if the
+    google-calendar MCP is healthy, time should work too. Severity WARN.
+    """
+    if mcp_client is None:
+        return False, "MCP client not started", "", ""
+    if "google-calendar" not in mcp_client._servers:
+        return False, "google-calendar MCP not running", "ops/google_oauth_bootstrap.py", ""
+    if "get-current-time" not in mcp_client._tools and "get_current_time" not in mcp_client._tools:
+        return True, "", "", "tool absent — not all gcal servers expose it"
+    tool = "get-current-time" if "get-current-time" in mcp_client._tools else "get_current_time"
+    try:
+        result = await mcp_client.call_tool(tool, {})
+        text = str(result)
+        # Accept anything that contains an ISO-shaped fragment.
+        if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text):
+            return True, "", "", f"got {text[:80]}"
+        return False, f"{tool} returned no parseable ISO timestamp", "", text[:200]
+    except Exception as e:
+        return False, f"{tool} raised: {e}", "", ""
+
+
+async def probe_mcp_tool_name_regex(mcp_client: Any) -> tuple[bool, str, str, str]:
+    """A1: every registered MCP tool name matches Anthropic's `^[a-zA-Z0-9_-]{1,128}$` regex.
+
+    Session 24 was killed at the API level because one tool slipped through
+    name sanitization. This is the belt-and-suspenders check; P2(a) is the
+    runtime gate. Severity CRITICAL.
+    """
+    if mcp_client is None or not getattr(mcp_client, "_started", False):
+        return False, "MCP client not started", "", ""
+    pattern = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+    offenders = [n for n in mcp_client._tools if not pattern.match(n)]
+    if offenders:
+        return (
+            False,
+            f"{len(offenders)} tool name(s) do not match Anthropic regex",
+            "Check src/mcp.py:_sanitize_tool_name registration path",
+            "; ".join(offenders[:5]),
+        )
+    return True, "", "", f"all {len(mcp_client._tools)} tool names valid"
 
 
 async def probe_mcp_filesystem(mcp_client: Any) -> tuple[bool, str, str, str]:
@@ -509,6 +569,136 @@ async def probe_accessibility() -> tuple[bool, str, str, str]:
     return True, "", "", f"frontmost={app_name}"
 
 
+async def probe_cursor_observer(cursor_observer: Any) -> tuple[bool, str, str, str]:
+    """External cursor observer HTTP endpoint is reachable from localhost."""
+    if cursor_observer is None:
+        return (
+            False,
+            "External Cursor observer not constructed",
+            "Check bot.py on_ready (cursor_observer init); see ARCHITECTURE.md External Cursor Observer",
+            "",
+        )
+    if not cursor_observer.alive:
+        return (
+            False,
+            "External Cursor observer not running (port bind failed or stopped)",
+            "Restart bot; check UCS_CURSOR_EVENT_PORT in .env",
+            "",
+        )
+    healthz = cursor_observer.url.rsplit("/", 1)[0] + "/healthz"
+    import urllib.request
+    try:
+        body = await asyncio.to_thread(
+            lambda: urllib.request.urlopen(healthz, timeout=2).read().decode()
+        )
+    except Exception as exc:
+        return (
+            False,
+            f"GET {healthz} failed: {exc}",
+            "Restart bot; ensure UCS_CURSOR_EVENT_HOST=127.0.0.1 and port is free",
+            "",
+        )
+    return True, "", "", body[:200]
+
+
+async def probe_cursor_hooks_installed() -> tuple[bool, str, str, str]:
+    """~/.cursor/hooks.json contains the aria-forwarder entries."""
+    hooks_path = os.path.expanduser("~/.cursor/hooks.json")
+    if not os.path.exists(hooks_path):
+        return (
+            False,
+            f"{hooks_path} does not exist",
+            ".venv/bin/python hooks/install.py",
+            "",
+        )
+    try:
+        with open(hooks_path) as f:
+            data = json.load(f)
+    except Exception as exc:
+        return (
+            False,
+            f"{hooks_path} is not valid JSON: {exc}",
+            "Fix the hooks file by hand or run: .venv/bin/python hooks/install.py",
+            "",
+        )
+
+    sections = (data or {}).get("hooks") or {}
+    aria_count = 0
+    aria_events: list[str] = []
+    for event, entries in sections.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("_tag") == "aria-cursor-event":
+                aria_count += 1
+                aria_events.append(event)
+
+    if aria_count == 0:
+        return (
+            False,
+            "no aria-cursor-event entries found in ~/.cursor/hooks.json",
+            ".venv/bin/python hooks/install.py",
+            f"existing top-level events: {sorted(sections.keys())}",
+        )
+
+    expected = {"stop", "subagentStop", "sessionEnd", "postToolUse", "afterAgentResponse"}
+    have = set(aria_events)
+    missing = expected - have
+    if missing:
+        return (
+            False,
+            f"aria hooks installed but missing events: {sorted(missing)}",
+            ".venv/bin/python hooks/install.py",
+            f"have: {sorted(have)}",
+        )
+
+    return True, "", "", f"{aria_count} aria hook entries across {sorted(have)}"
+
+
+async def probe_applescript_cursor() -> tuple[bool, str, str, str]:
+    """AppleScript can query the Cursor process (needed for remote-control tools).
+
+    Does NOT require Cursor to be running — only that the AppleScript /
+    System Events query succeeds. If Cursor isn't running, the query
+    returns empty, which is still a successful probe (Aria will note
+    "no Cursor windows open" at tool call time).
+    """
+    script = (
+        'tell application "System Events"\n'
+        '  if exists process "Cursor" then\n'
+        '    return ((count of (every window of process "Cursor")) as text)\n'
+        '  else\n'
+        '    return "NOTRUNNING"\n'
+        '  end if\n'
+        'end tell'
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=4.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False, "AppleScript Cursor query timed out after 4s", "", ""
+    if proc.returncode != 0:
+        err = stderr.decode().strip()
+        if "-1743" in err or "not allowed assistive access" in err.lower():
+            return (
+                False,
+                "Accessibility denied for AppleScript -> System Events -> Cursor",
+                "System Settings → Privacy & Security → Accessibility → grant your terminal/launcher",
+                err[:200],
+            )
+        return False, f"osascript failed: {err[:200]}", "", ""
+    out = stdout.decode().strip()
+    if out == "NOTRUNNING":
+        return True, "", "", "Cursor not currently running (probe still OK)"
+    return True, "", "", f"Cursor windows visible: {out}"
+
+
 async def probe_prompts() -> tuple[bool, str, str, str]:
     """All prompt templates load without falling back."""
     from .prompts import load_template
@@ -623,6 +813,7 @@ async def run_all(
     *,
     mcp_client: Any = None,
     cursor_bridge: Any = None,
+    cursor_observer: Any = None,
     alert_callback: Callable | None = None,
     include_gemini: bool = True,
     include_cursor: bool = True,
@@ -648,6 +839,7 @@ async def run_all(
         return await _run_all_inner(
             mcp_client=mcp_client,
             cursor_bridge=cursor_bridge,
+            cursor_observer=cursor_observer,
             alert_callback=alert_callback,
             include_gemini=include_gemini,
             include_cursor=include_cursor,
@@ -658,6 +850,7 @@ async def _run_all_inner(
     *,
     mcp_client: Any = None,
     cursor_bridge: Any = None,
+    cursor_observer: Any = None,
     alert_callback: Callable | None = None,
     include_gemini: bool = True,
     include_cursor: bool = True,
@@ -689,6 +882,16 @@ async def _run_all_inner(
 
     # MCP — only if a client was provided
     if mcp_client is not None and getattr(mcp_client, "_started", False):
+        # A1: CRITICAL — every tool name must match Anthropic's regex
+        # before we even enter the loop. Belt-and-suspenders for
+        # P2(a) in src/mcp.py.
+        report.results.append(
+            await _run_probe(
+                "mcp_tool_name_regex",
+                CRITICAL,
+                lambda: probe_mcp_tool_name_regex(mcp_client),
+            )
+        )
         report.results.append(
             await _run_probe("mcp_filesystem", CRITICAL, lambda: probe_mcp_filesystem(mcp_client))
         )
@@ -707,6 +910,11 @@ async def _run_all_inner(
         report.results.append(
             await _run_probe("mcp_gmail", WARN, lambda: probe_mcp_gmail(mcp_client))
         )
+        # A1: smoke test for the time tool. P3 already removes runtime
+        # dependence on it; this probe surfaces silent regressions.
+        report.results.append(
+            await _run_probe("mcp_time", WARN, lambda: probe_mcp_time(mcp_client))
+        )
 
     # Anchor health checks
     report.results.append(
@@ -722,6 +930,17 @@ async def _run_all_inner(
     # Wake word + accessibility
     report.results.append(await _run_probe("wake_word_model", WARN, probe_wake_word_model))
     report.results.append(await _run_probe("accessibility", WARN, probe_accessibility))
+
+    # External Cursor observer (remote-pilot capability)
+    report.results.append(
+        await _run_probe("cursor_observer", WARN, lambda: probe_cursor_observer(cursor_observer))
+    )
+    report.results.append(
+        await _run_probe("cursor_hooks_installed", WARN, probe_cursor_hooks_installed)
+    )
+    report.results.append(
+        await _run_probe("applescript_cursor", WARN, probe_applescript_cursor)
+    )
 
     report.finished_at = datetime.now(timezone.utc).isoformat()
     return report

@@ -50,6 +50,11 @@ class Config:
     # UCS feature flag — Phase 2 parallel path
     ucs_enabled: bool = os.getenv("UCS_ENABLED", "false").lower() == "true"
 
+    # External Cursor observer (hooks-driven, watches other IDE windows)
+    cursor_event_host: str = os.getenv("UCS_CURSOR_EVENT_HOST", "127.0.0.1")
+    cursor_event_port: int = int(os.getenv("UCS_CURSOR_EVENT_PORT", "8731"))
+    cursor_dm_pager_enabled: bool = os.getenv("UCS_CURSOR_DM_PAGER_ENABLED", "true").lower() == "true"
+
     # Paths
     data_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     prompts_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
@@ -60,6 +65,7 @@ class Config:
     cursor_wrapper_dir: str = os.path.join(
         os.path.dirname(os.path.dirname(__file__)), "cursor_wrapper"
     )
+    cursor_user_data_dir: str = os.path.expanduser("~/.cursor")
 
 
 config = Config()

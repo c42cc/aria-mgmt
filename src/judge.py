@@ -182,6 +182,11 @@ async def _run_anchors(record: dict[str, Any]) -> list[dict]:
     happen to cover the same `(tool, args)` share a single upstream API
     call. Without this, every parallel agent loop doubled Gmail / Calendar /
     GitHub traffic per anchor (audit gap L6).
+
+    P1 plan extension (F14): if the session was produced by
+    `plan_with_claude` and the trace has no entry for it, synthesise a
+    virtual entry so the PlanCitationAnchor can inspect the result text.
+    Plans are one-shot — they never appear in their own trace otherwise.
     """
     from .anchors import anchor_for
     from .anchors.base import AnchorReport
@@ -190,17 +195,31 @@ async def _run_anchors(record: dict[str, Any]) -> list[dict]:
     context = record.get("context_json")
     if isinstance(context, str) and context:
         context = json.loads(context)
-    if not context or not isinstance(context, dict):
-        return []
+    if not isinstance(context, dict):
+        context = {}
 
-    tool_trace = context.get("tool_trace", [])
-    if not tool_trace:
-        return []
+    tool_trace = list(context.get("tool_trace", []) or [])
 
     outputs = record.get("outputs_json")
     if isinstance(outputs, str):
         outputs = json.loads(outputs)
     aria_result = (outputs or {}).get("result", "")
+
+    record_tool = record.get("tool_name", "")
+    if record_tool == "plan_with_claude" and not any(
+        tc.get("tool") == "plan_with_claude" for tc in tool_trace
+    ):
+        tool_trace.append({
+            "tool": "plan_with_claude",
+            "args": {},
+            "result": aria_result,
+            "result_chars": len(aria_result),
+            "result_truncated": False,
+            "deduped": False,
+        })
+
+    if not tool_trace:
+        return []
 
     reports = []
     for tc in tool_trace:
