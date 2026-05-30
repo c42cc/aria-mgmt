@@ -8,6 +8,8 @@ import json
 import logging
 import sys
 import time
+from dataclasses import dataclass, field
+from typing import Coroutine
 
 import discord
 from discord.ext import commands
@@ -15,7 +17,8 @@ from discord.ext import commands
 from .config import config
 from .conversation import conversation
 from .cursor_bridge import CursorBridge
-from .cursor_external import CursorEvent, CursorExternalObserver
+from .cursor_external import CursorExternalObserver
+from .cursor_registry import CursorAgent, RegistryEvent, cursor_registry
 from .db import init_db, get_daily_spend, log_event, upsert_cursor_session, update_cursor_session_event
 from .discord_voice import VoiceTransitionBusy, voice_bridge, voice_controller
 from .gemini_session import GeminiSession
@@ -62,14 +65,138 @@ _local_silence_task: asyncio.Task | None = None
 _on_ready_done = False
 
 cursor_observer: CursorExternalObserver | None = None
-_pending_pages: list[CursorEvent] = []
-_pending_pages_max = 10
 
 IDLE_TIMEOUT_SEC = 25
 GROK_IDLE_TIMEOUT_SEC = 25
 GROK_COST_PER_MINUTE = 0.05
 VOICE_EXIT_TIMEOUT_SEC = 600  # leave voice after 10 min of total silence
 LOCAL_SILENCE_TIMEOUT_SEC = 8  # close local voice session after 8s idle
+
+CONFIRM_TIMEOUT_SEC = 60  # tier-X/I confirmation wait window
+CONFIRM_APPROVE_EMOJIS = {"\u2705", "\U0001f44d"}  # white check mark, thumbs up
+CONFIRM_DECLINE_EMOJIS = {"\u274c", "\U0001f44e"}  # cross mark, thumbs down
+
+
+# ---------------------------------------------------------------------------
+# Tier-X/I confirmation: text + reaction approval registry
+# ---------------------------------------------------------------------------
+# The Gemini confirm_action function call (gemini_session.py) is one
+# approval channel. A task initiated from #ucs text with no live voice
+# session cannot be approved through Gemini — there is no receive loop to
+# carry the confirm_action back. This registry adds a second answer
+# channel: !ok/!no in #ucs-alerts, or a reaction on the confirmation card.
+# bot._confirm_callback races Gemini wait_for_confirmation against
+# discord_wait_for_confirmation; whichever resolves first wins.
+
+@dataclass
+class _PendingConfirmation:
+    """A tier-X/I action awaiting approval via Discord text/reaction.
+
+    The `event` is set by `_resolve_pending_confirmation` when the user
+    answers via !ok/!no or a thumbs-up/check / thumbs-down/cross reaction.
+    `message_id` is the alerts-card message we watch reactions on.
+    """
+    action_id: str
+    tool_name: str
+    summary: str
+    event: asyncio.Event
+    message_id: int | None = None
+    result: dict = field(default_factory=dict)
+
+
+_pending_text_confirmations: dict[str, _PendingConfirmation] = {}
+# Reverse map message_id -> action_id so on_reaction_add can find the
+# pending confirmation by the reacted message without scanning the dict.
+_confirmation_message_index: dict[int, str] = {}
+
+# True while any do_with_claude loop or text-confirmation is in flight.
+# The Gemini idle-pause watchdog (_watchdog_task) and the Gemini session
+# close path (_do_close) consult this so they don't tear down work the
+# user is in the middle of approving or watching run.
+_loops_in_flight: int = 0
+
+
+def _register_pending_confirmation(
+    action_id: str, tool_name: str, summary: str
+) -> _PendingConfirmation:
+    pending = _PendingConfirmation(
+        action_id=action_id,
+        tool_name=tool_name,
+        summary=summary,
+        event=asyncio.Event(),
+    )
+    _pending_text_confirmations[action_id] = pending
+    return pending
+
+
+def _unregister_pending_confirmation(action_id: str) -> None:
+    pending = _pending_text_confirmations.pop(action_id, None)
+    if pending and pending.message_id is not None:
+        _confirmation_message_index.pop(pending.message_id, None)
+
+
+def _resolve_pending_confirmation(
+    action_id: str, approved: bool, source: str
+) -> bool:
+    """Set the pending confirmation result. Returns False if no such id."""
+    pending = _pending_text_confirmations.get(action_id)
+    if not pending:
+        return False
+    if pending.event.is_set():
+        return True
+    pending.result = {"approved": approved, "source": source}
+    pending.event.set()
+    return True
+
+
+async def _discord_wait_for_confirmation(
+    action_id: str, timeout: float
+) -> dict:
+    """Block until !ok/!no or a reaction resolves action_id, or timeout."""
+    pending = _pending_text_confirmations.get(action_id)
+    if not pending:
+        return {"approved": False, "timeout": True}
+    try:
+        await asyncio.wait_for(pending.event.wait(), timeout=timeout)
+        return pending.result or {"approved": False}
+    except asyncio.TimeoutError:
+        return {"approved": False, "timeout": True}
+
+
+async def _race_confirmations(
+    voice_waiter: Coroutine, text_waiter: Coroutine
+) -> dict:
+    """Run voice and text waiters concurrently; first decisive answer wins.
+
+    "Decisive" means a real approval/decline. If one waiter times out and
+    the other is still pending, we keep waiting on the other. If both
+    time out, the result is `{"approved": False, "timeout": True}`.
+    """
+    voice_task = asyncio.create_task(voice_waiter, name="confirm_voice")
+    text_task = asyncio.create_task(text_waiter, name="confirm_text")
+    pending = {voice_task, text_task}
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    res = task.result()
+                except Exception:
+                    log.exception("confirmation waiter raised")
+                    continue
+                if not res.get("timeout"):
+                    return res
+        return {"approved": False, "timeout": True}
+    finally:
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -212,18 +339,44 @@ def _looks_like_control_plane_error(result: str) -> bool:
 
 
 def _split_at_paragraphs(text: str, max_len: int = 1900) -> list[str]:
-    """Split text into chunks at paragraph boundaries."""
+    """Split text into Discord-safe chunks (<= max_len), preferring paragraph
+    then line boundaries. Falls back to a hard slice for runs that contain
+    no boundary at all, so the result is guaranteed never to exceed max_len —
+    Discord's hard limit is 2000 and the default 1900 leaves headroom.
+
+    Without the line/hard-slice fallback, a single long paragraph (e.g. the
+    preflight report banner) would be returned intact and Discord would
+    reject the send with HTTPException 50035.
+    """
     if len(text) <= max_len:
         return [text]
+
+    def _hard_slice(s: str) -> list[str]:
+        return [s[i : i + max_len] for i in range(0, len(s), max_len)]
+
+    def _split_line(line: str) -> list[str]:
+        return _hard_slice(line) if len(line) > max_len else [line]
+
+    def _flush(current: str, chunks: list[str]) -> str:
+        if current:
+            chunks.append(current.strip())
+        return ""
+
     chunks: list[str] = []
     current = ""
     for para in text.split("\n\n"):
-        if len(current) + len(para) + 2 > max_len:
-            if current:
-                chunks.append(current.strip())
-            current = para
-        else:
+        if len(para) <= max_len:
+            if len(current) + len(para) + 2 > max_len:
+                current = _flush(current, chunks)
             current = current + "\n\n" + para if current else para
+            continue
+        # Paragraph itself is too long: flush, then split by lines.
+        current = _flush(current, chunks)
+        for line in para.split("\n"):
+            for piece in _split_line(line):
+                if len(current) + len(piece) + 1 > max_len:
+                    current = _flush(current, chunks)
+                current = current + "\n" + piece if current else piece
     if current.strip():
         chunks.append(current.strip())
     return chunks or [text[:max_len]]
@@ -253,16 +406,59 @@ async def post_to_text(content: str, thread: discord.Thread | None = None) -> No
             await target.send(chunk)
 
 
-async def post_to_alerts(content: str) -> None:
+async def post_to_alerts(content: str, *, silent: bool = False) -> None:
     """Post to #ucs-alerts. Recorded in the conversation buffer as a
     system alert so text-Aria can answer 'what was that error?' from
-    `#ucs`."""
+    `#ucs`.
+
+    silent=True suppresses the push/badge/sound notification on the post.
+    Use it when an audit-trail record duplicates a louder primary
+    notification (e.g. the cursor pager that also fires a DM or a voice
+    narration on the same event).
+    """
     ch = bot.get_channel(int(config.discord_log_channel_id))
     if not ch:
         raise RuntimeError(f"Alert channel {config.discord_log_channel_id} not found — bot cannot post alerts")
     for chunk in _split_at_paragraphs(content):
-        await ch.send(chunk)
+        await ch.send(chunk, silent=silent)
     conversation.add_alert(content)
+
+
+async def _post_confirmation_card(
+    action_id: str, tool_name: str, summary: str
+) -> discord.Message | None:
+    """Post a tier-X/I confirmation card to #ucs-alerts and prime reactions.
+
+    Returns the posted Message so the caller can register its id for
+    reaction-based resolution. Failures are logged but do not block the
+    confirmation flow — voice approval still works.
+    """
+    body = (
+        f"**Confirmation required** (action_id=`{action_id}`)\n"
+        f"`{tool_name}`: {summary}\n"
+        f"Reply `!ok {action_id}` / `!no {action_id}` or react "
+        f"\u2705 / \u274c. Times out in {CONFIRM_TIMEOUT_SEC}s."
+    )
+    ch = bot.get_channel(int(config.discord_log_channel_id))
+    if not ch:
+        log.error(
+            "Alert channel %s not found — cannot post confirmation card",
+            config.discord_log_channel_id,
+        )
+        return None
+    message: discord.Message | None = None
+    try:
+        message = await ch.send(body)
+    except Exception:
+        log.exception("Failed to post confirmation card to #ucs-alerts")
+        return None
+    conversation.add_alert(body)
+    try:
+        await message.add_reaction("\u2705")
+        await message.add_reaction("\u274c")
+    except Exception:
+        log.debug("Could not prime confirmation reactions (non-fatal)", exc_info=True)
+    return message
 
 
 async def _mirror_to_voice_chat(prefix: str, text: str) -> None:
@@ -272,6 +468,13 @@ async def _mirror_to_voice_chat(prefix: str, text: str) -> None:
     spoken replies (and the user's transcribed utterances) so the voice
     session has a scrollable transcript visible in the same Discord
     channel as the audio.
+
+    silent=True suppresses the push/badge/sound notification for each
+    mirror post. Every voice turn produces TWO calls — one for the user
+    role ("You said: ...") and one for the aria role ("Aria: ..."). If
+    these dinged, the user would hear two notification sounds per
+    exchange ("ding ding") on top of the audio they're already hearing
+    in voice. The transcript is for reference, not for alerting.
     """
     if not voice_controller.channel_id:
         return
@@ -281,7 +484,7 @@ async def _mirror_to_voice_chat(prefix: str, text: str) -> None:
     body = f"**{prefix}** {text}" if prefix else text
     for chunk in _split_at_paragraphs(body):
         try:
-            await ch.send(chunk)
+            await ch.send(chunk, silent=True)
         except discord.HTTPException:
             log.exception("Failed to mirror transcript to voice chat %s", ch.name)
             return
@@ -311,6 +514,137 @@ async def _on_voice_transcript(role: str, text: str) -> None:
         await _mirror_to_voice_chat("Aria:", text)
     else:
         log.warning("Unknown transcript role %r — dropping", role)
+
+
+def _resolve_discord_channel(query: str):
+    """Best-effort resolver: query -> Discord TextChannel / VoiceChannel / Thread.
+
+    Accepts:
+    - A bare numeric id ("1234567890").
+    - A `<#1234567890>` channel mention.
+    - A channel name with optional `#` prefix.
+    - Well-known aliases ("ucs", "ucs-alerts", "alerts", "spicy-lit",
+      "spicylit", "voice").
+    - An active thread name (substring match across all guild threads).
+
+    Returns None when nothing matches.
+    """
+    if not query:
+        return None
+    q = query.strip()
+    if q.startswith("<#") and q.endswith(">"):
+        q = q[2:-1]
+    if q.startswith("#"):
+        q = q[1:]
+
+    try:
+        cid = int(q)
+    except ValueError:
+        cid = None
+    if cid is not None:
+        ch = bot.get_channel(cid)
+        if ch:
+            return ch
+
+    aliases = {
+        "ucs": config.discord_text_channel_id,
+        "ucs-text": config.discord_text_channel_id,
+        "text": config.discord_text_channel_id,
+        "ucs-alerts": config.discord_log_channel_id,
+        "alerts": config.discord_log_channel_id,
+        "spicy-lit": config.discord_spicylit_channel_id,
+        "spicylit": config.discord_spicylit_channel_id,
+    }
+    alias_id = aliases.get(q.lower())
+    if alias_id:
+        ch = bot.get_channel(int(alias_id))
+        if ch:
+            return ch
+
+    q_lower = q.lower()
+    for guild in bot.guilds:
+        for ch in guild.channels:
+            name = getattr(ch, "name", "")
+            if name and name.lower() == q_lower:
+                return ch
+        for thread in guild.threads:
+            tname = (thread.name or "").lower()
+            if tname == q_lower or q_lower in tname:
+                return thread
+    return None
+
+
+def _serialize_discord_message(m: discord.Message) -> dict:
+    """JSON-safe projection of a Discord message. Keeps content bounded."""
+    body = (m.content or "")[:2000]
+    return {
+        "id": str(m.id),
+        "author": str(m.author),
+        "author_id": str(m.author.id),
+        "is_bot": bool(getattr(m.author, "bot", False)),
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "edited_at": m.edited_at.isoformat() if m.edited_at else None,
+        "content": body,
+        "attachments": [a.filename for a in m.attachments],
+        "channel": getattr(m.channel, "name", str(getattr(m.channel, "id", ""))),
+        "channel_id": str(getattr(m.channel, "id", "")),
+    }
+
+
+async def _fetch_discord_history(channel_query: str, limit: int) -> list[dict]:
+    """Return up to `limit` most recent messages in `channel_query`, oldest-first.
+
+    Resolves channels and threads by id, alias, name. Used by Aria's
+    `discord_recent_messages` tool. Returns an empty list when the
+    channel can't be resolved or the bot lacks permission to read its
+    history — the tool layer wraps this in a JSON error envelope.
+    """
+    ch = _resolve_discord_channel(channel_query)
+    if ch is None:
+        raise ValueError(f"channel not found: {channel_query!r}")
+    if not hasattr(ch, "history"):
+        raise ValueError(
+            f"channel {getattr(ch, 'name', channel_query)!r} does not support history"
+        )
+    msgs: list[dict] = []
+    async for m in ch.history(limit=max(1, min(int(limit), 100))):
+        msgs.append(_serialize_discord_message(m))
+    msgs.reverse()
+    return msgs
+
+
+async def _fetch_discord_threads(channel_query: str) -> list[dict]:
+    """List threads in a parent channel. Returns active threads only.
+
+    Aria uses this to discover build threads (created by
+    `create_build_thread` for each Cursor SDK session) and any other
+    threads under `#ucs` or `#ucs-alerts`.
+    """
+    ch = _resolve_discord_channel(channel_query)
+    if ch is None:
+        raise ValueError(f"channel not found: {channel_query!r}")
+    out: list[dict] = []
+    raw_threads = list(getattr(ch, "threads", []))
+    for guild in bot.guilds:
+        for thread in guild.threads:
+            parent = getattr(thread, "parent_id", None)
+            if parent is not None and parent == getattr(ch, "id", None):
+                if thread not in raw_threads:
+                    raw_threads.append(thread)
+    for thread in raw_threads:
+        out.append(
+            {
+                "id": str(thread.id),
+                "name": thread.name,
+                "parent_id": str(getattr(thread, "parent_id", "")),
+                "parent_name": getattr(getattr(thread, "parent", None), "name", ""),
+                "created_at": thread.created_at.isoformat() if thread.created_at else None,
+                "message_count": getattr(thread, "message_count", None),
+                "archived": bool(getattr(thread, "archived", False)),
+            }
+        )
+    out.sort(key=lambda d: d.get("created_at") or "", reverse=True)
+    return out
 
 
 async def create_build_thread(session_id: str, project: str) -> discord.Thread | None:
@@ -404,6 +738,8 @@ async def _on_voice_audio(pcm: bytes) -> None:
                     await gemini.inject_text(buffer_ctx, turn_complete=False)
             except Exception:
                 log.exception("Failed to inject conversation buffer on resume")
+
+            await _inject_registry_briefing(on_resume=True)
         if gemini and gemini.connected:
             await gemini.send_audio(pcm)
 
@@ -425,25 +761,46 @@ async def _watchdog_task(session: GeminiSession) -> None:
 
     Saves transcript context so the session resumes seamlessly
     when the user speaks again (handled by _on_voice_audio).
+
+    Guarded against tearing down work the user is in the middle of:
+    pause is deferred while any do_with_claude loop is in flight or a
+    tier-X/I confirmation is pending. Without this guard the 25s idle
+    timer would race a 60s confirmation window — the brain dies before
+    the user can answer "yes," and the result gets orphaned to #ucs.
     """
     global _last_audio_received_at, _session_paused, _pause_transcript
+    from .tools import has_in_flight_loops
     try:
         while True:
             await asyncio.sleep(5)
             if _last_audio_received_at == 0:
                 continue
             idle = time.monotonic() - _last_audio_received_at
-            if idle > IDLE_TIMEOUT_SEC and session.connected:
-                log.info("%ds silence — pausing Gemini session", IDLE_TIMEOUT_SEC)
-                try:
-                    _pause_transcript = session.get_transcript_context(max_turns=10)
-                    await session.close()
-                except Exception:
-                    log.exception("Error pausing Gemini session")
-                _session_paused = True
-                _last_audio_received_at = 0.0
-                log.info("Gemini paused. Will auto-resume when user speaks.")
-                return
+            if idle <= IDLE_TIMEOUT_SEC or not session.connected:
+                continue
+            if _pending_text_confirmations:
+                log.info(
+                    "%ds silence but %d tier-X/I confirmation(s) pending — "
+                    "deferring Gemini pause",
+                    IDLE_TIMEOUT_SEC, len(_pending_text_confirmations),
+                )
+                continue
+            if has_in_flight_loops():
+                log.info(
+                    "%ds silence but agent loop in flight — deferring Gemini pause",
+                    IDLE_TIMEOUT_SEC,
+                )
+                continue
+            log.info("%ds silence — pausing Gemini session", IDLE_TIMEOUT_SEC)
+            try:
+                _pause_transcript = session.get_transcript_context(max_turns=10)
+                await session.close()
+            except Exception:
+                log.exception("Error pausing Gemini session")
+            _session_paused = True
+            _last_audio_received_at = 0.0
+            log.info("Gemini paused. Will auto-resume when user speaks.")
+            return
     except asyncio.CancelledError:
         pass
 
@@ -528,16 +885,27 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
     if _wake_listener:
         _wake_listener.pause()
 
-    joined = await voice_controller.join(
-        str(channel.id),
-        audio_callback=_on_voice_audio,
-        on_watchdog_expire=_on_voice_exit_timeout,
-    )
-    if not joined:
-        log.info("Voice join skipped for %s (already in voice or transition in progress)", channel.name)
-        return
+    # Lurk-mode rejoin: bridge is already in the channel (we never called
+    # leave when the user left). Skip bridge.join — it's a no-op — and
+    # respawn just the silence watchdog + AI pipeline below.
+    lurk_rejoin = voice_controller.in_voice and config.aria_lurk_in_voice
+    if lurk_rejoin:
+        log.info("Lurk-mode rejoin for %s — re-arming AI pipeline only", channel.name)
+        await voice_controller.rearm_watchdog_for_lurk(
+            audio_callback=_on_voice_audio,
+            on_watchdog_expire=_on_voice_exit_timeout,
+        )
+    else:
+        joined = await voice_controller.join(
+            str(channel.id),
+            audio_callback=_on_voice_audio,
+            on_watchdog_expire=_on_voice_exit_timeout,
+        )
+        if not joined:
+            log.info("Voice join skipped for %s (already in voice or transition in progress)", channel.name)
+            return
+        log.info("Joined voice channel %s", channel.name)
 
-    log.info("Joined voice channel %s", channel.name)
     _last_audio_received_at = 0.0
     _cancel_audio_tasks()
 
@@ -592,18 +960,14 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
         if gemini and gemini.connected:
             try:
                 buffer_ctx = conversation.as_gemini_injection(max_turns=10)
-                briefing = _drain_pending_pages_for_briefing()
-                if briefing:
-                    preamble = (
-                        "[Context: Corbin just joined voice. While he was away, you paged him "
-                        "about the following Cursor events. When he speaks, OPEN with a "
-                        "one-sentence briefing covering these and then ask what he wants to do "
-                        f"next:\n{briefing}]"
+                briefed = await _inject_registry_briefing(on_resume=False)
+                if not briefed:
+                    await gemini.inject_text(
+                        "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]",
+                        turn_complete=False,
                     )
-                else:
-                    preamble = "[Context: Corbin just joined the voice channel. Stay silent until he speaks.]"
-                injection = f"{preamble}\n\n{buffer_ctx}" if buffer_ctx else preamble
-                await gemini.inject_text(injection, turn_complete=False)
+                if buffer_ctx:
+                    await gemini.inject_text(buffer_ctx, turn_complete=False)
             except Exception:
                 log.exception("Failed to inject join context into Gemini")
 
@@ -707,6 +1071,16 @@ async def _cursor_event_consumer(
             etype = event.get("event", "")
             data = event.get("data") or {}
 
+            try:
+                await cursor_registry.record_sdk_event(
+                    session_id=session_id, event=etype, data=data
+                )
+            except Exception:
+                log.exception(
+                    "cursor_registry.record_sdk_event raised for sid=%s event=%s",
+                    session_id, etype,
+                )
+
             if etype == "completion" or (etype == "status" and isinstance(data, dict) and (data.get("status") or "").upper() == "FINISHED"):
                 if not finished:
                     if thread:
@@ -743,11 +1117,14 @@ async def _cursor_event_consumer(
                 now = time.monotonic()
                 if now - last_post > throttle_sec and thread:
                     try:
-                        await thread.send(line)
+                        # Incremental progress: silent. Only "Build complete."
+                        # (above) and explicit error alerts should ding. Without
+                        # this, an active build floods the thread with dings.
+                        await thread.send(line, silent=True)
                     except Exception:
                         log.exception("thread.send for SDK event failed")
                     last_post = now
-                update_cursor_session_event(session_id, etype)
+                    update_cursor_session_event(session_id, etype)
     except Exception:
         log.exception("Cursor event consumer error for %s", session_id)
     finally:
@@ -755,43 +1132,24 @@ async def _cursor_event_consumer(
 
 
 # ---------------------------------------------------------------------------
-# External Cursor observer pager
+# Registry-driven narrator (replaces the legacy _cursor_external_pager)
+#
+# One callback (`_narrate_registry_event`) owns the cross-cutting decisions
+# for every cursor event: idle-gated speech inject, DM rung, conversation
+# buffer record, silent #ucs-alerts audit. The `CursorAgentRegistry` calls
+# this whenever an agent transitions to a state worth surfacing.
 # ---------------------------------------------------------------------------
-
-def _format_brief_for_voice(evt: CursorEvent) -> str:
-    """Short, conversational version of the event for Gemini to speak."""
-    parts = [evt.brief]
-    if evt.transcript_snippet:
-        last = evt.transcript_snippet[-1]
-        if last.get("role") == "assistant":
-            parts.append(f"Last thing it said: {last.get('text', '')[:240]}")
-    if evt.recent_plans:
-        plan_names = ", ".join(p["slug"] for p in evt.recent_plans[:2])
-        parts.append(f"Recent plan file(s): {plan_names}.")
-    return " ".join(p for p in parts if p)
-
-
-def _format_brief_for_dm(evt: CursorEvent) -> str:
-    """One-shot Discord DM body. Begins with a user mention so phones buzz."""
-    mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
-    mention = f"<@{mention_id}> " if mention_id else ""
-    lines = [f"{mention}**{evt.brief}**"]
-    if evt.workspace_root:
-        lines.append(f"`{evt.workspace_root}`")
-    if evt.transcript_snippet:
-        last = evt.transcript_snippet[-1]
-        snippet = last.get("text", "")[:300].replace("\n", " ")
-        if snippet:
-            lines.append(f"Last turn ({last.get('role')}): {snippet}")
-    lines.append("Join voice when you want to debrief and pick the next move.")
-    return "\n".join(lines)
 
 
 async def _dm_authorized_user(content: str) -> bool:
-    """Send a DM to the first authorized user. Returns True on success.
+    """Send a DM to the first authorized user. Returns True on success,
+    False on any delivery failure (Forbidden, HTTPException, missing user).
 
-    Loud failure: surfaces to #ucs-alerts if the DM cannot be delivered so
-    the user knows the page didn't land.
+    Failures are logged but NOT individually posted to #ucs-alerts. The
+    caller owns the "escalate to a loud alerts post" decision so we get
+    exactly one Discord message per event instead of the double-post
+    pattern (silent audit + loud "Pager DM blocked" wall-of-text) that
+    flooded #ucs-alerts with two records per Cursor hook.
     """
     if not config.authorized_user_ids:
         log.warning("No authorized_user_ids configured — cannot DM")
@@ -799,14 +1157,8 @@ async def _dm_authorized_user(content: str) -> bool:
     user_id = int(config.authorized_user_ids[0])
     try:
         user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-    except discord.HTTPException as exc:
+    except discord.HTTPException:
         log.exception("Could not fetch authorized user for DM")
-        try:
-            await post_to_alerts(
-                f"**Pager DM failed:** could not fetch user {user_id} ({exc.__class__.__name__})."
-            )
-        except Exception:
-            log.exception("Failed to post DM failure alert")
         return False
 
     try:
@@ -819,14 +1171,10 @@ async def _dm_authorized_user(content: str) -> bool:
         try:
             await dm.send(chunk)
         except discord.Forbidden:
-            log.warning("User %s has DMs disabled — page lost", user_id)
-            try:
-                await post_to_alerts(
-                    f"**Pager DM blocked:** user {user_id} has DMs disabled. "
-                    f"Brief: {content[:300]}"
-                )
-            except Exception:
-                log.exception("Failed to post DM-blocked alert")
+            log.warning(
+                "User %s has DMs disabled — caller will escalate to #ucs-alerts if severity warrants",
+                user_id,
+            )
             return False
         except discord.HTTPException:
             log.exception("DM send failed")
@@ -834,74 +1182,273 @@ async def _dm_authorized_user(content: str) -> bool:
     return True
 
 
-async def _cursor_external_pager(evt: CursorEvent) -> None:
-    """Pager callback for the external observer.
+def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
+    """Structured silent-context block for Gemini before the heads-up trigger.
 
-    Rung A: voice connected -> inject_text(turn_complete=True). Aria speaks
-            the briefing immediately, mid-conversation.
-    Rung B: voice not connected -> DM with @mention; queue the brief so the
-            next voice join preamble includes a debrief instruction.
-
-    Always mirrors a record to #ucs-alerts so the audit trail exists in
-    Discord regardless of which rung fired.
+    Mirrors the shape the previous `_format_event_context` produced, but
+    sourced from the registry's `CursorAgent` instead of the now-deleted
+    `CursorEvent`. Includes the canonical `agent_id` Aria's tools take.
     """
+    agent = evt.agent
+    lines = ["[Cursor watch context for the event you are about to narrate:"]
+    lines.append(f"  agent_id: {agent.agent_id}")
+    lines.append(f"  workspace_root: {agent.workspace_root}")
+    lines.append(f"  project_label: {agent.project_label}")
+    lines.append(f"  source: {agent.source}")
+    lines.append(f"  status: {agent.status}")
+    lines.append(f"  kind: {evt.kind}")
+    lines.append(f"  severity: {evt.severity}")
+    lines.append(f"  reason: {evt.reason}")
+    if agent.pending_question:
+        lines.append(f"  pending_question: {agent.pending_question[:400]}")
+    if agent.last_assistant_text:
+        snippet = agent.last_assistant_text[:600].replace("\n", " ")
+        lines.append(f"  last_assistant_text: {snippet}")
+    if agent.recent_plan_files:
+        lines.append(
+            "  recent_plan_files: " + ", ".join(agent.recent_plan_files[-3:])
+        )
+    lines.append(
+        "  For follow-ups: pass agent_id above to cursor_read or cursor_send "
+        "(kind=chat/new_agent/approve/reject/cancel).]"
+    )
+    return "\n".join(lines)
+
+
+def _format_registry_speech(evt: RegistryEvent) -> str:
+    """Concise spoken line for the heads-up trigger."""
+    agent = evt.agent
+    parts: list[str] = [evt.reason]
+    if agent.pending_question:
+        parts.append(f"It asked: {agent.pending_question[:240]}")
+    elif agent.last_assistant_text and evt.kind in ("finished", "errored", "progress"):
+        parts.append(f"Last thing it said: {agent.last_assistant_text[:240]}")
+    if agent.recent_plan_files and evt.kind == "started":
+        parts.append(
+            f"Plan files: {', '.join(agent.recent_plan_files[-2:])}."
+        )
+    return " ".join(p for p in parts if p)
+
+
+def _format_registry_dm(evt: RegistryEvent) -> str:
+    """One-shot Discord DM body. Mention-prefixed so the phone buzzes."""
+    agent = evt.agent
+    mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
+    mention = f"<@{mention_id}> " if mention_id else ""
+    lines = [f"{mention}**{evt.reason}**"]
+    lines.append(f"`{agent.workspace_root}`")
+    if agent.pending_question:
+        lines.append(f"Question: {agent.pending_question[:300]}")
+    elif agent.last_assistant_text:
+        snippet = agent.last_assistant_text[:300].replace("\n", " ")
+        lines.append(f"Latest: {snippet}")
+    lines.append(
+        "Join voice to debrief, or send a follow-up via cursor_send."
+    )
+    return "\n".join(lines)
+
+
+async def _narrate_registry_event(evt: RegistryEvent) -> None:
+    """Single owner of voice / DM / alert routing for cursor registry events.
+
+    Replaces the four-rung `_cursor_external_pager`. Order is mechanical:
+
+    1. Record the cursor event in the conversation buffer (always).
+    2. Silent audit to `#ucs-alerts` (always).
+    3. On voice + idle gate: structured context inject + speech trigger
+       when severity warrants. The wait_until_idle gate prevents the
+       narration from being batched into Aria's in-flight turn.
+    4. Not on voice + high severity: DM the authorized user.
+    5. Mark `agent.last_delivered_at` on success of step 3 or 4 so the
+       join / resume briefing doesn't re-narrate.
+
+    The legacy "rung B/C/D" semantics collapse: a single high-severity
+    event whose DM fails posts a loud audit. Everything else is silent.
+    """
+    agent = evt.agent
     log.info(
-        "External cursor event: type=%s project=%s severity=%s status=%s",
-        evt.hook_type, evt.project, evt.severity, evt.status,
+        "Registry event: kind=%s severity=%s agent=%s source=%s",
+        evt.kind, evt.severity, agent.agent_id, agent.source,
+    )
+
+    audit_line = (
+        f"**[Cursor watch] {evt.reason}** "
+        f"_(severity={evt.severity}, kind={evt.kind}, source={agent.source})_"
     )
 
     try:
-        await post_to_alerts(
-            f"**[Cursor watch] {evt.brief}** _(severity={evt.severity}, hook={evt.hook_type})_"
-        )
+        conversation.add_cursor_event(_format_registry_context_for_inject(evt))
     except Exception:
-        log.exception("Failed to post cursor watch alert")
+        log.exception("Failed to record cursor event in conversation buffer")
+
+    async def _safe_post(content: str, *, silent: bool) -> None:
+        try:
+            await post_to_alerts(content, silent=silent)
+        except Exception:
+            log.exception("Failed to post cursor watch audit")
 
     on_voice = bool(gemini and gemini.connected)
     if on_voice:
         try:
-            speech = _format_brief_for_voice(evt)
-            await gemini.inject_text(
-                f"[Cursor watch heads-up — you should narrate this and ask what to do next] {speech}",
-                turn_complete=True,
-            )
+            try:
+                idle = await gemini.wait_until_idle(timeout=15.0)
+                if not idle:
+                    log.warning(
+                        "Registry narrate inject timed out waiting for Gemini idle — "
+                        "proceeding (may be batched into an in-flight turn)"
+                    )
+            except Exception:
+                log.exception(
+                    "wait_until_idle raised on registry narrate — proceeding with inject"
+                )
+            try:
+                await gemini.inject_text(
+                    _format_registry_context_for_inject(evt), turn_complete=False
+                )
+            except Exception:
+                log.exception(
+                    "Failed to inject structured registry context — "
+                    "continuing to the heads-up trigger anyway"
+                )
+            spoke_aloud = False
+            if evt.severity == "high":
+                speech = _format_registry_speech(evt)
+                await gemini.inject_text(
+                    f"[Cursor watch heads-up — narrate this and ask what to do next] {speech}",
+                    turn_complete=True,
+                )
+                spoke_aloud = True
+            if spoke_aloud:
+                # Only advance the delivery watermark when Aria actually
+                # said something out loud. Silent injects (low severity)
+                # are absorbed into her live context but do not count as
+                # "delivered" — if her session closes before the user
+                # debriefs, the briefing on rejoin still surfaces the
+                # event.
+                agent.last_delivered_at = agent.last_event_at
+                agent.last_delivered_reason = evt.reason
+            await _safe_post(audit_line, silent=True)
             return
         except Exception:
-            log.exception("Failed to inject cursor watch into Gemini — falling back to DM")
+            log.exception(
+                "Failed to inject registry event into Gemini — falling back to DM rung"
+            )
 
-    if config.cursor_dm_pager_enabled and evt.severity in ("high", "low"):
-        body = _format_brief_for_dm(evt)
-        ok = await _dm_authorized_user(body)
-        if not ok:
-            log.warning("Pager DM did not land for event project=%s hook=%s", evt.project, evt.hook_type)
+    dm_landed = False
+    if config.cursor_dm_pager_enabled and evt.severity == "high":
+        dm_landed = await _dm_authorized_user(_format_registry_dm(evt))
+        # DM landing intentionally does NOT advance last_delivered_at:
+        # Corbin saw a phone notification but hasn't talked about it with
+        # Aria yet. The next time he joins voice the briefing should
+        # surface this event so she can debrief verbally.
 
-    _queue_pending_page(evt)
+    if evt.severity == "high" and not dm_landed:
+        mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
+        mention = f"<@{mention_id}> " if mention_id else ""
+        loud_line = (
+            f"{mention}{audit_line}\n"
+            f"_(DM didn't land — likely DMs disabled. Join voice to debrief, "
+            f"or set UCS_CURSOR_DM_PAGER_ENABLED=false to silence this rung entirely.)_"
+        )
+        await _safe_post(loud_line, silent=False)
+    else:
+        await _safe_post(audit_line, silent=True)
 
 
-def _queue_pending_page(evt: CursorEvent) -> None:
-    """Buffer the event so the next voice join preamble can debrief on it.
+def _undelivered_agents() -> list[CursorAgent]:
+    """Agents whose latest event hasn't been narrated yet.
 
-    Drops oldest when at capacity — recent context matters more than old.
+    Replaces the `_pending_pages` deque. The registry is the source of
+    truth; each agent carries its own `last_delivered_at` watermark that
+    the narrator advances when speech or DM lands.
     """
-    _pending_pages.append(evt)
-    if len(_pending_pages) > _pending_pages_max:
-        del _pending_pages[: len(_pending_pages) - _pending_pages_max]
+    out = [
+        a for a in cursor_registry.agents()
+        if a.last_event_at > 0 and a.last_event_at > a.last_delivered_at
+    ]
+    out.sort(key=lambda a: a.last_event_at, reverse=True)
+    return out
 
 
-def _drain_pending_pages_for_briefing() -> str:
-    """Pop pending pages and render them as a join-preamble briefing.
+def _format_undelivered_briefing(agents: list[CursorAgent]) -> str:
+    """Render undelivered agents as a join / resume briefing.
 
-    Empty string when nothing is pending. Drains so the same event is not
-    re-briefed on the next join.
+    Prefers `last_event_reason` (set by every emit, including DM-only
+    paths) over `last_delivered_reason` (set only when Aria actually
+    spoke). This way a Cursor task that completed while Corbin was on
+    his phone gets surfaced as "Task completed in X" on his next voice
+    join, not the stale reason from the last time Aria spoke about that
+    agent.
     """
-    if not _pending_pages:
-        return ""
-    items = list(_pending_pages)
-    _pending_pages.clear()
-    lines = []
-    for evt in items:
-        lines.append(f"- {evt.brief} (hook={evt.hook_type}, project={evt.project}, status={evt.status or 'n/a'})")
+    lines: list[str] = []
+    for agent in agents:
+        reason = (
+            agent.last_event_reason
+            or agent.last_delivered_reason
+            or "recent activity"
+        )
+        bullet = (
+            f"- {agent.project_label} ({agent.source}, status={agent.status}): "
+            f"{reason}"
+        )
+        bullet += f"\n    agent_id: {agent.agent_id}"
+        if agent.workspace_root and agent.workspace_root != agent.agent_id:
+            bullet += f"\n    workspace_root: {agent.workspace_root}"
+        if agent.pending_question:
+            bullet += f"\n    pending_question: {agent.pending_question[:300]}"
+        elif agent.last_assistant_text:
+            snippet = agent.last_assistant_text[:300].replace("\n", " ")
+            bullet += f"\n    last said: {snippet}"
+        if agent.recent_plan_files:
+            bullet += (
+                "\n    recent_plan_files: "
+                + ", ".join(agent.recent_plan_files[-2:])
+            )
+        lines.append(bullet)
     return "\n".join(lines)
+
+
+async def _inject_registry_briefing(*, on_resume: bool = False) -> bool:
+    """Inject a briefing covering undelivered cursor activity.
+
+    Replaces `_inject_pending_pages_briefing`. Reads agent state straight
+    from `cursor_registry`; marks each surfaced agent as delivered after
+    a successful inject so it isn't re-briefed on the next pause/resume.
+
+    `on_resume=True` is for the pause/resume branch in `_on_voice_audio`;
+    `on_resume=False` is the fresh-join preamble in
+    `_auto_join_voice_channel`.
+    """
+    if not gemini or not gemini.connected:
+        return False
+    agents = _undelivered_agents()
+    if not agents:
+        return False
+    briefing = _format_undelivered_briefing(agents)
+    if on_resume:
+        preamble = (
+            "[Context: while you were paused, the following Cursor agents had "
+            "activity. When Corbin speaks next, OPEN with a one-sentence briefing "
+            "covering them and then ask what he wants to do next:\n"
+            f"{briefing}]"
+        )
+    else:
+        preamble = (
+            "[Context: Corbin just joined voice. While he was away, these Cursor "
+            "agents had activity. When he speaks, OPEN with a one-sentence "
+            "briefing covering them and then ask what he wants to do next:\n"
+            f"{briefing}]"
+        )
+    try:
+        await gemini.inject_text(preamble, turn_complete=False)
+    except Exception:
+        log.exception(
+            "Failed to inject registry briefing (on_resume=%s)", on_resume
+        )
+        return False
+    for agent in agents:
+        agent.last_delivered_at = max(agent.last_delivered_at, agent.last_event_at)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +1479,8 @@ async def on_ready():
             thread_callback=create_build_thread,
             cursor_event_callback=_cursor_event_consumer,
             reconnect_callback=_gemini_reconnect,
+            discord_history_callback=_fetch_discord_history,
+            discord_threads_callback=_fetch_discord_threads,
         )
 
         await cursor_bridge.start()
@@ -970,24 +1519,59 @@ async def on_ready():
             log.info("MCP fleet started")
 
             async def _confirm_callback(action_id: str, tool_name: str, summary: str) -> dict:
-                await post_to_alerts(f"**Confirmation required:**\n`{tool_name}`: {summary}")
-                if gemini and gemini.connected:
-                    await gemini.inject_text(
-                        f"I need your approval. About to run: {tool_name}. Details: {summary}. "
-                        "Do you approve? Say yes or no.",
-                        turn_complete=True,
+                # Register a text-side waiter before posting the card so
+                # !ok/!no and reactions can resolve it even if Gemini is
+                # disconnected (text-channel-initiated do_with_claude task).
+                _register_pending_confirmation(action_id, tool_name, summary)
+                try:
+                    card_message = await _post_confirmation_card(
+                        action_id, tool_name, summary
                     )
-                return await gemini.wait_for_confirmation(action_id, timeout=60.0)
+                    if card_message is not None:
+                        pending = _pending_text_confirmations.get(action_id)
+                        if pending is not None:
+                            pending.message_id = card_message.id
+                            _confirmation_message_index[card_message.id] = action_id
+                    if gemini and gemini.connected:
+                        try:
+                            await gemini.inject_text(
+                                f"I need your approval. About to run: {tool_name}. "
+                                f"Details: {summary}. Do you approve? Say yes or no. "
+                                f"When you call confirm_action, pass "
+                                f"action_id=\"{action_id}\".",
+                                turn_complete=True,
+                            )
+                        except Exception:
+                            log.exception("Failed to inject confirmation prompt to Gemini")
+                    return await _race_confirmations(
+                        gemini.wait_for_confirmation(
+                            action_id, timeout=CONFIRM_TIMEOUT_SEC
+                        ),
+                        _discord_wait_for_confirmation(
+                            action_id, timeout=CONFIRM_TIMEOUT_SEC
+                        ),
+                    )
+                finally:
+                    _unregister_pending_confirmation(action_id)
 
             mcp.set_confirm_callback(_confirm_callback)
         except Exception:
             log.exception("MCP fleet failed to start — preflight will flag MCP probes")
 
+        def _voice_injector_when_connected():
+            """Return the Gemini session for /aria_say when connected, else None."""
+            return gemini if (gemini and gemini.connected) else None
+
         try:
             from . import tools as tools_module
+            cursor_registry.set_project_aliases(dict(tools_module.PROJECT_REGISTRY))
+            cursor_registry.set_emit_callback(_narrate_registry_event)
             cursor_observer = CursorExternalObserver(
-                pager_callback=_cursor_external_pager,
                 registry_provider=lambda: dict(tools_module.PROJECT_REGISTRY),
+                voice_injector_provider=_voice_injector_when_connected,
+                registry_writer=cursor_registry.register_from_hook,
+                conversation_provider=lambda: conversation,
+                gemini_provider=lambda: gemini,
             )
             await cursor_observer.start()
         except OSError as exc:
@@ -1175,6 +1759,75 @@ async def stop(ctx: commands.Context):
     await ctx.send("All tasks aborted.")
 
 
+@bot.command(name="ok")
+async def confirm_ok(ctx: commands.Context, action_id: str | None = None):
+    """Approve a pending tier-X/I action by id, or the only one pending.
+
+    Usage:
+      !ok                       — approve when exactly one is pending
+      !ok <action_id>           — approve a specific pending action
+    """
+    if not _is_authorized(ctx.author.id):
+        await ctx.send("Not authorized.")
+        return
+    await _handle_text_confirmation(ctx, action_id, approved=True)
+
+
+@bot.command(name="no")
+async def confirm_no(ctx: commands.Context, action_id: str | None = None):
+    """Decline a pending tier-X/I action by id, or the only one pending."""
+    if not _is_authorized(ctx.author.id):
+        await ctx.send("Not authorized.")
+        return
+    await _handle_text_confirmation(ctx, action_id, approved=False)
+
+
+async def _handle_text_confirmation(
+    ctx: commands.Context, action_id: str | None, approved: bool
+) -> None:
+    """Resolve a pending confirmation from a !ok / !no command."""
+    pending_ids = list(_pending_text_confirmations)
+    if not pending_ids:
+        await ctx.send("No pending confirmations.")
+        return
+    if action_id is None:
+        if len(pending_ids) > 1:
+            ids = ", ".join(f"`{i}`" for i in pending_ids)
+            await ctx.send(
+                f"Multiple pending confirmations — specify which: {ids}"
+            )
+            return
+        action_id = pending_ids[0]
+    if not _resolve_pending_confirmation(action_id, approved, source="text"):
+        await ctx.send(f"No pending confirmation with id `{action_id}`.")
+        return
+    verb = "Approved" if approved else "Declined"
+    await ctx.send(f"{verb} `{action_id}`.")
+
+
+@bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    """Resolve a pending confirmation when the authorized user reacts.
+
+    Watches messages tracked in `_confirmation_message_index`. A check
+    or thumbs-up approves; a cross or thumbs-down declines. Reactions
+    from anyone other than the authorized user are ignored.
+    """
+    if user.bot:
+        return
+    if not _is_authorized(user.id):
+        return
+    msg = reaction.message
+    action_id = _confirmation_message_index.get(msg.id)
+    if not action_id:
+        return
+    emoji = str(reaction.emoji)
+    if emoji in CONFIRM_APPROVE_EMOJIS:
+        _resolve_pending_confirmation(action_id, True, source="reaction")
+    elif emoji in CONFIRM_DECLINE_EMOJIS:
+        _resolve_pending_confirmation(action_id, False, source="reaction")
+
+
 @bot.command()
 async def status(ctx: commands.Context):
     """Check system health and active sessions."""
@@ -1314,7 +1967,13 @@ async def _run_ask(channel, message: str) -> None:
     """
     channel_name = f"#{getattr(channel, 'name', channel.id)}"
     conversation.add_user_text(channel=channel_name, text=message)
-    await channel.send("Working on it...")
+    # Status acknowledgement: silent so the user doesn't get a ding for a
+    # placeholder. The real answer below is the message that should notify.
+    await channel.send(
+        "Working on it... (any approvals will land in #ucs-alerts — "
+        "reply `!ok <action_id>` to confirm).",
+        silent=True,
+    )
     from .tools import handle_tool_call
     session_key = str(channel.id)
     try:
@@ -1328,8 +1987,10 @@ async def _run_ask(channel, message: str) -> None:
             await channel.send(_CONTROL_PLANE_FRIENDLY)
             return
         if len(result) > 1900:
+            # post_to_text dings #ucs (real answer). The pointer in `channel`
+            # is a courtesy redirect; silent so it doesn't ding twice.
             await post_to_text(result)
-            await channel.send("Done — full result posted to #ucs.")
+            await channel.send("Done — full result posted to #ucs.", silent=True)
         else:
             await channel.send(result)
         conversation.add_aria_text(channel=channel_name, text=result)
@@ -1387,6 +2048,22 @@ async def _handle_text_conversation(message: discord.Message) -> None:
         except Exception:
             log.exception("Failed to inject user text into Gemini live context")
 
+    # Loud one-line ack so a long do_with_claude loop (the 42c.pw failure
+    # ran for 36 min) does not appear silent to the user. The body
+    # quotes the first ~120 chars of the request so the user can verify
+    # we read it correctly.
+    try:
+        ack_preview = user_text.strip().replace("\n", " ")
+        if len(ack_preview) > 120:
+            ack_preview = ack_preview[:120] + "…"
+        await message.channel.send(
+            f"On it — working on: \"{ack_preview}\". Confirmations (if any) "
+            f"will land in #ucs-alerts; reply `!ok <action_id>` to approve.",
+            silent=True,
+        )
+    except Exception:
+        log.debug("Failed to send text-conversation ack (non-fatal)", exc_info=True)
+
     from .tools import handle_tool_call
     async with message.channel.typing():
         try:
@@ -1409,8 +2086,10 @@ async def _handle_text_conversation(message: discord.Message) -> None:
     if len(result) <= 1900:
         await message.channel.send(result)
     else:
+        # post_to_text dings #ucs (real answer). The pointer in the source
+        # channel is a courtesy redirect; silent so it doesn't ding twice.
         await post_to_text(result)
-        await message.channel.send("Done — full result posted to #ucs.")
+        await message.channel.send("Done — full result posted to #ucs.", silent=True)
     conversation.add_aria_text(channel=channel_name, text=result)
 
     if gemini and gemini.connected:
@@ -1690,7 +2369,11 @@ async def on_voice_state_update(
         await _auto_join_voice_channel(after.channel)
 
     elif left_channel:
-        log.info("Authorized user left voice — cleaning up")
+        lurk = bool(config.aria_lurk_in_voice)
+        log.info(
+            "Authorized user left voice — cleaning up%s",
+            " (lurk mode: bot stays in channel)" if lurk else "",
+        )
         _session_paused = False
         _grok_paused = False
         _pause_transcript = ""
@@ -1702,7 +2385,13 @@ async def on_voice_state_update(
             _spicylit_active = False
         if gemini and gemini.connected:
             await gemini.close()
-        await voice_controller.note_external_disconnect()
+        if lurk:
+            # Keep the voice WebSocket alive. The next rejoin will see
+            # voice_controller.in_voice == True and re-arm only the
+            # AI-pipeline half of _auto_join_voice_channel.
+            await voice_controller.note_external_disconnect_lurk()
+        else:
+            await voice_controller.note_external_disconnect()
 
 
 def _is_authorized(user_id: int) -> bool:

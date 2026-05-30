@@ -292,7 +292,12 @@ class VoiceController:
                 self._state = VoiceState.IN_VOICE
                 self._on_watchdog_expire = on_watchdog_expire
                 self._last_activity_at = time.monotonic()
-                self._spawn_watchdog()
+                if not config.aria_lurk_in_voice:
+                    # In lurk mode the watchdog would eventually trip and
+                    # call bridge.leave() on user silence, undoing the
+                    # whole point. The bot relies on voice_state_update
+                    # for cleanup instead.
+                    self._spawn_watchdog()
                 return True
             except Exception:
                 self._state = VoiceState.DISCONNECTED
@@ -323,6 +328,52 @@ class VoiceController:
             self._state = VoiceState.DISCONNECTED
             self._channel_id = None
             self._last_activity_at = 0.0
+
+    async def note_external_disconnect_lurk(self) -> None:
+        """User left, but the bot stays in voice (lurk mode).
+
+        Cancels the silence watchdog so it does not eventually trigger
+        bridge.leave() on its own, and zeroes activity so the next user
+        rejoin starts a fresh idle window. The bridge WebSocket and the
+        IN_VOICE state are intentionally preserved — the audio sidecar
+        keeps the channel slot, only the per-conversation pipeline
+        (Gemini, audio drains) is torn down by the caller.
+        """
+        async with self._lock:
+            self._cancel_watchdog()
+            self._last_activity_at = 0.0
+
+    async def rearm_watchdog_for_lurk(
+        self,
+        *,
+        audio_callback: Callable[[bytes], Awaitable[None]],
+        on_watchdog_expire: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Lurk-mode rejoin path. The user came back into the channel the
+        bot has been quietly sitting in. We do NOT call bridge.join (a
+        no-op anyway, since the WebSocket never dropped), but we DO need
+        to re-register the audio callback (the bridge keeps it across
+        reconnects but defensive re-registration costs nothing).
+
+        Intentionally does NOT respawn the silence watchdog: the whole
+        point of lurk mode is to never auto-leave the channel. The
+        Gemini session is torn down explicitly on voice_state_update
+        when the user departs again, so a silence timeout would just be
+        a slow racey duplicate of that path that risks tripping
+        bridge.leave() and undoing the lurk.
+        """
+        async with self._lock:
+            if self._state is not VoiceState.IN_VOICE:
+                # Shouldn't happen, but degrade gracefully: caller should
+                # fall back to the normal join path.
+                log.warning(
+                    "rearm_watchdog_for_lurk called while not in voice (state=%s) — caller should use join()",
+                    self._state,
+                )
+                return
+            self._bridge.register_audio_callback(audio_callback)
+            self._on_watchdog_expire = on_watchdog_expire
+            self._last_activity_at = time.monotonic()
 
     @asynccontextmanager
     async def pipeline_switch(self):

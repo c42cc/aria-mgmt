@@ -41,6 +41,11 @@ import prism from "prism-media";
 import { Readable } from "node:stream";
 import readline from "node:readline";
 
+// Apply the DAVE passthrough patch BEFORE any voice connection is created.
+// See dave_passthrough_patch.js header for context. Removable once
+// @discordjs/voice >= 0.20.0 ships PR #11449.
+import "./dave_passthrough_patch.js";
+
 const BOT_TOKEN = process.env.DISCORD_VOICE_BOT_TOKEN || "";
 const AUTHORIZED_USER_ID = process.env.AUTHORIZED_VOICE_USER_ID || "";
 
@@ -120,14 +125,13 @@ async function attemptVoiceConnect(channel, attempt) {
     selfDeaf: false,
     selfMute: false,
     debug: true,
-    // DAVE: when bot joins a channel where a user is already speaking, the
-    // welcome from Discord can be at a stale MLS epoch. Discord-side default
-    // is 36 consecutive decrypt failures before recovery (re-request fresh
-    // commit/welcome via DaveMlsInvalidCommitWelcome), which is much longer
-    // than a typical short utterance — the failure counter resets when the
-    // stream ends from AfterSilence, so the bot never reaches the threshold
-    // during natural speech. Lower this so the bot self-heals fast.
-    decryptionFailureTolerance: 5,
+    // Use the library default tolerance (36). The earlier value of 5 was based
+    // on a misread of the library — `consecutiveFailures` resets on a
+    // successful decrypt, not on AfterSilence — and it triggered the
+    // lastTransitionId-falsy bug on the very first utterance. The real fix
+    // for that bug is in dave_passthrough_patch.js (imported above), which
+    // also enables passthrough for the in-flight MLS-transition packets
+    // that Davey would otherwise reject as UnencryptedWhenPassthroughDisabled.
   });
   conn.on("debug", (msg) => diag("voice debug", { msg: String(msg).slice(0, 300) }));
   attachConnectionDiagnostics(conn, channel.id);

@@ -63,7 +63,8 @@ def snap(label: str, out_dir: str) -> str:
 
 from src import tools as tools_module
 from src.cursor_bridge import CursorBridge
-from src.cursor_external import CursorEvent, CursorExternalObserver
+from src.cursor_external import CursorExternalObserver
+from src.cursor_registry import RegistryEvent, cursor_registry
 
 
 def step(num: int, label: str) -> None:
@@ -99,21 +100,19 @@ async def run_e2e(
     skip_cursor_open: bool,
     project_root: str | None,
 ) -> int:
-    paged: list[CursorEvent] = []
+    paged: list[RegistryEvent] = []
 
-    async def fake_pager(evt: CursorEvent) -> None:
+    async def fake_pager(evt: RegistryEvent) -> None:
         paged.append(evt)
+        agent = evt.agent
         print(
-            f"  >> ARIA WOULD PAGE: severity={evt.severity} brief={evt.brief!r}",
+            f"  >> ARIA WOULD PAGE: severity={evt.severity} kind={evt.kind} "
+            f"reason={evt.reason!r}",
             flush=True,
         )
-        if evt.transcript_snippet:
-            last = evt.transcript_snippet[-1]
-            print(
-                f"     last transcript turn ({last.get('role')}): "
-                f"{last.get('text', '')[:140]!r}",
-                flush=True,
-            )
+        if agent.last_assistant_text:
+            preview = agent.last_assistant_text[:140].replace("\n", " ")
+            print(f"     last assistant text: {preview!r}", flush=True)
 
     tools_module.init_tools(cursor_bridge=CursorBridge())
 
@@ -123,9 +122,11 @@ async def run_e2e(
     tools_module.PROJECT_REGISTRY[proj_name] = project_root
     print(f"\nregistered project: {proj_name} -> {project_root}", flush=True)
 
+    cursor_registry.set_project_aliases(dict(tools_module.PROJECT_REGISTRY))
+    cursor_registry.set_emit_callback(fake_pager)
     obs = CursorExternalObserver(
-        pager_callback=fake_pager,
         registry_provider=lambda: dict(tools_module.PROJECT_REGISTRY),
+        registry_writer=cursor_registry.register_from_hook,
     )
     try:
         await obs.start()

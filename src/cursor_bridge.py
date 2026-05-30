@@ -168,7 +168,12 @@ class CursorBridge:
     async def create_session(
         self, project_path: str, instruction: str, model: str | None = None
     ) -> str:
-        """Create a new Cursor agent session. Returns session_id and registers event queue."""
+        """Create a new Cursor agent session. Returns session_id and registers event queue.
+
+        Also writes the new session into the unified `cursor_registry` so
+        Aria's tools, the narrator, and the JSONL tailer see this SDK
+        agent on the same footing as one of the user's IDE-opened windows.
+        """
         resp = await self._send({
             "action": "create",
             "project_path": project_path,
@@ -178,6 +183,19 @@ class CursorBridge:
         session_id = resp.get("session_id", "")
         if session_id:
             self._session_queues.setdefault(session_id, asyncio.Queue())
+            try:
+                from .cursor_registry import cursor_registry
+                await cursor_registry.register_from_sdk(
+                    session_id=session_id,
+                    workspace_root=project_path,
+                    instruction=instruction,
+                )
+            except Exception:
+                log.exception(
+                    "cursor_registry.register_from_sdk raised for session %s "
+                    "(continuing — bridge state is unaffected)",
+                    session_id,
+                )
         return session_id
 
     async def send_message(self, session_id: str, message: str) -> dict[str, Any]:

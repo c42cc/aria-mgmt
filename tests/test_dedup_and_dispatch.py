@@ -269,6 +269,226 @@ class TestConversationBufferAlertFilter(unittest.TestCase):
         out = buf.as_gemini_injection(max_turns=10, include_alerts=True)
         self.assertIn("Preflight passed", out)
 
+    def test_cursor_event_survives_include_alerts_false(self):
+        """Plan §4.5 / §6.f: cursor watch entries must reach Aria on follow-up
+        even when generic alerts are filtered out."""
+        from src.conversation import ConversationBuffer
+        buf = ConversationBuffer()
+        buf.add_user_text("#ucs", "hello")
+        buf.add_alert("Preflight passed")
+        buf.add_cursor_event("[Cursor watch context: workspace_root=/tmp/proj]")
+        gemini_out = buf.as_gemini_injection(max_turns=10)
+        claude_out = buf.as_claude_context(max_turns=10)
+        for out in (gemini_out, claude_out):
+            self.assertIn("/tmp/proj", out)
+            self.assertNotIn("Preflight passed", out)
+
+
+# ---------------------------------------------------------------------------
+# 42c.pw failure fixes — confirmation-deadlock plan
+# ---------------------------------------------------------------------------
+
+class TestDeclineDetection(unittest.TestCase):
+    """tools._is_declined_result / _declined_reason: ERR_DECLINED envelope id."""
+
+    def test_recognizes_declined_envelope(self):
+        from src.tools import _is_declined_result
+        envelope = json.dumps({
+            "_error_class": "declined",
+            "_message": "Tier-X/I confirmation timed out — the user did not respond.",
+            "_hint": "Ask the user whether to retry.",
+            "_raw": "confirmation timed out",
+        })
+        self.assertTrue(_is_declined_result(envelope))
+
+    def test_rejects_non_declined_envelope(self):
+        from src.tools import _is_declined_result
+        envelope = json.dumps({
+            "_error_class": "permission",
+            "_message": "Missing scope.",
+            "_raw": "permission denied",
+        })
+        self.assertFalse(_is_declined_result(envelope))
+
+    def test_rejects_plain_text_result(self):
+        from src.tools import _is_declined_result
+        self.assertFalse(_is_declined_result(""))
+        self.assertFalse(_is_declined_result("ok"))
+        self.assertFalse(_is_declined_result("[TextContent(text='ok')]"))
+
+    def test_extracts_reason_from_envelope(self):
+        from src.tools import _declined_reason
+        envelope = json.dumps({
+            "_error_class": "declined",
+            "_message": "Tier-X/I confirmation timed out — the user did not respond.",
+        })
+        self.assertIn("timed out", _declined_reason(envelope))
+
+    def test_decline_blocker_names_command_and_unblock_path(self):
+        """Plan §3: the blocker message must name the tool and tell the user
+        how to approve it. Without this, the prior loop silently emitted
+        'Task reached iteration limit (30). Partial progress made.' for
+        what was really a string of declined shell commands."""
+        from src.tools import _format_decline_blocker
+        msg = _format_decline_blocker(
+            "execute_command",
+            {"command": "openssl passwd -apr1 42pw"},
+            "Tier-X/I confirmation timed out", 2, 2,
+        )
+        self.assertIn("execute_command", msg)
+        self.assertIn("openssl passwd -apr1 42pw", msg)
+        self.assertIn("!ok", msg)
+        # "approval required" should appear so it reads like a blocker,
+        # not a generic iteration-limit message.
+        self.assertIn("approval", msg.lower())
+
+
+class TestCursorEventCapInClaudeContext(unittest.TestCase):
+    """conversation.as_claude_context caps cursor_event turns at
+    _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT so a chatty watcher cannot bury
+    the user's actual request (42c.pw failure: 90% of an 11KB task body
+    was live_visuals_4 cursor watch events; the ask was the last line)."""
+
+    def test_only_last_n_cursor_events_in_claude_context(self):
+        from src.conversation import (
+            ConversationBuffer,
+            _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT,
+        )
+        buf = ConversationBuffer()
+        for i in range(_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT + 3):
+            buf.add_cursor_event(f"[Cursor watch event #{i}]")
+        buf.add_user_text("#ucs", "create a new account for 42C.PW")
+
+        out = buf.as_claude_context(max_turns=20)
+
+        # User request is present.
+        self.assertIn("create a new account for 42C.PW", out)
+        # The most recent N cursor events are present.
+        most_recent_index = _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT + 2
+        self.assertIn(f"#{most_recent_index}", out)
+        # The earliest event was dropped.
+        self.assertNotIn("#0]", out)
+
+    def test_user_request_survives_chatty_watcher(self):
+        """Even with the cursor-watch firehose, the user's ask must reach Claude.
+        This is the direct unit-level reproduction of the 42c.pw context-pollution
+        problem: many cursor events followed by a user message should still
+        emit the user message in the claude context preamble."""
+        from src.conversation import ConversationBuffer
+        buf = ConversationBuffer()
+        for i in range(30):
+            buf.add_cursor_event(f"[watch event {i}]")
+        buf.add_user_text(
+            "#ucs",
+            "Great, could you create a new account for 42C.PW Username: chris",
+        )
+        out = buf.as_claude_context(max_turns=10)
+        self.assertIn("Username: chris", out)
+
+
+class TestConfirmationRace(unittest.IsolatedAsyncioTestCase):
+    """bot._race_confirmations: voice and text waiters race; first decisive wins.
+
+    The plan's central fix: a tier-X/I task initiated from #ucs text with
+    no live voice session was structurally unapprovable (voice was the
+    only resolver). The race makes the text path a real alternative."""
+
+    async def test_text_wins_when_voice_times_out(self):
+        from src import bot
+
+        async def voice_waiter():
+            return {"approved": False, "timeout": True}
+
+        async def text_waiter():
+            return {"approved": True, "source": "text"}
+
+        result = await bot._race_confirmations(voice_waiter(), text_waiter())
+        self.assertTrue(result["approved"])
+        self.assertEqual(result.get("source"), "text")
+
+    async def test_voice_wins_when_text_times_out(self):
+        from src import bot
+
+        async def voice_waiter():
+            await asyncio.sleep(0)
+            return {"approved": True, "source": "voice"}
+
+        async def text_waiter():
+            return {"approved": False, "timeout": True}
+
+        result = await bot._race_confirmations(voice_waiter(), text_waiter())
+        self.assertTrue(result["approved"])
+
+    async def test_both_timeout_returns_timeout_envelope(self):
+        from src import bot
+
+        async def voice_waiter():
+            return {"approved": False, "timeout": True}
+
+        async def text_waiter():
+            return {"approved": False, "timeout": True}
+
+        result = await bot._race_confirmations(voice_waiter(), text_waiter())
+        self.assertFalse(result["approved"])
+        self.assertTrue(result.get("timeout"))
+
+    async def test_text_resolution_via_pending_registry(self):
+        """!ok routes through _resolve_pending_confirmation, which sets the
+        Event the discord_wait_for_confirmation waiter is blocked on."""
+        from src import bot
+
+        bot._pending_text_confirmations.clear()
+        bot._confirmation_message_index.clear()
+
+        bot._register_pending_confirmation("abc12345", "execute_command", "openssl passwd")
+        waiter = asyncio.create_task(
+            bot._discord_wait_for_confirmation("abc12345", timeout=5.0)
+        )
+        await asyncio.sleep(0)
+        ok = bot._resolve_pending_confirmation("abc12345", True, source="text")
+        self.assertTrue(ok)
+        result = await waiter
+        self.assertTrue(result["approved"])
+        self.assertEqual(result.get("source"), "text")
+
+        bot._unregister_pending_confirmation("abc12345")
+        self.assertNotIn("abc12345", bot._pending_text_confirmations)
+
+    async def test_text_waiter_times_out_when_no_answer(self):
+        from src import bot
+
+        bot._pending_text_confirmations.clear()
+        bot._register_pending_confirmation("nobody12", "execute_command", "")
+        try:
+            result = await bot._discord_wait_for_confirmation(
+                "nobody12", timeout=0.05
+            )
+            self.assertTrue(result["timeout"])
+            self.assertFalse(result["approved"])
+        finally:
+            bot._unregister_pending_confirmation("nobody12")
+
+
+class TestInFlightLoopGuard(unittest.IsolatedAsyncioTestCase):
+    """tools.has_in_flight_loops powers the watchdog guard so the 25s idle
+    pause cannot tear down a long do_with_claude loop mid-flight (the
+    Gemini brain shouldn't die while the user is waiting for an answer)."""
+
+    def setUp(self):
+        from src import tools
+        tools._session_states.clear()
+
+    async def test_no_loops_means_false(self):
+        from src.tools import has_in_flight_loops
+        self.assertFalse(has_in_flight_loops())
+
+    async def test_held_lock_signals_in_flight(self):
+        from src.tools import _agent_lock_for, has_in_flight_loops
+        lock = _agent_lock_for("ch-X")
+        async with lock:
+            self.assertTrue(has_in_flight_loops())
+        self.assertFalse(has_in_flight_loops())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

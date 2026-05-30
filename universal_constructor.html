@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Universal Constructor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: #000;
+    color: #b0b0b0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.65;
+  }
+
+  /* ===== HERO ===== */
+  .hero {
+    width: 100%;
+    height: 100vh;
+    min-height: 720px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-bottom: 1px solid #1f1f1f;
+  }
+  .hero-title {
+    position: absolute;
+    top: 40px;
+    left: 56px;
+    font-size: 11px;
+    letter-spacing: 0.35em;
+    text-transform: uppercase;
+    color: #d0d0d0;
+    font-weight: 400;
+    z-index: 2;
+  }
+  .hero-title .sub {
+    margin-top: 6px;
+    font-size: 10px;
+    color: #666;
+    letter-spacing: 0.28em;
+  }
+
+  .legend {
+    position: absolute;
+    bottom: 40px;
+    left: 56px;
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: #9a9a9a;
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+    z-index: 2;
+  }
+  .legend-row { display: flex; align-items: center; gap: 14px; }
+  .mark { width: 12px; display: flex; align-items: center; justify-content: center; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: #e0e0e0; }
+  .dot.uc1 { background: #e8f6ff; box-shadow: 0 0 8px rgba(216,238,248,0.8); }
+  .dot.uc2 { background: #f8e2b8; box-shadow: 0 0 8px rgba(248,226,184,0.8); }
+  .line { width: 14px; height: 1px; background: #b8b8b8; }
+  .box { width: 11px; height: 11px; border: 1px solid #888; }
+
+  .scroll-hint {
+    position: absolute;
+    bottom: 40px;
+    right: 56px;
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: #666;
+    z-index: 2;
+  }
+
+  svg.scene { width: 100%; height: 100%; max-width: 1360px; }
+
+  .cube-front { fill: none; stroke: #6f6f6f; stroke-width: 1.2; }
+  .cube-back  { fill: none; stroke: #444444; stroke-width: 1; }
+  .cube-edge  { fill: none; stroke: #4a4a4a; stroke-width: 1; }
+
+  .lib-entry {
+    stroke: #999999;
+    stroke-width: 1.2;
+    stroke-linecap: square;
+    transition: stroke 0.4s, stroke-width 0.4s;
+  }
+  .lib-entry.active { stroke: #ffffff; stroke-width: 1.7; }
+  .lib-entry.editing { stroke: #d8eef8; stroke-width: 1.6; }
+
+  .tree-branch { stroke: #c4c4c4; stroke-width: 1.1; fill: none; stroke-linecap: round; }
+  .tree-stem   { stroke: #a8a8a8; stroke-width: 0.9; fill: none; stroke-linecap: round; }
+  .tree-node   { fill: #d8d8d8; }
+  .tree-twig   { fill: #f0f0f0; }
+  .leaf-node   { fill: #ffffff; }
+
+  .uc1-core { fill: #e8f6ff; }
+  .uc1-halo { fill: rgba(216, 238, 248, 0.20); }
+  .uc2-core { fill: #f8e2b8; }
+  .uc2-halo { fill: rgba(248, 226, 184, 0.20); }
+
+  .prompt-particle { fill: #ffffff; }
+
+  .input-line   { stroke: #5a5a5a; stroke-width: 1; }
+  .input-source { fill: #999999; }
+
+  .label {
+    fill: #aaaaaa;
+    font-size: 10px;
+    letter-spacing: 0.25em;
+    font-family: inherit;
+    text-transform: uppercase;
+  }
+  .label.right { text-anchor: end; }
+
+  /* ===== DOCUMENT ===== */
+  .doc {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 120px 40px 160px;
+    font-size: 16px;
+    line-height: 1.7;
+    color: #b0b0b0;
+  }
+  .doc h1 {
+    font-size: 36px;
+    font-weight: 300;
+    color: #f4f4f4;
+    margin-bottom: 16px;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+  }
+  .doc .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: #666;
+    margin-bottom: 80px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid #1f1f1f;
+  }
+  .doc h2 {
+    font-size: 20px;
+    font-weight: 400;
+    color: #ececec;
+    margin-top: 72px;
+    margin-bottom: 24px;
+  }
+  .doc h2:first-of-type { margin-top: 0; }
+  .doc p { margin-bottom: 22px; color: #b4b4b4; }
+  .doc p strong, .doc strong { color: #ececec; font-weight: 500; }
+  .doc em { color: #d8d8d8; font-style: italic; }
+  .doc ul { list-style: none; margin: 12px 0 22px; }
+  .doc ul li { padding-left: 24px; position: relative; margin-bottom: 14px; }
+  .doc ul li::before { content: "—"; position: absolute; left: 0; color: #555; }
+  .doc table { border-collapse: collapse; width: 100%; margin: 24px 0; font-size: 14px; }
+  .doc th {
+    text-align: left;
+    padding: 14px 18px 14px 0;
+    border-bottom: 1px solid #2a2a2a;
+    color: #999;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 10px;
+  }
+  .doc td {
+    padding: 14px 18px 14px 0;
+    border-bottom: 1px solid #1a1a1a;
+    color: #c0c0c0;
+    vertical-align: top;
+  }
+  .doc td strong { color: #e8f6ff; }
+  .doc .footer {
+    margin-top: 140px;
+    padding-top: 24px;
+    border-top: 1px solid #1f1f1f;
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: #555;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-title">
+    Universal Constructor
+    <div class="sub">A live trace</div>
+  </div>
+
+  <svg class="scene" viewBox="0 0 1360 820" preserveAspectRatio="xMidYMid meet">
+    <g id="cube"></g>
+    <g id="inputs"></g>
+    <g id="library"></g>
+    <g id="tree"></g>
+    <g id="leaves"></g>
+    <g id="stems"></g>
+    <g id="trails"></g>
+    <g id="particles"></g>
+    <g id="uc1">
+      <circle class="uc1-halo" cx="700" cy="640" r="13"/>
+      <circle class="uc1-core" cx="700" cy="640" r="4"/>
+    </g>
+    <g id="uc2" style="opacity:0">
+      <circle class="uc2-halo" cx="700" cy="300" r="13"/>
+      <circle class="uc2-core" cx="700" cy="300" r="4"/>
+    </g>
+  </svg>
+
+  <div class="legend">
+    <div class="legend-row">
+      <div class="mark"><div class="dot uc1"></div></div>
+      <span>UC1 — Forward (root → leaves)</span>
+    </div>
+    <div class="legend-row">
+      <div class="mark"><div class="dot uc2"></div></div>
+      <span>UC2 — Inverse (leaves → root)</span>
+    </div>
+    <div class="legend-row">
+      <div class="mark"><div class="line"></div></div>
+      <span>Library — Loop 2 rewrites</span>
+    </div>
+    <div class="legend-row">
+      <div class="mark"><div class="box"></div></div>
+      <span>Harness</span>
+    </div>
+  </div>
+
+  <div class="scroll-hint">Scroll for context ↓</div>
+</section>
+
+<section class="doc">
+  <h1>Universal Digital Constructor</h1>
+  <div class="eyebrow">Architecture &amp; Vision</div>
+
+  <h2>What it is</h2>
+  <p>An LLM is the primitive that lets us, for the first time, <strong>literally structure chaos</strong>. Apply compute, and arbitrary unstructured input — text, fragments, intent, mess — becomes ordered, intentional output, at scale. Inside the system, the second law of thermodynamics does not bind: entropy decreases locally wherever the LLM operates (with structure). The totality of this is not yet generally understood, and it is the substrate on which everything below rests.</p>
+  <p>A prompt library is a finite set of named transformations expressed in text. A loop composes them: output becomes input under a new prompt, until the user accepts the result. A second loop rewrites the library by operating on the dual — what was missed, what should not have been needed, what could collapse into a more general primitive. The library is driven toward minimality.</p>
+  <p><em>That is the constructor.</em></p>
+
+  <h2>Architecture</h2>
+  <p><strong>Loop 1 — Core.</strong> A general text-to-text interpreter applies prompts from the library to the current state. Each step produces a new state, which conditions the next prompt selection. The library is consulted, not blindly followed: when no entry fits, the next prompt is synthesized. The loop runs until the user accepts the artifact. Inputs are elicited from the user only when required, and only what is required.</p>
+  <p><strong>Loop 2 — Improve.</strong> A second iteration whose object is the library, not the artifact. After each acceptance it asks what should have been true for the path to be radically shorter, and what should not have been needed at all. It operates on the dual — Type II errors, gaps, drift, sprawl — and rewrites entries by splitting, merging, generalizing, retiring. Every additive pressure from Loop 1 is met by a recombinative or subtractive response. The net direction is monotonic simplification.</p>
+  <p><strong>Loop 3 — Reserved.</strong> A third dimension orthogonal to production and improvement. The slot is held open by design rather than filled prematurely.</p>
+  <p>Everything else — sandbox, tests, red team, observability — is harness. Necessary, but cellular context, not the constructor.</p>
+
+  <h2>Two directions of construction</h2>
+  <p>Loop 1 admits a natural decomposition into two cooperating constructors operating in opposite directions.</p>
+  <p><strong>UC1 — Forward. (Root --> Leaf) </strong> Starts at the root and builds outward toward the user-facing surface: root → trunk → branches → leaves. Primitives compose into structure, structure into capability, capability into experience. This is the traditional bottom-up path.</p>
+  <p><strong>UC2 — Inverse. (Leaf --> Root)</strong> Starts at the leaves and builds backward toward the root: leaves → branches → trunk → root. The leaves are the full user experience the system is supposed to deliver. UC2 commits to those <em>first</em> — laid out at their destinations as terminal nodes — and then derives the implementation path by connecting each terminus back into the structure that should produce it.</p>
+  <p>They meet in the middle. Forward construction supplies the primitives that inverse decomposition needs to terminate against. Inverse decomposition supplies the targets that forward construction is aiming at. Neither alone is sufficient: primitives without targets generate arbitrary structure; targets without primitives generate sketches. Both share the same library, and Loop 2 rewrites that library underneath them both.</p>
+
+  <h2>Mental model: the PTC inside the ribosome</h2>
+  <p>Roughly four billion years ago, on a planet of nothing but chemistry, a single mechanism came into existence and the universe acquired a new category. This event is called <strong>abiogenesis</strong> — the transition from non-living chemistry to living biology, the origin of life itself. Before it: molecules. After it: life. Every organism that has ever existed on Earth — every bacterium, every redwood, every human being who has ever lived — descends in an unbroken line from the first system that contained the mechanism by which abiogenesis occurred. That mechanism is called the <strong>Peptidyl Transferase Center (PTC)</strong>: a small region of ancient RNA, about 180 nucleotides, that performs exactly one operation — it bonds one amino acid to the next. That is all it does. From that single act, four billion years of biology unfolds.</p>
+  <p>The PTC sits at the heart of the <strong>ribosome</strong> — the molecular machine that reads genetic instructions and builds proteins, the substance from which all cells are made and by which they run. The ribosome is large and elaborate, a structure of RNA and dozens of proteins. The PTC is the small, ancient core inside it where the actual chemistry happens. Everything around it — the decoding apparatus, the scaffolding, the positioning machinery — exists to feed substrates to this one catalytic point. The PTC does not care which amino acid; it is general over its input. Strip everything else away and the PTC alone still works. It is the smallest sufficient mechanism, and the entire diversity of organic life is what it generates when it runs. Life does not exist anywhere on this planet without it.</p>
+  <p>This is the position the <strong>LLM</strong> occupies in our system. A small, substrate-general primitive across which a new kind of construction becomes possible. Before it: text, code, intent — inert. After it: a system that takes arbitrary input and produces structured, intentional output, at scale. The LLM is to digital construction what the PTC is to biological construction. Not metaphorically. Structurally. The same shape of threshold: a single small mechanism, general over its substrate, from which a new universe of constructed things becomes possible.</p>
+  
+  <p>The PTC is, in other words, the smallest universal primitive in biology: one tiny, substrate-general operator from which the entire diversity of organic life is composed.</p>
+  <table>
+    <thead>
+      <tr><th>Ribosome</th><th>Constructor</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>mRNA + tRNAs</td><td>Prompt library</td></tr>
+      <tr><td>Decoding center</td><td>Prompt selection</td></tr>
+      <tr><td>Peptidyl Transferase Center</td><td>LLM</td></tr>
+      <tr><td>Cellular machinery</td><td>Harness</td></tr>
+      <tr><td>Ribosomes making ribosomal proteins</td><td>Loop 2</td></tr>
+    </tbody>
+  </table>
+  <p>Abiogenesis happened once. Four billion years of life came from it. We are standing at the same kind of threshold now, in a different substrate.</p>
+  </br>
+  <p>The PTC is the minimal catalytic primitive of biology's protein constructor: substrate-general, ancient, surrounded by scaffolding it does not need to do its work. The LLM occupies the same position over text.</p>
+  <p>Universality in protein space is a small primitive plus a tape plus a cell. Universality in digital-artifact space is the same shape.</p>
+
+  <h2>What makes it a constructor</h2>
+  <p>Most LLM systems are agents: they receive instructions, do work, return results. The system above is different. It externalizes its own operating program — the prompt library — into an inspectable, editable form, and turns one of its loops on that program. The result is a system that produces artifacts and produces the means by which it produces artifacts.</p>
+  <p>This is the universal constructor pattern: a machine whose tape can describe any product, including the machine itself. Biology's instance is the ribosome, encoded by genes the ribosome itself translates. The instance here is an LLM iterating over a library that a second LLM iteration rewrites. Different substrate, same recursion.</p>
+
+  <h2>Convergence</h2>
+  <p>The library does not grow without bound. Loop 2's inversion pressure pushes against accretion: every additive proposal faces a subtractive counter-proposal grounded in the dual. Over many cycles, the entries that survive are those no smaller composition can replace. The library approaches a minimum set of generators that spans the user's artifact space — the way a small set of axioms spans a mathematics, or a small set of phonemes spans a language.</p>
+  <p>As that minimum is approached, further capability comes only from composition: which entries to use, in what order, with what parameters. The library becomes, in the limit, a compressed description of the user's digital universe — the smallest set of generators sufficient to recompose it.</p>
+
+  <h2>The power</h2>
+  <p>Three properties together:</p>
+  <ul>
+    <li><strong>Generality.</strong> Anything expressible as text is in range, by closure. And because the LLM structures chaos, "expressible as text" includes nearly anything we can point at.</li>
+    <li><strong>Convergence.</strong> The library is driven toward a minimum sufficient set of generators by intrinsic pressure, not external curation.</li>
+    <li><strong>Inspectability.</strong> The program is finite, named, and human-readable at every moment.</li>
+  </ul>
+  <p>The interpreter is the only opaque element, and it is held constant. Everything that gets better — what the system can build, how efficiently it builds it, what failure modes it covers — lives in the inspectable layer.</p>
+
+  <div class="footer">END</div>
+</section>
+
+<script>
+(function() {
+  const NS = 'http://www.w3.org/2000/svg';
+
+  // ===== CUBE GEOMETRY =====
+  const fx = 220, fy = 130, fw = 820, fh = 540;
+  const fxR = fx + fw, fyB = fy + fh;
+  const dx_cube = 58, dy_cube = -42;
+  const bx = fx + dx_cube, by = fy + dy_cube;
+  const bxR = bx + fw, byB = by + fh;
+
+  // ===== HELPERS =====
+  function svgLine(x1, y1, x2, y2, cls, parent) {
+    const l = document.createElementNS(NS, 'line');
+    l.setAttribute('x1', x1); l.setAttribute('y1', y1);
+    l.setAttribute('x2', x2); l.setAttribute('y2', y2);
+    l.setAttribute('class', cls);
+    parent.appendChild(l);
+    return l;
+  }
+  function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+  function fadeIn(el, dur) {
+    const start = performance.now();
+    (function step(now) {
+      const t = Math.min((now - start) / dur, 1);
+      el.style.opacity = t;
+      if (t < 1) requestAnimationFrame(step);
+    })(performance.now());
+  }
+  function animateNum(from, to, dur, setter) {
+    const start = performance.now();
+    (function step(now) {
+      const t = Math.min((now - start) / dur, 1);
+      setter(from + (to - from) * easeInOut(t));
+      if (t < 1) requestAnimationFrame(step);
+    })(performance.now());
+  }
+
+  // ===== CUBE =====
+  function drawCube() {
+    const g = document.getElementById('cube');
+    svgLine(bx, by, bxR, by, 'cube-back', g);
+    svgLine(bxR, by, bxR, byB, 'cube-back', g);
+    svgLine(bx, byB, bxR, byB, 'cube-back', g);
+    svgLine(bx, by, bx, byB, 'cube-back', g);
+    svgLine(fx, fy, bx, by, 'cube-edge', g);
+    svgLine(fxR, fy, bxR, by, 'cube-edge', g);
+    svgLine(fxR, fyB, bxR, byB, 'cube-edge', g);
+    svgLine(fx, fyB, bx, byB, 'cube-edge', g);
+    svgLine(fx, fy, fxR, fy, 'cube-front', g);
+    svgLine(fxR, fy, fxR, fyB, 'cube-front', g);
+    svgLine(fx, fyB, fxR, fyB, 'cube-front', g);
+    svgLine(fx, fy, fx, fyB, 'cube-front', g);
+    const lbl = document.createElementNS(NS, 'text');
+    lbl.setAttribute('class', 'label');
+    lbl.setAttribute('x', bxR);
+    lbl.setAttribute('y', byB + 22);
+    lbl.setAttribute('text-anchor', 'end');
+    lbl.textContent = 'Harness';
+    g.appendChild(lbl);
+  }
+
+  // ===== LIBRARY =====
+  const libX = fx + 50;
+  const libY = fy + 96;
+  const libCount = 9;
+  const libSpacing = 18;
+  const libMaxLen = 110;
+  const libMinLen = 28;
+  const library = [];
+
+  function buildLibrary() {
+    const g = document.getElementById('library');
+    const header = document.createElementNS(NS, 'text');
+    header.setAttribute('class', 'label');
+    header.setAttribute('x', libX);
+    header.setAttribute('y', libY - 22);
+    header.textContent = 'Library';
+    g.appendChild(header);
+    for (let i = 0; i < libCount; i++) {
+      const length = libMinLen + 12 + Math.random() * (libMaxLen - libMinLen - 12);
+      const y = libY + i * libSpacing;
+      const line = document.createElementNS(NS, 'line');
+      line.setAttribute('class', 'lib-entry');
+      line.setAttribute('x1', libX);
+      line.setAttribute('y1', y);
+      line.setAttribute('x2', libX + length);
+      line.setAttribute('y2', y);
+      g.appendChild(line);
+      library.push({ y, length, el: line });
+    }
+  }
+
+  // ===== INPUTS =====
+  function buildInputs() {
+    const g = document.getElementById('inputs');
+    const defs = [
+      { y: fy + 140, label: 'Intent' },
+      { y: fy + 280, label: 'Context' },
+      { y: fy + 420, label: 'Constraints' },
+    ];
+    for (const d of defs) {
+      svgLine(fx - 120, d.y, fx, d.y, 'input-line', g);
+      const lbl = document.createElementNS(NS, 'text');
+      lbl.setAttribute('class', 'label right');
+      lbl.setAttribute('x', fx - 130);
+      lbl.setAttribute('y', d.y + 3);
+      lbl.textContent = d.label;
+      g.appendChild(lbl);
+      const src = document.createElementNS(NS, 'circle');
+      src.setAttribute('class', 'input-source');
+      src.setAttribute('cx', fx - 120);
+      src.setAttribute('cy', d.y);
+      src.setAttribute('r', 2.6);
+      g.appendChild(src);
+    }
+    function tick() {
+      const d = defs[Math.floor(Math.random() * defs.length)];
+      const p = document.createElementNS(NS, 'circle');
+      p.setAttribute('cx', fx - 120);
+      p.setAttribute('cy', d.y);
+      p.setAttribute('r', 2.8);
+      p.setAttribute('fill', '#d8eef8');
+      g.appendChild(p);
+      const start = performance.now();
+      const dur = 1400;
+      (function step(now) {
+        const t = Math.min((now - start) / dur, 1);
+        p.setAttribute('cx', fx - 120 + 120 * (t * t));
+        p.setAttribute('opacity', 1 - t * 0.85);
+        if (t < 1) requestAnimationFrame(step);
+        else p.remove();
+      })(performance.now());
+      setTimeout(tick, 1000 + Math.random() * 1200);
+    }
+    setTimeout(tick, 800);
+  }
+
+  // ===== PROMPT PARTICLE FLOW =====
+  async function sendPrompt(bug) {
+    const entry = library[Math.floor(Math.random() * library.length)];
+    entry.el.classList.add('active');
+    const sx = libX + entry.length;
+    const sy = entry.y;
+    const particle = document.createElementNS(NS, 'circle');
+    particle.setAttribute('class', 'prompt-particle');
+    particle.setAttribute('cx', sx);
+    particle.setAttribute('cy', sy);
+    particle.setAttribute('r', 2.4);
+    particle.setAttribute('opacity', 0.95);
+    document.getElementById('particles').appendChild(particle);
+    return new Promise(res => {
+      const start = performance.now();
+      const dur = 380 + Math.random() * 120;
+      (function step(now) {
+        const t = Math.min((now - start) / dur, 1);
+        const e = easeInOut(t);
+        const tx = bug.x, ty = bug.y;
+        const arc = Math.sin(t * Math.PI) * 18;
+        particle.setAttribute('cx', sx + (tx - sx) * e);
+        particle.setAttribute('cy', sy + (ty - sy) * e - arc);
+        particle.setAttribute('opacity', 0.95 * (1 - Math.pow(t, 4) * 0.4));
+        if (t < 1) requestAnimationFrame(step);
+        else {
+          particle.remove();
+          setTimeout(() => entry.el.classList.remove('active'), 140);
+          res();
+        }
+      })(performance.now());
+    });
+  }
+
+  // ===== TREE GENERATION =====
+  function generateTree(centerX, baseY, topY, leftX, rightX) {
+    let id = 0;
+    function mk(x, y, parent, depth, kind) {
+      const n = { id: id++, x, y, parent, children: [], depth, kind };
+      if (parent) parent.children.push(n);
+      return n;
+    }
+    const root = mk(centerX, baseY, null, 0, 'root');
+    const trunkSeg = (baseY - topY) * 0.11;
+    let trunkTop = root;
+    for (let i = 0; i < 3; i++) {
+      trunkTop = mk(
+        centerX + (Math.random() - 0.5) * 4,
+        trunkTop.y - trunkSeg,
+        trunkTop, trunkTop.depth + 1, 'trunk'
+      );
+    }
+    function inBounds(x, y) {
+      return x > leftX + 25 && x < rightX - 25 && y > topY + 25 && y < baseY - 10;
+    }
+    function grow(parent, dir, depth, segLen, maxDepth) {
+      if (depth > maxDepth) return;
+      let nx = parent.x, ny = parent.y;
+      const wobble = segLen * 0.05;
+      if (dir === 'up')    { ny -= segLen; nx += (Math.random() - 0.5) * wobble; }
+      if (dir === 'left')  { nx -= segLen; ny += (Math.random() - 0.5) * wobble; }
+      if (dir === 'right') { nx += segLen; ny += (Math.random() - 0.5) * wobble; }
+      if (!inBounds(nx, ny)) return;
+      const kind = depth >= maxDepth - 1 ? 'twig' : 'branch';
+      const n = mk(nx, ny, parent, depth, kind);
+      if (depth >= maxDepth) return;
+      const r = Math.random();
+      if (dir === 'up') {
+        if (r < 0.48) {
+          grow(n, 'left',  depth + 1, segLen * 0.85, maxDepth);
+          grow(n, 'right', depth + 1, segLen * 0.85, maxDepth);
+        } else if (r < 0.80) {
+          grow(n, Math.random() < 0.5 ? 'left' : 'right', depth + 1, segLen * 0.90, maxDepth);
+        } else {
+          grow(n, 'up', depth + 1, segLen * 0.93, maxDepth);
+        }
+      } else {
+        if (r < 0.42) {
+          grow(n, 'up', depth + 1, segLen * 0.88, maxDepth);
+        } else if (r < 0.70) {
+          grow(n, dir, depth + 1, segLen * 0.92, maxDepth);
+        } else {
+          grow(n, 'up', depth + 1, segLen * 0.84, maxDepth);
+          grow(n, dir, depth + 1, segLen * 0.86, maxDepth);
+        }
+      }
+    }
+    grow(trunkTop, 'left',  trunkTop.depth + 1, trunkSeg * 1.00, 9);
+    grow(trunkTop, 'right', trunkTop.depth + 1, trunkSeg * 1.00, 9);
+    grow(trunkTop, 'up',    trunkTop.depth + 1, trunkSeg * 0.95, 9);
+    const all = [];
+    (function walk(n) {
+      all.push(n);
+      n.children.forEach(walk);
+    })(root);
+    const twigs = all.filter(n => n.children.length === 0);
+    return { root, allNodes: all, twigs };
+  }
+
+  // ===== PERIMETER TWIG FILTER =====
+  // Angular binning: divide 360° into N bins around canopy center;
+  // for each bin, keep only the FARTHEST twig. Interior twigs get no leaves.
+  function findPerimeterTwigs(twigs, center) {
+    const numBins = 20;
+    const bins = Array.from({length: numBins}, () => null);
+    for (const twig of twigs) {
+      const dx = twig.x - center.x;
+      const dy = twig.y - center.y;
+      let angle = Math.atan2(dy, dx);
+      if (angle < 0) angle += 2 * Math.PI;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const bin = Math.floor(angle / (2 * Math.PI) * numBins);
+      if (!bins[bin] || bins[bin].dist < dist) {
+        bins[bin] = { twig, dist };
+      }
+    }
+    return bins.filter(b => b !== null).map(b => b.twig);
+  }
+
+  // ===== LEAVES (perimeter only, fan outward) =====
+  function generateLeaves(twigs, canopyCenter, bounds) {
+    const perimeterTwigs = findPerimeterTwigs(twigs, canopyCenter);
+    const leaves = [];
+    for (const twig of perimeterTwigs) {
+      const dx = twig.x - canopyCenter.x;
+      const dy = twig.y - canopyCenter.y;
+      const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+      const outwardAngle = distFromCenter > 4
+        ? Math.atan2(dy, dx)
+        : -Math.PI / 2;
+      const numLeaves = 2 + Math.floor(Math.random() * 2); // 2 or 3
+      for (let i = 0; i < numLeaves; i++) {
+        // Tighter fan around outward direction (was 0.55)
+        const baseSpread = Math.PI * 0.32;
+        let angleOffset;
+        if (numLeaves === 1) {
+          angleOffset = (Math.random() - 0.5) * baseSpread;
+        } else {
+          const step = baseSpread / (numLeaves - 1);
+          angleOffset = -baseSpread / 2 + i * step + (Math.random() - 0.5) * step * 0.3;
+        }
+        const angle = outwardAngle + angleOffset;
+        // Push leaves further OUT beyond the twig (was 20-34)
+        const offsetDist = 28 + Math.random() * 12;
+        const lx = twig.x + Math.cos(angle) * offsetDist;
+        const ly = twig.y + Math.sin(angle) * offsetDist;
+        if (lx < bounds.leftX + 12 || lx > bounds.rightX - 12) continue;
+        if (ly < bounds.topY + 12 || ly > bounds.baseY - 12) continue;
+        let tooClose = false;
+        for (const existing of leaves) {
+          const ddx = existing.x - lx, ddy = existing.y - ly;
+          if (Math.sqrt(ddx * ddx + ddy * ddy) < 14) { tooClose = true; break; }
+        }
+        if (tooClose) continue;
+        leaves.push({ x: lx, y: ly, twig });
+      }
+    }
+    return leaves;
+  }
+
+  function centroidOf(points) {
+    let sx = 0, sy = 0;
+    for (const p of points) { sx += p.x; sy += p.y; }
+    return { x: sx / points.length, y: sy / points.length };
+  }
+
+  // ===== CLOCKWISE ORDERING =====
+  function cwFromLeft(point, center) {
+    const angle = Math.atan2(point.y - center.y, point.x - center.x);
+    let cw = angle - (-Math.PI);
+    while (cw < 0) cw += 2 * Math.PI;
+    while (cw >= 2 * Math.PI) cw -= 2 * Math.PI;
+    return cw;
+  }
+  function dfsSkeletonCW(node, result = []) {
+    result.push(node);
+    if (node.children.length === 0) return result;
+    const sorted = [...node.children].sort((a, b) =>
+      cwFromLeft(a, node) - cwFromLeft(b, node)
+    );
+    for (const c of sorted) dfsSkeletonCW(c, result);
+    return result;
+  }
+  function sortLeavesCW(leaves, center) {
+    return [...leaves].sort((a, b) => cwFromLeft(a, center) - cwFromLeft(b, center));
+  }
+
+  // ===== RIGHT-ANGLE PATH =====
+  function rightAnglePath(from, to) {
+    const dxv = to.x - from.x;
+    const dyv = to.y - from.y;
+    if (Math.abs(dxv) < 6) return [{ x: from.x, y: from.y }, { x: to.x, y: to.y }];
+    if (Math.abs(dyv) < 6) return [{ x: from.x, y: from.y }, { x: to.x, y: to.y }];
+    if (Math.abs(dyv) >= Math.abs(dxv)) {
+      return [
+        { x: from.x, y: from.y },
+        { x: from.x, y: to.y },
+        { x: to.x, y: to.y }
+      ];
+    } else {
+      return [
+        { x: from.x, y: from.y },
+        { x: to.x, y: from.y },
+        { x: to.x, y: to.y }
+      ];
+    }
+  }
+
+  // ===== BUG PRIMITIVES =====
+  function makeBug(coreSel, haloSel, gSel) {
+    return {
+      x: 0, y: 0,
+      core: document.querySelector(coreSel),
+      halo: document.querySelector(haloSel),
+      group: document.querySelector(gSel),
+      active: true,
+    };
+  }
+  const uc1 = makeBug('.uc1-core', '.uc1-halo', '#uc1');
+  const uc2 = makeBug('.uc2-core', '.uc2-halo', '#uc2');
+  uc2.active = false;
+
+  function setBugPos(bug, x, y) {
+    bug.x = x; bug.y = y;
+    bug.core.setAttribute('cx', x); bug.core.setAttribute('cy', y);
+    bug.halo.setAttribute('cx', x); bug.halo.setAttribute('cy', y);
+  }
+
+  function moveBug(bug, toX, toY, dur) {
+    return new Promise(res => {
+      const sx = bug.x, sy = bug.y;
+      const start = performance.now();
+      (function step(now) {
+        const t = Math.min((now - start) / dur, 1);
+        const e = easeInOut(t);
+        setBugPos(bug, sx + (toX - sx) * e, sy + (toY - sy) * e);
+        if (t < 1) requestAnimationFrame(step);
+        else res();
+      })(performance.now());
+    });
+  }
+
+  async function bugTracePath(bug, waypoints, durPerSeg, pathEl) {
+    const segs = [`M ${waypoints[0].x},${waypoints[0].y}`];
+    if (pathEl) pathEl.setAttribute('d', segs.join(' '));
+    for (let i = 1; i < waypoints.length; i++) {
+      const from = waypoints[i - 1], to = waypoints[i];
+      await new Promise(res => {
+        const start = performance.now();
+        (function step(now) {
+          const t = Math.min((now - start) / durPerSeg, 1);
+          const e = easeInOut(t);
+          const x = from.x + (to.x - from.x) * e;
+          const y = from.y + (to.y - from.y) * e;
+          setBugPos(bug, x, y);
+          if (pathEl) pathEl.setAttribute('d', segs.join(' ') + ` L ${x},${y}`);
+          if (t < 1) requestAnimationFrame(step);
+          else res();
+        })(performance.now());
+      });
+      segs.push(`L ${to.x},${to.y}`);
+      if (pathEl) pathEl.setAttribute('d', segs.join(' '));
+    }
+  }
+
+  // Trails
+  const trailHistory = { uc1: { x: 0, y: 0 }, uc2: { x: 0, y: 0 } };
+  function spawnTrailIfMoved(bug, color, key) {
+    const last = trailHistory[key];
+    const ddx = bug.x - last.x, ddy = bug.y - last.y;
+    if (Math.sqrt(ddx * ddx + ddy * ddy) > 5) {
+      const tr = document.createElementNS(NS, 'circle');
+      tr.setAttribute('cx', bug.x);
+      tr.setAttribute('cy', bug.y);
+      tr.setAttribute('r', 1.6);
+      tr.setAttribute('fill', color);
+      document.getElementById('trails').appendChild(tr);
+      const start = performance.now();
+      (function step(now) {
+        const t = Math.min((now - start) / 700, 1);
+        tr.setAttribute('opacity', 1 - t);
+        if (t < 1) requestAnimationFrame(step);
+        else tr.remove();
+      })(performance.now());
+      trailHistory[key] = { x: bug.x, y: bug.y };
+    }
+  }
+  setInterval(() => {
+    if (uc1.active) spawnTrailIfMoved(uc1, 'rgba(216,238,248,0.35)', 'uc1');
+    if (uc2.active) spawnTrailIfMoved(uc2, 'rgba(248,226,184,0.35)', 'uc2');
+  }, 70);
+
+  // Halo pulse
+  (function haloLoop() {
+    const start = performance.now();
+    (function step(now) {
+      const t = (now - start) / 1000;
+      uc1.halo.setAttribute('r', 12 + Math.sin(t * 1.6) * 2.6);
+      uc2.halo.setAttribute('r', 12 + Math.sin(t * 1.6 + 1) * 2.6);
+      requestAnimationFrame(step);
+    })(performance.now());
+  })();
+
+  // ===== TREE RENDERING =====
+  function drawSkeletonNode(node) {
+    const g = document.getElementById('tree');
+    const c = document.createElementNS(NS, 'circle');
+    const isTwig = node.children.length === 0;
+    c.setAttribute('class', isTwig ? 'tree-twig' : 'tree-node');
+    c.setAttribute('cx', node.x);
+    c.setAttribute('cy', node.y);
+    c.setAttribute('r', node.depth === 0 ? 3.8 : (isTwig ? 2.4 : 2.2));
+    c.style.opacity = '0';
+    g.appendChild(c);
+    fadeIn(c, 300);
+  }
+
+  function drawLeaf(leaf) {
+    const g = document.getElementById('leaves');
+    const c = document.createElementNS(NS, 'circle');
+    c.setAttribute('class', 'leaf-node');
+    c.setAttribute('cx', leaf.x);
+    c.setAttribute('cy', leaf.y);
+    c.setAttribute('r', 3.0);
+    c.style.opacity = '0';
+    g.appendChild(c);
+    fadeIn(c, 320);
+  }
+
+  // ===== UC1: SKELETON =====
+  async function uc1Build(node) {
+    await sendPrompt(uc1);
+    if (!node.parent) {
+      await moveBug(uc1, node.x, node.y, 500);
+      drawSkeletonNode(node);
+      return;
+    }
+    await moveBug(uc1, node.parent.x, node.parent.y, 240);
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('class', 'tree-branch');
+    document.getElementById('tree').appendChild(path);
+    const wp = rightAnglePath(node.parent, node);
+    await bugTracePath(uc1, wp, 150, path);
+    drawSkeletonNode(node);
+  }
+
+  // ===== UC2: LEAVES =====
+  async function uc2PlaceLeaf(leaf) {
+    await sendPrompt(uc2);
+    await moveBug(uc2, leaf.x, leaf.y, 360);
+    drawLeaf(leaf);
+  }
+  async function uc2ConnectLeaf(leaf) {
+    await sendPrompt(uc2);
+    await moveBug(uc2, leaf.x, leaf.y, 280);
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('class', 'tree-stem');
+    document.getElementById('stems').appendChild(path);
+    const wp = [{ x: leaf.x, y: leaf.y }, { x: leaf.twig.x, y: leaf.twig.y }];
+    await bugTracePath(uc2, wp, 200, path);
+  }
+  function spawnUC2(x, y) {
+    setBugPos(uc2, x, y);
+    uc2.active = true;
+    uc2.group.style.transition = 'opacity 0.8s';
+    uc2.group.style.opacity = '1';
+  }
+  function despawnUC2() {
+    uc2.group.style.transition = 'opacity 1.0s';
+    uc2.group.style.opacity = '0';
+    uc2.active = false;
+  }
+
+  // ===== LOOP 2 =====
+  async function loop2Rewrite() {
+    const n = 2 + Math.floor(Math.random() * 2);
+    const picks = [];
+    while (picks.length < n) {
+      const i = Math.floor(Math.random() * library.length);
+      if (!picks.includes(i)) picks.push(i);
+    }
+    for (const i of picks) {
+      library[i].el.classList.add('editing');
+      await sleep(180);
+    }
+    await sleep(500);
+    for (const i of picks) {
+      const e = library[i];
+      const factor = Math.random() < 0.72
+        ? 0.65 + Math.random() * 0.25
+        : 1.05 + Math.random() * 0.18;
+      const newLen = Math.max(libMinLen, Math.min(libMaxLen, e.length * factor));
+      animateNum(e.length, newLen, 700, v => e.el.setAttribute('x2', libX + v));
+      e.length = newLen;
+    }
+    await sleep(800);
+    for (const i of picks) library[i].el.classList.remove('editing');
+  }
+
+  // ===== HARNESS PULSES =====
+  function harnessActivity() {
+    setTimeout(function tick() {
+      const edges = [
+        { x1: fx, y1: fy, x2: fxR, y2: fy },
+        { x1: fxR, y1: fy, x2: fxR, y2: fyB },
+        { x1: fx, y1: fyB, x2: fxR, y2: fyB },
+        { x1: fx, y1: fy, x2: fx, y2: fyB },
+      ];
+      const e = edges[Math.floor(Math.random() * edges.length)];
+      const ex = e.x2 - e.x1, ey = e.y2 - e.y1;
+      const t0 = 0.1 + Math.random() * 0.7;
+      const t1 = t0 + 0.13;
+      const seg = document.createElementNS(NS, 'line');
+      seg.setAttribute('x1', e.x1 + ex * t0);
+      seg.setAttribute('y1', e.y1 + ey * t0);
+      seg.setAttribute('x2', e.x1 + ex * t0);
+      seg.setAttribute('y2', e.y1 + ey * t0);
+      seg.setAttribute('stroke', '#ffffff');
+      seg.setAttribute('stroke-width', 1.6);
+      document.querySelector('svg.scene').appendChild(seg);
+      const start = performance.now();
+      const dur = 900;
+      (function step(now) {
+        const t = Math.min((now - start) / dur, 1);
+        const fade = t < 0.5 ? t / 0.5 : (1 - t) / 0.5;
+        seg.setAttribute('x2', e.x1 + ex * (t0 + (t1 - t0) * t));
+        seg.setAttribute('y2', e.y1 + ey * (t0 + (t1 - t0) * t));
+        seg.setAttribute('opacity', fade * 0.9);
+        if (t < 1) requestAnimationFrame(step);
+        else seg.remove();
+      })(performance.now());
+      setTimeout(tick, 2200 + Math.random() * 1800);
+    }, 1500);
+  }
+
+  // ===== MAIN CYCLE =====
+  async function constructCycle() {
+    document.getElementById('tree').innerHTML = '';
+    document.getElementById('leaves').innerHTML = '';
+    document.getElementById('stems').innerHTML = '';
+    document.getElementById('trails').innerHTML = '';
+
+    const libRightEdge = libX + libMaxLen + 40;
+    const treeArea = {
+      cx: (libRightEdge + (fxR - 20)) / 2,
+      baseY: fyB - 20,
+      topY: fy + 30,
+      leftX: libRightEdge,
+      rightX: fxR - 20,
+    };
+
+    const tree = generateTree(
+      treeArea.cx, treeArea.baseY, treeArea.topY,
+      treeArea.leftX, treeArea.rightX
+    );
+    const canopyCenter = centroidOf(tree.twigs);
+    const leaves = generateLeaves(tree.twigs, canopyCenter, treeArea);
+
+    const skeletonOrder = dfsSkeletonCW(tree.root);
+    const leavesCW = sortLeavesCW(leaves, canopyCenter);
+
+    setBugPos(uc1, treeArea.cx, treeArea.baseY + 20);
+    uc1.active = true;
+    uc1.group.style.opacity = '1';
+    uc2.group.style.opacity = '0';
+    uc2.active = false;
+
+    await sleep(600);
+    let uc1Done = false;
+
+    const uc1Task = (async () => {
+      for (const node of skeletonOrder) {
+        await uc1Build(node);
+      }
+      uc1Done = true;
+    })();
+
+    const uc2Task = (async () => {
+      await sleep(3600);
+      if (leavesCW.length === 0) return;
+      spawnUC2(leavesCW[0].x, leavesCW[0].y);
+      await sleep(400);
+      for (const leaf of leavesCW) {
+        await uc2PlaceLeaf(leaf);
+      }
+      while (!uc1Done) await sleep(100);
+      await sleep(600);
+      const reversed = leavesCW.slice().reverse();
+      for (const leaf of reversed) {
+        await uc2ConnectLeaf(leaf);
+      }
+    })();
+
+    await Promise.all([uc1Task, uc2Task]);
+    await sleep(1500);
+    await loop2Rewrite();
+    await sleep(700);
+
+    const allArtifactEls = [
+      ...Array.from(document.getElementById('tree').children),
+      ...Array.from(document.getElementById('leaves').children),
+      ...Array.from(document.getElementById('stems').children),
+    ];
+    allArtifactEls.forEach(el => {
+      el.style.transition = 'opacity 1.2s';
+      el.style.opacity = '0';
+    });
+    despawnUC2();
+    await sleep(1400);
+    constructCycle();
+  }
+
+  // ===== INIT =====
+  drawCube();
+  buildLibrary();
+  buildInputs();
+  harnessActivity();
+  const libRightEdge = libX + libMaxLen + 40;
+  setBugPos(uc1, (libRightEdge + (fxR - 20)) / 2, fyB - 20);
+  setTimeout(constructCycle, 1100);
+})();
+</script>
+</body>
+</html>

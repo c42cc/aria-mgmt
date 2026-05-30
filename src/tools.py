@@ -28,6 +28,14 @@ from .db import (
     tool_to_product,
     upsert_cursor_session,
 )
+from .cursor_tools import (
+    _cursor_agents,
+    _cursor_read,
+    _cursor_screenshot,
+    _cursor_send,
+    _cursor_spawn,
+    _cursor_status_new,
+)
 from .memory import recall as mem_recall, remember as mem_remember, forget as mem_forget
 from .prompts import (
     clear_cache as prompts_clear_cache,
@@ -77,6 +85,63 @@ def _dedup_key(tool_name: str, args: dict) -> str:
     except Exception:
         args_json = repr(args)
     return f"{tool_name}:{args_json}"
+
+
+# Maximum number of tier-X/I declines (timeouts or explicit no) allowed
+# across an entire agent loop before we abort early and surface an
+# explicit blocker. Independent of per-action repeats below.
+_DECLINE_TOTAL_ABORT = 3
+# Maximum number of declines for a single (tool, args) pair before we
+# abort. The 42c.pw failure repeatedly retried htpasswd/openssl variants;
+# 2 is enough headroom for one accidental decline + one retry.
+_DECLINE_PER_ACTION_ABORT = 2
+
+
+def _is_declined_result(result_str: str) -> bool:
+    """True if `result_str` is the typed ERR_DECLINED envelope from src/mcp.py."""
+    if not result_str:
+        return False
+    s = result_str.strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(obj, dict) and obj.get("_error_class") == "declined"
+
+
+def _declined_reason(result_str: str) -> str:
+    """Short reason from the ERR_DECLINED envelope, or 'declined' as fallback."""
+    try:
+        obj = json.loads(result_str)
+        msg = str(obj.get("_message") or obj.get("_raw") or "declined")
+        return msg[:300]
+    except Exception:
+        return "declined"
+
+
+def _format_decline_blocker(
+    tool_name: str, args: dict, reason: str, per_action_count: int, total_count: int
+) -> str:
+    """Build the user-facing blocker message for an early decline-driven abort.
+
+    Names the exact command and tells the user how to approve. This is
+    the "loud failure" your rules require — the prior behavior was to
+    silently burn the iteration budget and emit a generic 'iteration
+    limit' string.
+    """
+    args_preview = json.dumps(args, default=str)[:300]
+    return (
+        f"**Blocked: approval required for `{tool_name}`** "
+        f"(declined {per_action_count}x, {total_count} total decline(s) this task).\n"
+        f"Args: `{args_preview}`\n"
+        f"Reason: {reason}\n"
+        f"To unblock: reply `!ok <action_id>` (or react \u2705) on the next "
+        f"confirmation card in #ucs-alerts, or say \"yes\" in voice. Then "
+        f"send the task again. Stopping early so we don't burn the rest of "
+        f"the iteration budget on retries."
+    )
 
 
 def _truncate_trace_args(args: dict, max_chars: int = _TRACE_ARG_MAX_CHARS) -> dict:
@@ -309,6 +374,10 @@ _alert_callback: Callable[..., Coroutine] | None = None
 _thread_callback: Callable[..., Coroutine] | None = None
 _cursor_event_callback: Callable[..., Coroutine] | None = None
 _reconnect_callback: Callable[..., Coroutine] | None = None
+# Discord text-history fetchers injected at boot. Wired by bot.py so the
+# tools layer doesn't take a hard dependency on the discord client.
+_discord_history_callback: Callable[..., Coroutine] | None = None
+_discord_threads_callback: Callable[..., Coroutine] | None = None
 _transcript_provider: Callable[[], list[dict[str, str]]] | None = None
 
 
@@ -353,7 +422,58 @@ def _agent_lock_for(session_key: str) -> asyncio.Lock:
     """Per-session asyncio.Lock to serialize agent loops for the same channel."""
     return _state_for(session_key).lock
 
+
+def has_in_flight_loops() -> bool:
+    """True if any session's agent lock is currently held (loop in flight).
+
+    Consulted by the Gemini idle-pause watchdog (`bot._watchdog_task`) so
+    it does not tear down the Gemini session while a `do_with_claude`
+    loop is running — the loop's eventual narration would otherwise be
+    orphaned and the user would see only a 25s idle pause cut into a
+    long task.
+    """
+    return any(s.lock.locked() for s in _session_states.values())
+
+# Alias-only configuration loaded from projects/registry.md. Maps a short
+# registered name to an absolute workspace path. After the unified-cursor-
+# agent migration the canonical resolver is `cursor_registry.lookup()`;
+# this dict is only consulted to translate registered short names into the
+# workspace paths the registry keys on. Code that needs to find an agent
+# should call `cursor_registry.lookup(agent_id)` instead of poking this map.
 PROJECT_REGISTRY: dict[str, str] = {}
+
+
+def register_observed_workspace(workspace_root: str | None) -> str | None:
+    """Add a basename -> workspace_root entry to PROJECT_REGISTRY if free.
+
+    Called by the cursor external pager whenever a hook event arrives with
+    a `workspace_root`. Lets ad-hoc Cursor windows (not in
+    projects/registry.md) become addressable by the basename that
+    `_classify` puts into `evt.brief`, so a follow-up like
+    `read_cursor_window(project="ucs2")` resolves instead of returning
+    "Unknown project".
+
+    Returns the registry key used (basename) when an entry was added,
+    None when no-op (missing input, empty basename, or a different path
+    already owns that basename — registry.md wins).
+    """
+    if not workspace_root:
+        return None
+    norm = workspace_root.rstrip("/")
+    base = os.path.basename(norm)
+    if not base:
+        return None
+    existing = PROJECT_REGISTRY.get(base)
+    if existing is None:
+        PROJECT_REGISTRY[base] = norm
+        log.info("Auto-registered Cursor workspace: %s -> %s", base, norm)
+        return base
+    if existing.rstrip("/") != norm:
+        log.debug(
+            "Workspace basename collision: %s already maps to %s; not overwriting with %s",
+            base, existing, norm,
+        )
+    return None
 
 
 def init_tools(
@@ -363,11 +483,14 @@ def init_tools(
     thread_callback: Callable[..., Coroutine] | None = None,
     cursor_event_callback: Callable[..., Coroutine] | None = None,
     reconnect_callback: Callable[..., Coroutine] | None = None,
+    discord_history_callback: Callable[..., Coroutine] | None = None,
+    discord_threads_callback: Callable[..., Coroutine] | None = None,
 ) -> None:
     """Initialize tool dependencies. Call once at bot startup."""
     global _anthropic_client, _cursor_bridge
     global _post_callback, _alert_callback, _thread_callback, _cursor_event_callback
     global _reconnect_callback
+    global _discord_history_callback, _discord_threads_callback
 
     _anthropic_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
     _cursor_bridge = cursor_bridge
@@ -376,7 +499,12 @@ def init_tools(
     _thread_callback = thread_callback
     _cursor_event_callback = cursor_event_callback
     _reconnect_callback = reconnect_callback
+    _discord_history_callback = discord_history_callback
+    _discord_threads_callback = discord_threads_callback
     _load_project_registry()
+
+    from . import cursor_tools
+    cursor_tools.init_cursor_tools(cursor_bridge)
 
 
 def set_transcript_provider(provider: Callable[[], list[dict[str, str]]]) -> None:
@@ -420,7 +548,7 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "plan_with_claude": _plan_with_claude,
         "build_with_cursor": _build_with_cursor,
         "query_cursor": _query_cursor,
-        "cursor_status": _cursor_status,
+        "cursor_status": _cursor_status_new,
         "do_with_claude": _do_with_claude,
         "remember": _remember,
         "recall": _recall,
@@ -437,15 +565,19 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "get_focused_app": _get_focused_app,
         "focus_app": _focus_app,
         "dictate_into_focused_app": _dictate_into_focused_app,
-        "list_cursor_windows": _list_cursor_windows,
-        "read_cursor_window": _read_cursor_window,
-        "list_cursor_plans": _list_cursor_plans,
-        "focus_cursor_window": _focus_cursor_window,
-        "send_to_cursor_chat": _send_to_cursor_chat,
-        "keystroke_to_cursor_window": _keystroke_to_cursor_window,
-        "screenshot_cursor_window": _screenshot_cursor_window,
-        "approve_cursor_plan": _approve_cursor_plan,
-        "reject_cursor_plan": _reject_cursor_plan,
+        # Unified cursor tool surface — the six replacements. The per-window
+        # handlers below (_list_cursor_windows, _read_cursor_window,
+        # _send_to_cursor_chat, _screenshot_cursor_window, …) still live in
+        # this file as private helpers used by `cursor_tools` for IDE-side
+        # osascript fallback, but they are no longer dispatched by name.
+        "cursor_agents": _cursor_agents,
+        "cursor_read": _cursor_read,
+        "cursor_send": _cursor_send,
+        "cursor_spawn": _cursor_spawn,
+        "cursor_screenshot": _cursor_screenshot,
+        # Discord text-history tools — read-only.
+        "discord_recent_messages": _discord_recent_messages,
+        "discord_list_threads": _discord_list_threads,
     }
     handler = handlers.get(name)
     if not handler:
@@ -456,9 +588,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "cursor_status", "recall", "cancel_current_task", "list_prompts",
         "show_prompt", "prompt_versions", "reload_prompts",
         "get_focused_app", "focus_app", "dictate_into_focused_app",
-        "list_cursor_windows", "read_cursor_window", "list_cursor_plans",
-        "focus_cursor_window", "send_to_cursor_chat", "keystroke_to_cursor_window",
-        "screenshot_cursor_window", "approve_cursor_plan", "reject_cursor_plan",
+        "cursor_agents", "cursor_read", "cursor_send", "cursor_spawn",
+        "cursor_screenshot",
+        "discord_recent_messages", "discord_list_threads",
     )
     if spend >= config.daily_spend_cap_usd and name not in _free_tools:
         return json.dumps({"error": f"Daily spend cap (${config.daily_spend_cap_usd}) reached. Current: ${spend:.2f}"})
@@ -739,6 +871,79 @@ async def _cursor_status() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Discord text-history tools
+# ---------------------------------------------------------------------------
+#
+# Aria's window into Discord channel and thread history. The fetchers are
+# injected by bot.py at init time so this layer has no hard dependency on
+# the py-cord client. Use cases:
+#
+# - "What did Cursor just post in the foo build thread?"
+#     -> discord_list_threads("ucs") to find the build thread,
+#        discord_recent_messages("Build: foo (sid)") to read it.
+# - "Catch me up on #ucs while I was away."
+#     -> discord_recent_messages("ucs", limit=30).
+# - "Did anything land in #ucs-alerts overnight?"
+#     -> discord_recent_messages("alerts", limit=50).
+
+async def _discord_recent_messages(channel: str = "ucs", limit: int = 20) -> str:
+    """Return the most recent messages from a Discord text channel or thread.
+
+    `channel` accepts a numeric id, a `<#id>` mention, a channel name
+    (with or without leading `#`), an alias (`ucs`, `alerts`,
+    `spicy-lit`), or a thread name (substring match across active
+    threads). `limit` is clamped to [1, 100]. Messages come back
+    oldest-first so the caller can read them top-to-bottom.
+    """
+    if _discord_history_callback is None:
+        return json.dumps({"error": "Discord history callback not wired."})
+    try:
+        n = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        n = 20
+    try:
+        msgs = await _discord_history_callback(channel, n)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception as exc:
+        log.exception("discord_recent_messages failed for %r", channel)
+        return json.dumps({"error": f"history fetch failed: {exc}"})
+    return json.dumps(
+        {
+            "channel": channel,
+            "count": len(msgs),
+            "messages": msgs,
+        }
+    )
+
+
+async def _discord_list_threads(channel: str = "ucs") -> str:
+    """List active threads under a Discord channel.
+
+    Use to discover build threads (created by Aria's cursor_spawn
+    pipeline) and any other threads under `#ucs` or `#ucs-alerts`. The
+    response includes thread ids and names you can pass back to
+    `discord_recent_messages` to read history.
+    """
+    if _discord_threads_callback is None:
+        return json.dumps({"error": "Discord threads callback not wired."})
+    try:
+        threads = await _discord_threads_callback(channel)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception as exc:
+        log.exception("discord_list_threads failed for %r", channel)
+        return json.dumps({"error": f"threads fetch failed: {exc}"})
+    return json.dumps(
+        {
+            "channel": channel,
+            "count": len(threads),
+            "threads": threads,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # Do with Claude (MCP agent loop)
 # ---------------------------------------------------------------------------
 
@@ -809,6 +1014,14 @@ async def _do_with_claude_legacy(
     # iteration cap by one so a single gate failure can't starve the budget
     # the agent legitimately needed for tool work.
     ground_check_retries = 0
+
+    # Decline accounting — abort early so we don't burn the iteration
+    # budget retrying tier-X/I commands the user is never going to approve.
+    # 42c.pw failure mode: 11 declined execute_command variants × 30 iters
+    # × $7+/iter with no user-facing report.
+    decline_total = 0
+    decline_per_action: dict[str, int] = {}
+    decline_blocker: str | None = None
 
     while iteration < max_iterations + ground_check_retries and not state.cancel:
         iteration += 1
@@ -926,7 +1139,33 @@ async def _do_with_claude_legacy(
                 "deduped": prev_count >= 1,
             })
 
+            if _is_declined_result(result_str):
+                decline_total += 1
+                per_count = decline_per_action.get(dedup_key, 0) + 1
+                decline_per_action[dedup_key] = per_count
+                log.warning(
+                    "tier-X/I declined: %s args=%s (per-action=%d, total=%d) session=%s",
+                    block.name, str(tool_args)[:200], per_count, decline_total,
+                    session_key,
+                )
+                if (
+                    per_count >= _DECLINE_PER_ACTION_ABORT
+                    or decline_total >= _DECLINE_TOTAL_ABORT
+                ):
+                    decline_blocker = _format_decline_blocker(
+                        block.name, tool_args,
+                        _declined_reason(result_str),
+                        per_count, decline_total,
+                    )
+                    break
+
         messages.append({"role": "user", "content": tool_results})
+
+        if decline_blocker is not None:
+            final_status = "declined_abort"
+            if _alert_callback:
+                asyncio.create_task(_alert_callback(decline_blocker))
+            break
 
         if total_output_tokens > max_tokens_budget:
             final_status = "token_budget"
@@ -938,7 +1177,7 @@ async def _do_with_claude_legacy(
 
     if state.cancel:
         final_status = "cancelled"
-    elif final_status != "token_budget":
+    elif final_status not in ("token_budget", "declined_abort"):
         final_status = "iteration_limit"
 
     log_loop_execution(
@@ -960,7 +1199,19 @@ async def _do_with_claude_legacy(
     if state.cancel:
         return "Task cancelled by user."
 
-    partial = f"Task reached iteration limit ({max_iterations}). Partial progress made."
+    if decline_blocker is not None:
+        return decline_blocker
+
+    partial = (
+        f"Task reached iteration limit ({max_iterations}). Partial progress made."
+    )
+    if decline_total > 0:
+        partial += (
+            f"\n\nNote: {decline_total} tier-X/I command(s) were declined "
+            f"during this task — approval was required but never granted. "
+            f"That likely prevented the work from completing. Reply "
+            f"`!ok <action_id>` to the next confirmation card in #ucs-alerts."
+        )
     if _alert_callback:
         asyncio.create_task(_alert_callback(partial))
     return partial
@@ -1344,21 +1595,39 @@ async def _run_osascript(script: str, timeout: float = 6.0) -> tuple[int, str, s
     return proc.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
-def _resolve_cursor_target(project: str | None) -> tuple[str | None, str | None]:
-    """Resolve `project` to (search_substring, registered_path).
+def _resolve_cursor_target(
+    project: str | None,
+    workspace_root: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve (project, workspace_root) to (search_substring, registered_path).
 
-    The substring is what we'll match in window titles. If `project` is in
-    the registry, we use the short name; otherwise we use the basename of
-    the path; otherwise we use the raw string.
+    The substring is what we'll match in Cursor window titles via osascript.
+    The path is the on-disk cwd used for transcript JSONL lookups.
+
+    Resolution order:
+      1. Registered short name (`project in PROJECT_REGISTRY`).
+      2. Absolute path passed as `project` that exists on disk.
+      3. `workspace_root` fallback when `project` is empty or unresolved —
+         use the basename as the title substring and the path verbatim.
+      4. Raw `project` string as substring with no path (osascript can
+         still try to match a title, but tools needing the cwd return
+         "Unknown project").
+
+    Step 3 lets Aria's tool calls succeed when the only handle she has
+    is the `workspace_root` an observer event carried (e.g. ad-hoc
+    Cursor windows that aren't in projects/registry.md).
     """
-    if not project:
-        return None, None
-    if project in PROJECT_REGISTRY:
+    if project and project in PROJECT_REGISTRY:
         return project, PROJECT_REGISTRY[project]
-    import os as _os
-    if "/" in project and _os.path.isdir(project):
-        return _os.path.basename(project.rstrip("/")), project
-    return project, None
+    if project and "/" in project and os.path.isdir(project):
+        return os.path.basename(project.rstrip("/")), project
+    if workspace_root:
+        norm = workspace_root.rstrip("/")
+        if os.path.isdir(norm):
+            return os.path.basename(norm), norm
+    if project:
+        return project, None
+    return None, None
 
 
 async def _list_cursor_windows() -> str:
@@ -1395,22 +1664,36 @@ async def _list_cursor_windows() -> str:
     return json.dumps({"windows": out, "count": len(out)})
 
 
-async def _read_cursor_window(project: str, n_turns: int = 5) -> str:
+async def _read_cursor_window(
+    project: str | None = None,
+    n_turns: int = 5,
+    workspace_root: str | None = None,
+) -> str:
     """Return the last N turns of the most recent transcript for a project,
     plus any plan files modified in the last 10 minutes.
 
-    Project may be a registered name OR an absolute path. Falls back gracefully
-    if Cursor has no data on disk for the project yet.
+    Accepts either a registered project name, an absolute path as `project`,
+    or a `workspace_root` (absolute path). `workspace_root` is the ground
+    truth that Cursor hooks deliver — pass it when you have it (e.g. from
+    a recently paged cursor event) so resolution succeeds even for
+    ad-hoc windows that aren't in projects/registry.md.
+
+    Falls back gracefully if Cursor has no data on disk for the project yet.
     """
     from .cursor_external import read_last_n_turns, list_recent_plans
 
-    _, cwd = _resolve_cursor_target(project)
+    _, cwd = _resolve_cursor_target(project, workspace_root)
     if not cwd:
-        if project.startswith("/"):
+        if project and project.startswith("/"):
             cwd = project
+        elif workspace_root and workspace_root.startswith("/"):
+            cwd = workspace_root
         else:
             return json.dumps({
-                "error": f"Unknown project: {project!r}. Known: {list(PROJECT_REGISTRY.keys())}",
+                "error": (
+                    f"Unknown project: {project!r}. Known: {list(PROJECT_REGISTRY.keys())}. "
+                    "Pass workspace_root with the absolute Cursor cwd if you have it."
+                ),
             })
 
     n = max(1, min(int(n_turns) if n_turns else 5, 25))
@@ -1418,6 +1701,7 @@ async def _read_cursor_window(project: str, n_turns: int = 5) -> str:
     plans = list_recent_plans(max_age_sec=600, limit=5)
     return json.dumps({
         "project": project,
+        "workspace_root": workspace_root or cwd,
         "cwd": cwd,
         "turns_returned": len(turns),
         "turns": turns,

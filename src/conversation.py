@@ -25,12 +25,22 @@ from typing import Literal
 
 log = logging.getLogger(__name__)
 
-Role = Literal["user", "aria", "alert"]
+Role = Literal["user", "aria", "alert", "cursor_event"]
 Medium = Literal["text", "voice"]
 
 _MAX_TURNS = 60
 _MAX_TURN_CHARS = 2000
 _MAX_ALERT_CHARS = 2000
+_MAX_CURSOR_EVENT_CHARS = 4000
+
+# Cap on how many cursor_event turns are surfaced to Claude's per-task
+# context (as_claude_context). The external Cursor observer can fire
+# events every few minutes from each watched workspace; without this
+# cap, an 11KB Cursor-watch firehose drowns out the user's actual
+# request. The 42c.pw failure showed the task body at 11,463 chars with
+# the user's "create an account" request only on the last line.
+# Most-recent-first wins so live context still reaches Aria.
+_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT = 2
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,31 @@ class ConversationBuffer:
                 body = body + " […]"
         self._append(Turn(role="alert", medium="text", channel="#ucs-alerts", text=body))
 
+    def add_cursor_event(self, text: str) -> None:
+        """Record a cursor watch event so Aria can recall it on follow-up.
+
+        Distinct from `add_alert` in two ways:
+
+        1. The role is `cursor_event`, and both `as_claude_context` and
+           `as_gemini_injection` include cursor events by default. They are
+           first-class conversational context — when Corbin asks 'what did
+           Cursor do?' Aria needs them visible regardless of the
+           `include_alerts` flag. Generic alerts (preflight, confirmations)
+           were intentionally hidden to keep them from drowning Claude
+           context with boot-time noise; the cursor watch deserves a
+           separate channel.
+
+        2. The truncation budget is larger (`_MAX_CURSOR_EVENT_CHARS`) so
+           workspace_root, the last transcript turn, and recent plan files
+           survive into Aria's resume context.
+        """
+        body = text.strip()
+        if not body:
+            return
+        if len(body) > _MAX_CURSOR_EVENT_CHARS:
+            body = body[:_MAX_CURSOR_EVENT_CHARS] + " […]"
+        self._append(Turn(role="cursor_event", medium="text", channel="#cursor-watch", text=body))
+
     def _append(self, turn: Turn) -> None:
         body = turn.text.strip()
         if not body:
@@ -106,6 +141,27 @@ class ConversationBuffer:
         if max_turns <= 0:
             return []
         return list(self._turns)[-max_turns:]
+
+    def last_n_turns(self, n: int) -> list[dict]:
+        """Serialize the last N turns as plain dicts for external consumers.
+
+        Used by `CursorExternalObserver`'s `GET /recent_turns` endpoint so
+        out-of-process test harnesses can assert on what Aria actually
+        heard and said. JSON-safe: each entry is {role, medium, channel,
+        text, ts (float seconds since epoch)}.
+        """
+        if n <= 0:
+            return []
+        return [
+            {
+                "role": t.role,
+                "medium": t.medium,
+                "channel": t.channel,
+                "text": t.text,
+                "ts": t.ts,
+            }
+            for t in self.recent(max_turns=n)
+        ]
 
     def as_claude_context(
         self,
@@ -125,10 +181,34 @@ class ConversationBuffer:
         and confirmation pings should not be silently prepended to every
         Claude task. The caller can opt in when the user is plausibly
         asking about an alert (e.g. 'what was that error?').
+
+        Cursor watch events (role `cursor_event`) are always included
+        regardless of `include_alerts`, but capped at
+        `_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT` (most-recent-first). One
+        watched workspace firing every few minutes was crowding the real
+        user request off the bottom of the context window — the 42c.pw
+        failure had the actual ask at char 11,300 of 11,463.
         """
         candidates = self.recent(max_turns + exclude_last + 10)
         if not include_alerts:
             candidates = [t for t in candidates if t.role != "alert"]
+
+        # Cap cursor_event turns *first* so they don't claim slots that
+        # the user's actual messages need. We keep the most recent
+        # `_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT` cursor_events and drop
+        # earlier ones — and only count those when computing the
+        # `max_turns + exclude_last` window so user/aria turns still fit.
+        cursor_events = [t for t in candidates if t.role == "cursor_event"]
+        if len(cursor_events) > _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT:
+            keep_ids = {
+                id(t)
+                for t in cursor_events[-_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT:]
+            }
+            candidates = [
+                t for t in candidates
+                if t.role != "cursor_event" or id(t) in keep_ids
+            ]
+
         turns = candidates[-(max_turns + exclude_last):] if max_turns else []
         if exclude_last:
             turns = turns[:-exclude_last]
@@ -141,8 +221,13 @@ class ConversationBuffer:
                 "user": "User",
                 "aria": "You",
                 "alert": "System alert",
+                "cursor_event": "Cursor watch event",
             }[t.role]
-            modifier = f" (via {t.medium} in {t.channel})" if t.role != "alert" else ""
+            modifier = (
+                f" (via {t.medium} in {t.channel})"
+                if t.role in ("user", "aria")
+                else ""
+            )
             lines.append(f"- {speaker}{modifier}: {t.short()}")
         return "\n".join(lines) + "\n"
 
@@ -159,6 +244,11 @@ class ConversationBuffer:
         context on every `!join` / pause-resume cycle. They are noise to
         the conversational model and re-trigger the very `do_with_claude`
         calls the audit was trying to deduplicate (L15 fix).
+
+        Cursor watch events (role `cursor_event`) are always included
+        regardless of `include_alerts`. A cursor task that finished during
+        the pause must reach Aria on resume; without this it was invisible
+        once the pending-page queue had been drained.
         """
         candidates = self.recent(max_turns + 5)
         if not include_alerts:
@@ -173,6 +263,8 @@ class ConversationBuffer:
                 lines.append(f"User said ({t.medium}, {t.channel}): {t.short()}")
             elif t.role == "aria":
                 lines.append(f"You said ({t.medium}, {t.channel}): {t.short()}")
+            elif t.role == "cursor_event":
+                lines.append(f"Cursor watch event recorded: {t.short()}")
             else:
                 lines.append(f"System alert posted: {t.short()}")
         lines.append("[End context. Continue from where the thread left off.]")

@@ -5,7 +5,7 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test clean fmt audit-idempotency audit-dedup
+.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup
 
 help:
 	@echo "Targets:"
@@ -17,6 +17,7 @@ help:
 	@echo "  deps         - regenerate requirements.txt from pip freeze (drift check)"
 	@echo "  test         - run smoke + deep integration tests"
 	@echo "  anchor-test  - run anchor pressure-test suite (20 tasks, ~5min)"
+	@echo "  e2e-golden   - run unified Aria voice+text golden-path E2E (~10min, ~\$$1-2)"
 	@echo "  fmt          - format Python (ruff)"
 	@echo "  audit-idempotency - AST-check that connect/start/open/join begin with idempotency guard"
 	@echo "  audit-dedup  - scan data/audit.jsonl for duplicate API calls inside 5s windows"
@@ -51,6 +52,14 @@ test:
 
 anchor-test:
 	@$(PYTHON) tests/anchor_suite/run.py
+
+# Primary E2E test going forward — exercises every verbal request type Aria
+# handles through her real voice path against a real bot. Owns the bot
+# lifecycle (kill -> reinstall -> start -> preflight wait -> run -> kill).
+# Requires the operator to be in the #general voice channel so Aria can
+# auto-connect. ~10 min wall time, ~$1-2 in real API calls.
+e2e-golden:
+	@$(PYTHON) scripts/e2e_aria_golden.py
 
 fmt:
 	@$(PYTHON) -m ruff format src/ tests/ 2>/dev/null || echo "ruff not installed"

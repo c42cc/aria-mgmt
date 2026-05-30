@@ -6,6 +6,7 @@ import asyncio
 import collections
 import json
 import logging
+import os
 import time
 from typing import Any, Callable, Coroutine
 
@@ -59,7 +60,12 @@ TOOL_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="cursor_status",
-        description="Get status of all running/waiting Cursor build sessions.",
+        description=(
+            "Compact health summary across the Cursor fleet: registry size, "
+            "agent status counts (running/waiting/finished/errored), SDK source "
+            "counts, active DB sessions, daily spend. For per-agent detail use "
+            "cursor_agents."
+        ),
         parameters=types.Schema(type="OBJECT", properties={}),
     ),
     types.FunctionDeclaration(
@@ -216,146 +222,129 @@ TOOL_DECLARATIONS = [
             required=["text"],
         ),
     ),
+    # ---- Unified Cursor agent surface ---------------------------------------
+    # `agent_id` is the canonical handle. The CursorAgentRegistry routes SDK
+    # agents (Aria-spawned) through the bridge and IDE agents (user-opened)
+    # through osascript automatically. The JSONL tailer keeps state fresh
+    # so follow-up questions ("what did it just say?") have an O(1) answer.
     types.FunctionDeclaration(
-        name="list_cursor_windows",
+        name="cursor_agents",
         description=(
-            "List the titles of every Cursor IDE window currently open on the Mac. "
-            "Use when the user asks what windows are open, or before targeting a specific window. "
-            "Each entry tells you whether its title matches a registered project name."
+            "List every Cursor agent currently visible — IDE windows Corbin "
+            "opened himself and SDK agents you spawned, on equal footing. Each "
+            "entry carries `agent_id` (use it for follow-up calls), `source` "
+            "(sdk|ide), `status`, `last_assistant_text`, and `pending_question`. "
+            "Call this first when Corbin asks what's running."
         ),
         parameters=types.Schema(type="OBJECT", properties={}),
     ),
     types.FunctionDeclaration(
-        name="read_cursor_window",
+        name="cursor_read",
         description=(
-            "Read the most recent transcript turns for a Cursor window/project. "
-            "Use to catch up on what an external Cursor agent is doing or has done — what it said, "
-            "what tools it called, and what plan files were just written. "
-            "Project may be a registered short name or an absolute path."
+            "Read the most recent transcript turns for a Cursor agent identified "
+            "by `agent_id`. Fresh from the registry's live JSONL tailer, with a "
+            "fallback to the on-disk transcript if the tailer hasn't started. "
+            "Includes recent plan files for the workspace."
         ),
         parameters=types.Schema(
             type="OBJECT",
             properties={
-                "project": types.Schema(type="STRING", description="Registered project name (preferred) or absolute project cwd."),
-                "n_turns": types.Schema(type="INTEGER", description="How many recent turns to return (default 5, max 25)."),
+                "agent_id": types.Schema(type="STRING", description="Agent handle from cursor_agents."),
+                "n_turns": types.Schema(type="INTEGER", description="Number of recent turns to return (default 5, max 25)."),
             },
-            required=["project"],
+            required=["agent_id"],
         ),
     ),
     types.FunctionDeclaration(
-        name="list_cursor_plans",
+        name="cursor_send",
         description=(
-            "List plan files written under ~/.cursor/plans/ in the last N minutes. "
-            "Use when the user asks 'is there a new plan?' or 'show me recent plans'."
+            "Universal send to a Cursor agent. Routes by source: SDK agents go "
+            "through the bridge (no osascript, no focus contests); IDE agents go "
+            "through the existing paste-and-send path. Use this instead of the "
+            "legacy send_to_cursor_chat / approve_cursor_plan / reject_cursor_plan. "
+            "`kind` shapes the body: chat (default), new_agent, approve, reject, cancel."
         ),
         parameters=types.Schema(
             type="OBJECT",
             properties={
-                "max_age_minutes": types.Schema(type="INTEGER", description="Plan recency window in minutes (default 60)."),
+                "agent_id": types.Schema(type="STRING", description="Agent handle from cursor_agents."),
+                "message": types.Schema(type="STRING", description="Refined message body (required for chat/new_agent; ignored for approve/reject/cancel unless customizing)."),
+                "kind": types.Schema(type="STRING", description="One of: chat (default), new_agent, approve, reject, cancel."),
+                "note": types.Schema(type="STRING", description="Optional note appended to approve/reject."),
+            },
+            required=["agent_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="cursor_spawn",
+        description=(
+            "Spawn a fresh `@cursor/sdk` agent in `workspace_root` with `instruction`. "
+            "Returns the canonical `agent_id` so you can immediately cursor_send or "
+            "cursor_read it. Prefer this over build_with_cursor for new work — no "
+            "osascript involved, the agent is addressable by handle from the start."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "workspace_root": types.Schema(type="STRING", description="Absolute workspace directory."),
+                "instruction": types.Schema(type="STRING", description="What the agent should do (precise, well-formed prompt)."),
+                "model": types.Schema(type="STRING", description="Optional Cursor model override (defaults to composer-2)."),
+            },
+            required=["workspace_root", "instruction"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="cursor_screenshot",
+        description=(
+            "Screenshot a Cursor IDE window. No-op for SDK agents (they have no window). "
+            "Use to confirm UI state before approving a plan or to inspect an unexpected dialog."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(type="STRING", description="Agent handle from cursor_agents."),
+                "save_path": types.Schema(type="STRING", description="Optional absolute PNG path. Defaults to data/screenshots/."),
+            },
+            required=["agent_id"],
+        ),
+    ),
+    # ---- Discord text history ----------------------------------------------
+    # Read-only windows into Discord channel and thread history. Use to catch
+    # up on what Corbin said, what Cursor build threads logged, what landed
+    # in #ucs-alerts overnight, and so on.
+    types.FunctionDeclaration(
+        name="discord_recent_messages",
+        description=(
+            "Return the most recent messages from a Discord text channel or thread, "
+            "oldest-first. `channel` accepts a numeric id, a channel name (with or "
+            "without `#`), an alias (`ucs` for the text channel, `alerts` for "
+            "#ucs-alerts, `spicy-lit`), or a thread name from discord_list_threads. "
+            "Use this to catch up on history Corbin or Cursor wrote while you "
+            "weren't listening, especially when he asks 'what did Cursor say in the "
+            "build thread?' — call discord_list_threads first to find the thread."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "channel": types.Schema(type="STRING", description="Channel id, name, alias, or thread name. Defaults to 'ucs'."),
+                "limit": types.Schema(type="INTEGER", description="How many recent messages to return (default 20, max 100)."),
             },
         ),
     ),
     types.FunctionDeclaration(
-        name="focus_cursor_window",
+        name="discord_list_threads",
         description=(
-            "Bring a specific Cursor IDE window to the front by matching its title against the project "
-            "name. Must be called before any send_to_cursor_chat / keystroke_to_cursor_window / "
-            "screenshot_cursor_window (those tools focus implicitly, but call this if you want to verify "
-            "the right window was found first)."
+            "List active threads under a parent Discord channel. The default `ucs` "
+            "lists every active thread in the text channel, including build threads "
+            "that Aria's cursor_spawn pipeline creates per SDK agent. Pair with "
+            "discord_recent_messages(channel=<thread_name>) to read a specific "
+            "thread's transcript."
         ),
         parameters=types.Schema(
             type="OBJECT",
             properties={
-                "project": types.Schema(type="STRING", description="Registered project name (preferred) or substring matching the window title."),
+                "channel": types.Schema(type="STRING", description="Parent channel id, name, or alias. Defaults to 'ucs'."),
             },
-            required=["project"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="send_to_cursor_chat",
-        description=(
-            "Type a message into a specific Cursor window and send it. Aria's primary way to "
-            "relay Corbin's spoken instructions into a Cursor agent. With new_agent=True "
-            "(default) opens a fresh agent composer (Cmd+I) and starts a new agent task; "
-            "new_agent=False opens the existing chat sidebar (Cmd+L) for a follow-up. "
-            "Returns ok=True if the keystrokes fired against the focused Cursor window — "
-            "this is NOT proof the agent received them. To confirm the send actually landed, "
-            "wait 8-15 seconds and call read_cursor_window: if you see a new user turn or "
-            "an in-progress assistant turn, it worked. Only retry the send if read_cursor_window "
-            "shows no new turn after the wait. Always translate Corbin's casual voice intent "
-            "into a precise, well-formed prompt before sending."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "project": types.Schema(type="STRING", description="Registered project name or substring matching the window title."),
-                "message": types.Schema(type="STRING", description="The refined, well-formed message to type into the chat input."),
-                "new_agent": types.Schema(type="BOOLEAN", description="True (default) starts a NEW agent task; False sends into the existing chat."),
-            },
-            required=["project", "message"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="keystroke_to_cursor_window",
-        description=(
-            "Escape hatch: send arbitrary keystrokes to a Cursor window after focusing it. "
-            "Use for shortcuts (Cmd+P, Cmd+Shift+L, Esc, etc.) when the dedicated tools don't fit. "
-            "For typing a chat message prefer send_to_cursor_chat."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
-                "keys": types.Schema(type="STRING", description="Literal keystrokes (System Events keystroke argument)."),
-                "modifiers": types.Schema(type="STRING", description="Comma-separated subset of {command, control, option, shift}."),
-            },
-            required=["project", "keys"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="screenshot_cursor_window",
-        description=(
-            "Take a screenshot of a Cursor window for visual context. "
-            "Use when you need to see the current state of a window — plan-mode UI, an error dialog, "
-            "or unexpected layout. Returns the saved PNG path."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
-                "save_path": types.Schema(type="STRING", description="Optional absolute path for the PNG. Defaults to data/screenshots/."),
-            },
-            required=["project"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="approve_cursor_plan",
-        description=(
-            "Approve and proceed on a Cursor plan-mode plan by typing 'Approve and proceed.' into "
-            "the target window's chat. Use after read_cursor_window shows a plan that Corbin verbally OK'd."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
-                "note": types.Schema(type="STRING", description="Optional extra context appended to the approval message."),
-            },
-            required=["project"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="reject_cursor_plan",
-        description=(
-            "Reject a Cursor plan-mode plan by typing 'Stop. Do not proceed with this plan.' Use when "
-            "Corbin verbally vetoes a plan and you need to halt the agent."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "project": types.Schema(type="STRING", description="Registered project name or window-title substring."),
-                "reason": types.Schema(type="STRING", description="Optional reason to communicate to the agent."),
-            },
-            required=["project"],
         ),
     ),
 ]
@@ -393,6 +382,16 @@ class GeminiSession:
         self._audio_out_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
         self._receive_task: asyncio.Task | None = None
         self._connected = False
+
+        # Idle gate: set() means the model is NOT currently producing a turn
+        # (no model_turn parts in-flight, last turn_complete fired). Cleared
+        # when a model_turn arrives, set again on turn_complete or interrupted.
+        # External callers (e.g. /aria_say) use `wait_until_idle()` to avoid
+        # batching their inject into a turn the model is already generating.
+        # Defaults to set so the very first inject after connect doesn't block
+        # forever waiting for a turn that hasn't started yet.
+        self._idle_event: asyncio.Event = asyncio.Event()
+        self._idle_event.set()
 
         self._transcript_buffer: collections.deque[TranscriptEntry] = collections.deque(maxlen=100)
 
@@ -477,6 +476,23 @@ class GeminiSession:
             log.exception("Failed to send audio to Gemini")
             self._connected = False
 
+    async def signal_audio_end(self) -> None:
+        """Signal end of the current user audio stream.
+
+        Production use is rare — the Discord voice path streams continuously
+        and Gemini's automatic VAD detects end-of-turn from silence. This
+        method exists for tests (`scripts/e2e_aria_golden.py --tts` via the
+        observer's /test_voice_in endpoint) that synthesize a finite TTS
+        utterance and then need to deterministically end the user turn so
+        Aria responds without waiting for VAD timeout.
+        """
+        if not self._session or not self._connected:
+            return
+        try:
+            await self._session.send_realtime_input(audio_stream_end=True)
+        except Exception:
+            log.exception("Failed to signal audio_stream_end to Gemini")
+
     async def inject_text(self, text: str, turn_complete: bool = True) -> None:
         """Inject text into the Gemini session context.
 
@@ -492,6 +508,26 @@ class GeminiSession:
             )
         except Exception:
             log.exception("Failed to inject text into Gemini session")
+
+    async def wait_until_idle(self, timeout: float = 15.0) -> bool:
+        """Block until the model is not actively generating a turn.
+
+        Returns True when idle (or we never went non-idle), False on timeout.
+        Use this BEFORE calling `inject_text(..., turn_complete=True)` from
+        an out-of-band path like the /aria_say HTTP endpoint — without it,
+        an inject that arrives mid-turn (e.g. while the voice-join preamble
+        is still being spoken) gets batched into the in-progress generation
+        and never produces its own audible response.
+        """
+        if not self._connected:
+            return True
+        if self._idle_event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._idle_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def get_audio(self) -> bytes:
         """Get the next audio chunk from the output queue."""
@@ -567,9 +603,38 @@ class GeminiSession:
                         return
                     backoff = 1.0
 
+                    # Opt-in debug trace: ARIA_GEMINI_RECV_DEBUG=1 logs every
+                    # Gemini Live message shape. Off by default. Useful for
+                    # diagnosing TTS-driven E2E runs where audio is sent but
+                    # tool calls are missing (e.g. Aria hallucinating instead
+                    # of calling the requested tool).
+                    if os.getenv("ARIA_GEMINI_RECV_DEBUG"):
+                        kinds: list[str] = []
+                        if msg.server_content:
+                            sc_dbg = msg.server_content
+                            if sc_dbg.model_turn:
+                                kinds.append(f"model_turn[parts={len(sc_dbg.model_turn.parts)}]")
+                            if sc_dbg.input_transcription and sc_dbg.input_transcription.text:
+                                kinds.append(f"input_tx[{sc_dbg.input_transcription.text[:40]!r}]")
+                            if sc_dbg.output_transcription and sc_dbg.output_transcription.text:
+                                kinds.append(f"output_tx[{sc_dbg.output_transcription.text[:40]!r}]")
+                            if getattr(sc_dbg, "turn_complete", False):
+                                kinds.append("turn_complete")
+                            if getattr(sc_dbg, "interrupted", False):
+                                kinds.append("interrupted")
+                        if msg.tool_call:
+                            kinds.append(f"tool_call[{len(msg.tool_call.function_calls)} fcs]")
+                        if msg.setup_complete is not None:
+                            kinds.append("setup_complete")
+                        log.info("[recv] %s", ",".join(kinds) or "empty")
+
                     if msg.server_content:
                         sc = msg.server_content
                         if sc.model_turn:
+                            # Model just started (or is still) generating a
+                            # turn — gate any defer-aware injectors out
+                            # until turn_complete fires below.
+                            self._idle_event.clear()
                             for part in sc.model_turn.parts:
                                 if part.inline_data and part.inline_data.data:
                                     try:
@@ -601,6 +666,7 @@ class GeminiSession:
 
                         if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
                             await self._flush_turn_accumulators()
+                            self._idle_event.set()
 
                     elif msg.tool_call:
                         seen_in_turn: set[str] = set()
@@ -758,7 +824,19 @@ class GeminiSession:
         """Internal close. Caller must hold _lifecycle_lock."""
         if not self._connected and not self._session and not self._session_ctx:
             return
-        self._connected = False
+        # If a tier-X/I confirmation is pending, the receive loop still
+        # needs to read a confirm_action function call before we can
+        # safely close. Setting _connected=False up front would drop
+        # that incoming function call on the floor and force the
+        # confirmation to time out → declined. Defer the flip until
+        # after the in-flight wait below, when confirmations are
+        # explicitly accounted for.
+        had_pending_confirmations = bool(self._pending_confirmations)
+        if not had_pending_confirmations:
+            self._connected = False
+        # Release anyone awaiting wait_until_idle so they don't hang past
+        # session teardown.
+        self._idle_event.set()
         try:
             await self._flush_turn_accumulators()
         except Exception:
@@ -766,22 +844,64 @@ class GeminiSession:
 
         # Wait briefly for in-flight tool dispatches to finish so their
         # results can be sent back to Gemini before the session closes.
-        # Bounded by 5s — beyond that we accept orphan-tool-result loss
-        # and surface it via orphan_callback. Without this wait, every
-        # in-flight tool at close time becomes a silent loss (L1).
+        # Bounded by 5s normally — beyond that we accept orphan-tool-
+        # result loss and surface it via orphan_callback. Without this
+        # wait, every in-flight tool at close time becomes a silent
+        # loss (L1).
+        #
+        # Pending tier-X/I confirmations extend the wait to ~65s — they
+        # are bounded by the 60s wait_for_confirmation timeout, plus a
+        # small margin for the close path itself. Without this, a
+        # premature close (e.g. from the idle watchdog) would race the
+        # confirmation window and turn every text-initiated tier-X tool
+        # into a declined timeout.
         in_flight = {t for t in self._dispatch_tasks if not t.done()}
-        if in_flight:
-            log.info(
-                "Waiting up to 5s for %d in-flight tool dispatch(es) before close",
-                len(in_flight),
-            )
-            done, pending = await asyncio.wait(in_flight, timeout=5.0)
-            for t in pending:
-                log.error(
-                    "Tool dispatch did not finish within close window — cancelling. "
-                    "Side effect may have completed without a model-visible response."
+        close_grace = 65.0 if had_pending_confirmations else 5.0
+        if in_flight or had_pending_confirmations:
+            if in_flight:
+                log.info(
+                    "Waiting up to %.0fs for %d in-flight tool dispatch(es) before close%s",
+                    close_grace, len(in_flight),
+                    " (pending confirmations)" if had_pending_confirmations else "",
                 )
-                t.cancel()
+            elif had_pending_confirmations:
+                log.info(
+                    "Waiting up to %.0fs for %d pending tier-X/I confirmation(s) before close",
+                    close_grace, len(self._pending_confirmations),
+                )
+            # We may also need to wait on bare pending-confirmation
+            # events even when no dispatch task is in flight (the loop
+            # awaits the event directly).
+            confirm_tasks: set[asyncio.Task] = {
+                asyncio.create_task(ev.wait(), name=f"close_wait_confirm_{aid}")
+                for aid, ev in self._pending_confirmations.items()
+                if not ev.is_set()
+            }
+            try:
+                wait_set = in_flight | confirm_tasks
+                if wait_set:
+                    _, pending_after = await asyncio.wait(
+                        wait_set, timeout=close_grace
+                    )
+                else:
+                    pending_after = set()
+            finally:
+                for t in confirm_tasks:
+                    if not t.done():
+                        t.cancel()
+            for t in pending_after:
+                if t in in_flight:
+                    log.error(
+                        "Tool dispatch did not finish within close window — cancelling. "
+                        "Side effect may have completed without a model-visible response."
+                    )
+                    t.cancel()
+            # Now flip _connected so the receive loop and tool senders
+            # observe the close.
+            self._connected = False
+        # Always ensure _connected is False from here on; covers the
+        # path where there were no in-flight tasks at all.
+        self._connected = False
 
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()

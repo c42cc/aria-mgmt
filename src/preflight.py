@@ -220,10 +220,34 @@ async def probe_mcp_apple_calendar(mcp_client: Any) -> tuple[bool, str, str, str
     A1: explicitly checks for the `write-only` mode that produced 21 audit
     hits between 2026-05-12 and 2026-05-16 without ever turning into a
     preflight failure. The string is canonical in mcp-macos output.
+
+    Args: the mcp-macos package collapsed every calendar verb into a single
+    tool gated by `action`. Calling with `{}` produces an arg-schema
+    violation. We pass `action: "list"` (the read-only variant) and fall
+    back to schema introspection if the default value is rejected by a
+    future schema bump.
     """
     if mcp_client is None or "apple" not in mcp_client._servers:
         return False, "apple MCP not running", "ops/bootstrap.sh", ""
-    result = await mcp_client.call_tool("calendar_calendars", {})
+
+    args = {"action": "list"}
+    schema = (mcp_client._tools.get("calendar_calendars") or {}).get("input_schema") or {}
+    enum_values: list[str] = []
+    try:
+        action_prop = (schema.get("properties") or {}).get("action") or {}
+        enum_values = list(action_prop.get("enum") or [])
+        if enum_values and "list" not in enum_values:
+            # Schema bumped — pick a read-like verb if any, else first value.
+            for candidate in ("list", "read", "get", "fetch", "all"):
+                if candidate in enum_values:
+                    args = {"action": candidate}
+                    break
+            else:
+                args = {"action": enum_values[0]}
+    except Exception:
+        pass
+
+    result = await mcp_client.call_tool("calendar_calendars", args)
     text = str(result)
     lower = text.lower()
     if "EventKitCLI binary not found" in text:
@@ -247,9 +271,12 @@ async def probe_mcp_apple_calendar(mcp_client: Any) -> tuple[bool, str, str, str
             "bash ops/grant_permissions.sh",
             text[:200],
         )
+    if "arg-schema violation" in lower or "missing required argument" in lower:
+        hint = f"valid action values: {enum_values}" if enum_values else "inspect calendar_calendars input_schema"
+        return False, "calendar_calendars rejected our args", hint, text[:300]
     if "error" in lower[:40] or "failed" in lower[:40]:
         return False, "calendar_calendars call failed", "", text[:300]
-    return True, "", "", f"got {text[:120]!r}"
+    return True, "", "", f"action={args['action']!r} got {text[:100]!r}"
 
 
 async def probe_mcp_time(mcp_client: Any) -> tuple[bool, str, str, str]:

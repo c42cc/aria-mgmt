@@ -55,6 +55,15 @@ class Config:
     cursor_event_port: int = int(os.getenv("UCS_CURSOR_EVENT_PORT", "8731"))
     cursor_dm_pager_enabled: bool = os.getenv("UCS_CURSOR_DM_PAGER_ENABLED", "true").lower() == "true"
 
+    # Lurk-in-voice: when true, the voice sidecar stays connected to the
+    # voice channel after the authorized user leaves (Gemini and audio
+    # pipelines are torn down; only the WebSocket persists). This kills the
+    # "bling-bling" double join sound the user otherwise hears on every
+    # rejoin (one Discord notification for their join, one for the bot's
+    # auto-join 700ms later) at the cost of the bot looking permanently
+    # present in the channel. Off by default — opt-in.
+    aria_lurk_in_voice: bool = os.getenv("ARIA_LURK_IN_VOICE", "false").lower() == "true"
+
     # Paths
     data_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     prompts_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")
