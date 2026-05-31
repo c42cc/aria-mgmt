@@ -424,6 +424,43 @@ async def post_to_alerts(content: str, *, silent: bool = False) -> None:
     conversation.add_alert(content)
 
 
+async def _emit_progress_to_user(text: str, session_key: str = "") -> None:
+    """Progress-spine sink injected into tools.init_tools.
+
+    A per-tool step is incidental detail, not a finished answer. It goes to
+    #ucs-alerts — the catch-all — and is kept OUT of #ucs and the other
+    channels, which carry only consolidated, quality results. The step is
+    tagged with its originating channel so concurrent tasks stay legible in
+    the shared catch-all, and also fed to a connected Gemini voice session
+    as background context so Aria narrates "still working" coherently and
+    the session stays warm.
+
+    Strictly non-fatal. Posted directly (not via post_to_alerts) so it is
+    never recorded in the conversation buffer — that is reserved for real
+    turns, not tool-by-tool narration that would drown out Claude/Gemini
+    context on the next request.
+    """
+    origin = ""
+    try:
+        if session_key and str(session_key).isdigit():
+            src = bot.get_channel(int(session_key))
+            if src is not None:
+                origin = f"[#{getattr(src, 'name', session_key)}] "
+    except Exception:
+        origin = ""
+    try:
+        alerts = bot.get_channel(int(config.discord_log_channel_id))
+        if alerts is not None:
+            await alerts.send(f"{origin}{text}", silent=True)
+    except Exception:
+        log.debug("progress post failed (non-fatal)", exc_info=True)
+    try:
+        if gemini and gemini.connected:
+            await gemini.inject_text(f"[progress] {text}", turn_complete=False)
+    except Exception:
+        log.debug("progress voice inject failed (non-fatal)", exc_info=True)
+
+
 async def _post_confirmation_card(
     action_id: str, tool_name: str, summary: str
 ) -> discord.Message | None:
@@ -459,6 +496,117 @@ async def _post_confirmation_card(
     except Exception:
         log.debug("Could not prime confirmation reactions (non-fatal)", exc_info=True)
     return message
+
+
+async def _post_proposal_card(
+    action_id: str, title: str, why: str, task: str
+) -> discord.Message | None:
+    """Post a tap-to-approve 'recommended approach' card to #ucs-alerts.
+
+    Distinct wording from the tier-X/I confirmation card: this is a positive
+    recommendation Corbin opts INTO, not a gate on something already decided.
+    Primes the same check/cross reactions the reaction handler resolves.
+    """
+    # @mention so it buzzes the phone via #ucs-alerts (Corbin's DMs are off,
+    # so the alerts channel is the real notification surface).
+    mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
+    mention = f"<@{mention_id}> " if mention_id else ""
+    body = (
+        f"{mention}**Recommended approach** (id `{action_id}`)\n"
+        f"**{title}**\n"
+        + (f"{why}\n" if why else "")
+        + f"\n_What I'll do on approval:_ {task[:400]}\n\n"
+        f"Tap \u2705 to run it autonomously, or \u274c to skip "
+        f"(or reply `!ok {action_id}` / `!no {action_id}`)."
+    )
+    ch = bot.get_channel(int(config.discord_log_channel_id))
+    if not ch:
+        log.error("Alert channel not found — cannot post proposal card")
+        return None
+    try:
+        message = await ch.send(body)
+    except Exception:
+        log.exception("Failed to post proposal card")
+        return None
+    conversation.add_alert(body)
+    try:
+        await message.add_reaction("\u2705")
+        await message.add_reaction("\u274c")
+    except Exception:
+        log.debug("Could not prime proposal reactions (non-fatal)", exc_info=True)
+    return message
+
+
+async def _await_and_run_proposal(
+    action_id: str, title: str, task: str, session_key: str
+) -> None:
+    """Wait for Corbin to approve a proposal, then run it autonomously."""
+    try:
+        res = await _discord_wait_for_confirmation(
+            action_id, timeout=config.proposal_timeout_sec
+        )
+    finally:
+        _unregister_pending_confirmation(action_id)
+
+    if not res.get("approved"):
+        note = "expired (no tap in time)" if res.get("timeout") else "skipped"
+        await post_to_alerts(f"Recommendation **{title}** {note}.", silent=True)
+        return
+
+    await post_to_alerts(f"Approved \u2014 running **{title}** now.", silent=True)
+    from .tools import handle_tool_call
+    try:
+        result = await handle_tool_call(
+            "do_with_claude",
+            {"task": task, "session_key": session_key or f"proposal:{action_id}"},
+        )
+    except Exception:
+        log.exception("Proposal execution failed for %s", action_id)
+        await post_to_alerts(f"Recommendation **{title}** hit an error while running \u2014 see logs.")
+        return
+    try:
+        await post_to_text(f"**{title}** \u2014 done.\n\n{result}")
+    except Exception:
+        log.exception("Failed to post proposal result")
+
+
+async def _propose_action(
+    title: str, why: str = "", task: str = "", session_key: str = ""
+) -> dict:
+    """Push Corbin a one-tap recommendation; on approval run `task` autonomously.
+
+    Non-blocking: posts the card + a phone DM, spawns the wait/run task, and
+    returns an ack immediately so the caller's loop is never held open.
+    """
+    import uuid
+    action_id = str(uuid.uuid4())[:8]
+    pending = _register_pending_confirmation(action_id, "propose_action", title)
+
+    card = await _post_proposal_card(action_id, title, why, task)
+    if card is not None:
+        pending.message_id = card.id
+        _confirmation_message_index[card.id] = action_id
+
+    # Buzz the phone with the decision + context.
+    try:
+        await _dm_authorized_user(
+            f"**Recommended: {title}**\n"
+            + (f"{why}\n" if why else "")
+            + f"Tap \u2705 in #ucs-alerts (or reply `!ok {action_id}`) and I'll run it."
+        )
+    except Exception:
+        log.debug("proposal DM buzz failed (non-fatal)", exc_info=True)
+
+    asyncio.create_task(
+        _await_and_run_proposal(action_id, title, task, session_key),
+        name=f"proposal_{action_id}",
+    )
+    return {
+        "ok": True,
+        "proposed": title,
+        "action_id": action_id,
+        "note": "Pushed to your phone; I'll run it the moment you approve.",
+    }
 
 
 async def _mirror_to_voice_chat(prefix: str, text: str) -> None:
@@ -745,11 +893,31 @@ async def _on_voice_audio(pcm: bytes) -> None:
 
 
 async def _drain_gemini_to_voice(session: GeminiSession) -> None:
-    """Drain Gemini's 24kHz mono audio output and stream it to the voice sidecar."""
+    """Drain Gemini's 24kHz mono audio output and stream it to the voice sidecar.
+
+    Resilient to the in-loop reconnect path (gemini_session._receive_loop flips
+    `connected` False->True on a mid-session error). A single transient error or
+    a brief disconnect window must not permanently kill audio: we only exit if
+    the session stays down past a short grace period (a real pause/close, which
+    also cancels this task via _cancel_audio_tasks()).
+    """
     try:
-        while session.connected:
-            pcm = await session.get_audio()
-            await voice_bridge.send_audio(pcm)
+        while True:
+            if not session.connected:
+                disconnected_since = time.monotonic()
+                while not session.connected:
+                    await asyncio.sleep(0.2)
+                    if time.monotonic() - disconnected_since > 3.0:
+                        return
+                continue
+            try:
+                pcm = await session.get_audio()
+                await voice_bridge.send_audio(pcm)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Gemini -> voice drain transient error; continuing", exc_info=True)
+                await asyncio.sleep(0.1)
     except asyncio.CancelledError:
         pass
     except Exception:
@@ -1235,16 +1403,21 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
     agent = evt.agent
     mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
     mention = f"<@{mention_id}> " if mention_id else ""
-    lines = [f"{mention}**{evt.reason}**"]
-    lines.append(f"`{agent.workspace_root}`")
+    project = (agent.workspace_root or "").rstrip("/").split("/")[-1] or agent.workspace_root
+    lines = [f"{mention}**{evt.reason}** \u2014 _{project}_"]
     if agent.pending_question:
-        lines.append(f"Question: {agent.pending_question[:300]}")
+        lines.append(f"It's asking: {agent.pending_question[:300]}")
     elif agent.last_assistant_text:
         snippet = agent.last_assistant_text[:300].replace("\n", " ")
         lines.append(f"Latest: {snippet}")
-    lines.append(
-        "Join voice to debrief, or send a follow-up via cursor_send."
-    )
+    # Decision-oriented tail: tell Corbin what he can actually do about it,
+    # rather than a generic "join voice". Context > noise.
+    if agent.pending_question:
+        lines.append("\u2192 Reply here with the answer and I'll relay it, or say it in voice.")
+    elif evt.kind in ("error", "errored", "failed"):
+        lines.append("\u2192 Looks stuck. Reply 'fix it' and I'll investigate + propose an approach to approve.")
+    else:
+        lines.append("\u2192 Reply for a 1-line debrief, or ignore \u2014 I'll keep watching and only ping when it matters.")
     return "\n".join(lines)
 
 
@@ -1343,14 +1516,12 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
         # surface this event so she can debrief verbally.
 
     if evt.severity == "high" and not dm_landed:
-        mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
-        mention = f"<@{mention_id}> " if mention_id else ""
-        loud_line = (
-            f"{mention}{audit_line}\n"
-            f"_(DM didn't land — likely DMs disabled. Join voice to debrief, "
-            f"or set UCS_CURSOR_DM_PAGER_ENABLED=false to silence this rung entirely.)_"
-        )
-        await _safe_post(loud_line, silent=False)
+        # DMs didn't land (Corbin keeps them off), so #ucs-alerts is the real
+        # phone channel. Post the full decision-oriented body — it already
+        # @mentions to buzz — instead of a terse audit one-liner. This is the
+        # difference between "useless ping" and "here's what happened + what I
+        # can do about it."
+        await _safe_post(_format_registry_dm(evt), silent=False)
     else:
         await _safe_post(audit_line, silent=True)
 
@@ -1481,6 +1652,8 @@ async def on_ready():
             reconnect_callback=_gemini_reconnect,
             discord_history_callback=_fetch_discord_history,
             discord_threads_callback=_fetch_discord_threads,
+            progress_callback=_emit_progress_to_user,
+            propose_callback=_propose_action,
         )
 
         await cursor_bridge.start()
@@ -1591,7 +1764,7 @@ async def on_ready():
             log.exception("External Cursor observer failed to start")
             cursor_observer = None
 
-        from .preflight import run_all, format_report
+        from .preflight import run_all, format_report, format_summary
         report = await run_all(
             mcp_client=mcp,
             cursor_bridge=cursor_bridge,
@@ -1603,9 +1776,17 @@ async def on_ready():
         _last_preflight_report = report
         _preflight_passed = report.ok
 
+        # Quiet-when-healthy: the full per-probe report is a wall of text that
+        # spammed #ucs-alerts on every launch. Post the wall only when a
+        # CRITICAL probe failed (the user must act); otherwise a one-line
+        # summary. The full report always goes to the logs.
         formatted = format_report(report, markdown=True)
+        log.info("Preflight report:\n%s", formatted)
         try:
-            await post_to_alerts(formatted)
+            if report.ok:
+                await post_to_alerts(format_summary(report, markdown=True), silent=True)
+            else:
+                await post_to_alerts(formatted)
         except Exception:
             log.exception("Failed to post preflight report to alerts channel")
 
@@ -1970,8 +2151,8 @@ async def _run_ask(channel, message: str) -> None:
     # Status acknowledgement: silent so the user doesn't get a ding for a
     # placeholder. The real answer below is the message that should notify.
     await channel.send(
-        "Working on it... (any approvals will land in #ucs-alerts — "
-        "reply `!ok <action_id>` to confirm).",
+        "Working on it... (live steps and any approvals land in #ucs-alerts — "
+        "reply `!ok <action_id>` to confirm; the result comes back here).",
         silent=True,
     )
     from .tools import handle_tool_call
@@ -2057,8 +2238,9 @@ async def _handle_text_conversation(message: discord.Message) -> None:
         if len(ack_preview) > 120:
             ack_preview = ack_preview[:120] + "…"
         await message.channel.send(
-            f"On it — working on: \"{ack_preview}\". Confirmations (if any) "
-            f"will land in #ucs-alerts; reply `!ok <action_id>` to approve.",
+            f"On it — working on: \"{ack_preview}\". Live steps and any "
+            f"approval prompts land in #ucs-alerts; the finished result "
+            f"comes back here. Reply `!ok <action_id>` to approve.",
             silent=True,
         )
     except Exception:

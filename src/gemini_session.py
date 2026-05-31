@@ -70,7 +70,7 @@ TOOL_DECLARATIONS = [
     ),
     types.FunctionDeclaration(
         name="do_with_claude",
-        description="Execute a complex multi-step task using Claude Opus 4.6 with tool access. Use for email, calendar, file management, research, or any non-coding task that requires reasoning and actions.",
+        description="Execute a complex multi-step task using Claude Opus 4.6 with tool access. Use for email, calendar, file management, research, sending iMessages, looking up contacts, or any non-coding task that requires reasoning and actions. For a compound request like 'make an account for X and text them', hand the whole thing to do_with_claude — it can create the 42c.pw account, look up the contact, read prior texts, and send the message in one go.",
         parameters=types.Schema(
             type="OBJECT",
             properties={
@@ -78,6 +78,40 @@ TOOL_DECLARATIONS = [
                 "session_key": types.Schema(type="STRING", description="Discord thread ID."),
             },
             required=["task", "session_key"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="create_42c_account",
+        description="Create a login account on the 42c.pw website (shared HTTP Basic Auth) so someone can see what Corbin is working on. Adds the credential and redeploys so it goes live (~1-2 min), then returns the login URL plus the username and password to share. Use only for a standalone 'make an account for X' request; for 'make an account AND text them', route to do_with_claude instead so it does both.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "username": types.Schema(type="STRING", description="The account username/login (a short handle)."),
+                "password": types.Schema(type="STRING", description="The account password."),
+                "label": types.Schema(type="STRING", description="Optional note about who it's for, e.g. the person's name."),
+            },
+            required=["username", "password"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="propose_action",
+        description=(
+            "Recommend a consequential approach to Corbin that he approves with ONE tap, "
+            "then it runs autonomously with no further per-command confirmation. Use this "
+            "instead of doing big/expensive/destructive/ambiguous things unannounced, and "
+            "instead of asking him to confirm individual commands. For small or clearly-"
+            "intended actions, just do them — don't propose. The proposal is pushed to his "
+            "phone; you get an immediate ack and it runs when he approves."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "title": types.Schema(type="STRING", description="Short name of the recommended approach."),
+                "why": types.Schema(type="STRING", description="1-2 sentences of context: what's going on and why this is the move."),
+                "task": types.Schema(type="STRING", description="The full task to execute autonomously on approval."),
+                "session_key": types.Schema(type="STRING", description="Discord thread/channel id."),
+            },
+            required=["title", "task"],
         ),
     ),
     types.FunctionDeclaration(

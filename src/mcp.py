@@ -241,6 +241,66 @@ def _typed_error(cls: str, message: str, raw: str) -> str:
     })
 
 
+def _extract_tool_text(result: Any) -> str:
+    """Extract the model/user-facing text from an MCP CallToolResult.
+
+    This is the single extraction chokepoint for every MCP-backed action.
+    The SDK returns `result.content` as a list of typed content blocks
+    (TextContent, ImageContent, AudioContent, EmbeddedResource,
+    ResourceLink). The payload Aria needs is each text block's `.text`.
+
+    The prior `str(result.content)` emitted the Python *repr* of that list —
+    `[TextContent(type='text', text='...', annotations=None, meta=None)]` —
+    leaking the `annotations=None, meta=None` nulls and the `TextContent(...)`
+    wrapper into the audit log, the agent loop's view of every result, and
+    (via quick_email_check / quick_calendar) straight into Aria's voice
+    readout. One repr at the root polluted every channel.
+
+    Non-text blocks become explicit, compact markers so nothing is silently
+    dropped. An unrecognised block type is logged loudly (not swallowed) and
+    rendered as a typed marker rather than repr-dumped — there is no silent
+    fallback to `str()`.
+    """
+    content = getattr(result, "content", None)
+    if content is None:
+        structured = getattr(result, "structuredContent", None)
+        if structured is not None:
+            return json.dumps(structured, default=str)
+        raise RuntimeError(
+            "MCP CallToolResult has neither content nor structuredContent — "
+            "cannot extract a tool result"
+        )
+
+    parts: list[str] = []
+    for block in content:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            parts.append(block.text)
+        elif btype == "image":
+            parts.append(f"[image: {getattr(block, 'mimeType', 'image')}]")
+        elif btype == "audio":
+            parts.append(f"[audio: {getattr(block, 'mimeType', 'audio')}]")
+        elif btype == "resource_link":
+            parts.append(f"[resource_link: {getattr(block, 'uri', '')}]")
+        elif btype == "resource":
+            res = getattr(block, "resource", None)
+            text = getattr(res, "text", None)
+            if text is not None:
+                parts.append(text)
+            else:
+                marker = f"[resource: {getattr(res, 'uri', '')} {getattr(res, 'mimeType', '')}]"
+                parts.append(marker.strip())
+        else:
+            log.warning("MCP returned unrecognised content block type=%r", btype)
+            parts.append(f"[unsupported content block: type={btype}]")
+
+    if not parts:
+        structured = getattr(result, "structuredContent", None)
+        if structured is not None:
+            return json.dumps(structured, default=str)
+    return "\n".join(parts)
+
+
 def _validate_args_against_schema(args: dict, schema: dict) -> str | None:
     """Light JSON-Schema check for the dimensions Aria most often gets wrong.
 
@@ -502,7 +562,11 @@ class MCPClient:
         tier = _classify_tier(server_name, tool_name)
         confirmed = None
 
-        if tier in ("I", "X") and self._confirm_callback:
+        # Per-command confirmation is OFF by default (Corbin's call): tier-I/X
+        # tools run autonomously and the audit log records them. Human approval
+        # lives at the approach level via propose_action, not per command. Set
+        # CONFIRM_RISKY_TOOLS=true to restore the per-command gate.
+        if tier in ("I", "X") and config.confirm_risky_tools and self._confirm_callback:
             import uuid
             action_id = str(uuid.uuid4())[:8]
             summary = f"{tool_name}({json.dumps(args)[:200]})"
@@ -528,11 +592,16 @@ class MCPClient:
                     "user declined",
                 )
             confirmed = True
+        elif tier in ("I", "X"):
+            log.info(
+                "tier-%s tool '%s' executing autonomously (per-command confirm off; audited)",
+                tier, tool_name,
+            )
 
         try:
             wire_name = self._original_names.get(tool_name, tool_name)
             result = await session.call_tool(wire_name, args)
-            result_text = str(result.content) if hasattr(result, "content") else str(result)
+            result_text = _extract_tool_text(result)
             _audit_log(server_name, tool_name, args, result_text[:1_000_000], tier, confirmed, session_key)
 
             # P2(c) — typed error classification on the success path. Some

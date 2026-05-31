@@ -43,6 +43,12 @@ class Config:
     per_session_cursor_runs_max: int = int(os.getenv("PER_SESSION_CURSOR_RUNS_MAX", "5"))
     do_with_claude_max_iterations: int = int(os.getenv("DO_WITH_CLAUDE_MAX_ITERATIONS", "30"))
 
+    # Wall-clock bound on each Anthropic request inside the agent loop. Without
+    # this the SDK default (600s timeout x 2 retries) lets one hung request
+    # stall the whole loop for ~20 minutes with no feedback. With it, the loop's
+    # worst case is iterations * timeout, and a stuck call fails loudly instead.
+    anthropic_timeout_sec: float = float(os.getenv("ANTHROPIC_TIMEOUT_SEC", "120"))
+
     # SpicyLit / Grok
     grok_api_key: str = os.getenv("GROK_API_KEY", "")
     discord_spicylit_channel_id: str = os.getenv("DISCORD_SPICYLIT_CHANNEL_ID", "")
@@ -63,6 +69,30 @@ class Config:
     # auto-join 700ms later) at the cost of the bot looking permanently
     # present in the channel. Off by default — opt-in.
     aria_lurk_in_voice: bool = os.getenv("ARIA_LURK_IN_VOICE", "false").lower() == "true"
+
+    # Approvals model. Corbin opted OUT of per-command confirmation: tier-I
+    # (irreversible) and tier-X (executable) MCP tools execute autonomously and
+    # are still recorded in data/audit.jsonl (the ground-truth record of what
+    # fired). Set CONFIRM_RISKY_TOOLS=true to restore the per-command gate.
+    # Human taps belong on high-level *approaches* (propose_action), not on
+    # every individual command.
+    confirm_risky_tools: bool = os.getenv("CONFIRM_RISKY_TOOLS", "false").lower() == "true"
+    # How long a propose_action recommendation waits for a tap before expiring.
+    proposal_timeout_sec: float = float(os.getenv("PROPOSAL_TIMEOUT_SEC", "1800"))
+
+    # 42c.pw account provisioning. 42c.pw is gated by shared HTTP Basic Auth on
+    # the alive-river Fly app; "creating an account" = upserting a credential
+    # into c42_public/.htpasswd and redeploying so the new login goes live.
+    # create_42c_account encapsulates that as one deterministic tool so Aria
+    # never improvises htpasswd/openssl shell commands (the 42c.pw failure).
+    c42_public_dir: str = os.getenv(
+        "C42_PUBLIC_DIR",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "c42_public"
+        ),
+    )
+    c42_url: str = os.getenv("C42_URL", "https://42c.pw/")
+    c42_deploy_timeout_sec: float = float(os.getenv("C42_DEPLOY_TIMEOUT_SEC", "360"))
 
     # Paths
     data_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")

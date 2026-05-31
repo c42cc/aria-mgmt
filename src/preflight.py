@@ -873,6 +873,158 @@ async def run_all(
         )
 
 
+async def probe_ffmpeg() -> tuple[bool, str, str, str]:
+    """ffmpeg is on PATH — the voice sidecar needs it to (down/up)sample audio.
+
+    Without it the discord.js bridge's prism-media pipeline fails and Aria can
+    neither hear nor speak, with no other visible error. There was no probe for
+    this before, so a missing ffmpeg looked like a mysterious 'voice is broken'.
+    """
+    import shutil
+    path = shutil.which("ffmpeg")
+    if not path:
+        return (
+            False,
+            "ffmpeg not found on PATH — voice audio (down/upsample) will fail",
+            "brew install ffmpeg",
+            "",
+        )
+    return True, "", "", path
+
+
+async def probe_authorized_voice_user() -> tuple[bool, str, str, str]:
+    """AUTHORIZED_VOICE_USER_ID is set and numeric.
+
+    The sidecar drops audio from every other speaker. If this is empty, every
+    speaker is forwarded; if it's wrong, Corbin's own audio is silently dropped
+    and 'voice conversation doesn't work' with no error surfaced.
+    """
+    from .config import config
+    val = (config.authorized_voice_user_id or "").strip()
+    if not val:
+        return (
+            False,
+            "AUTHORIZED_VOICE_USER_ID not set — voice frames are unfiltered",
+            "Set AUTHORIZED_VOICE_USER_ID=<your numeric Discord user id> in .env",
+            "",
+        )
+    if not val.isdigit():
+        return (
+            False,
+            f"AUTHORIZED_VOICE_USER_ID is not numeric: {val!r}",
+            "Set AUTHORIZED_VOICE_USER_ID to your numeric Discord user id in .env",
+            "",
+        )
+    return True, "", "", f"id={val[:4]}\u2026"
+
+
+async def probe_messages_fda() -> tuple[bool, str, str, str]:
+    """Full Disk Access: the Messages chat.db is readable.
+
+    Reading prior iMessages to personalize a message requires FDA for the host
+    process. (Sending also needs Automation permission for Messages, which
+    can't be probed non-interactively — noted in the fix hint.)
+    """
+    db = os.path.expanduser("~/Library/Messages/chat.db")
+    if not os.path.exists(db):
+        return True, "", "", "no chat.db (Messages not configured) — skipped"
+    try:
+        with open(db, "rb") as f:
+            f.read(16)
+    except PermissionError:
+        return (
+            False,
+            "chat.db not readable — Full Disk Access missing; iMessage reads will fail",
+            "System Settings > Privacy & Security > Full Disk Access > enable Aria's host (Terminal/Python)",
+            "",
+        )
+    except Exception as exc:
+        return False, f"chat.db read error: {exc}", "", ""
+    return True, "", "", "chat.db readable"
+
+
+async def probe_messages_send() -> tuple[bool, str, str, str]:
+    """Messages SEND automation: does Python hold the macOS Automation grant
+    to control Messages (com.apple.MobileSMS)?
+
+    Reading iMessages uses Full Disk Access (probe_messages_fda). SENDING uses
+    AppleScript automation — a SEPARATE TCC permission. Without it a send hangs
+    and times out ("Messages did not respond in time") instead of erroring
+    cleanly, which is exactly how "text my friend" silently fails. We read the
+    user TCC.db directly (no interactive prompt) so this never blocks boot but
+    tells the user precisely why outbound texts won't send.
+    """
+    import sqlite3
+    tcc = os.path.expanduser("~/Library/Application Support/com.apple.TCC/TCC.db")
+    if not os.path.exists(tcc):
+        return True, "", "", "no user TCC.db — skipped"
+    fix = (
+        "Grant Automation > Messages to the bot's Python: System Settings > "
+        "Privacy & Security > Automation. The entry appears after the first send "
+        "attempt — approve that one-time prompt (do it while at the Mac). SIP "
+        "prevents pre-granting it programmatically."
+    )
+    try:
+        con = sqlite3.connect(f"file:{tcc}?mode=ro&immutable=1", uri=True)
+        rows = con.execute(
+            "select client, auth_value from access "
+            "where service='kTCCServiceAppleEvents' "
+            "and indirect_object_identifier='com.apple.MobileSMS'"
+        ).fetchall()
+        con.close()
+    except Exception as exc:
+        return True, "", "", f"TCC.db unreadable ({exc}) — cannot verify, skipped"
+    py = [(c, a) for (c, a) in rows if "python" in (c or "").lower()]
+    if any(a in (2, 3) for _c, a in py):
+        return True, "", "", "Messages automation granted"
+    if py:
+        return False, "Messages send automation DENIED for Python", fix, str(py[:2])
+    return (
+        False,
+        "Messages send automation not yet granted for Python — outbound iMessages will time out",
+        fix,
+        "",
+    )
+
+
+async def probe_contacts() -> tuple[bool, str, str, str]:
+    """Contacts automation: does Python hold the Automation grant to control
+    Contacts (com.apple.AddressBook)? Resolving a name -> phone/handle uses
+    AppleScript automation (a TCC permission). Checked via TCC.db so we never
+    hang ~12s per boot on a pending (and never-answered) permission prompt.
+    """
+    import sqlite3
+    tcc = os.path.expanduser("~/Library/Application Support/com.apple.TCC/TCC.db")
+    if not os.path.exists(tcc):
+        return True, "", "", "no user TCC.db — skipped"
+    fix = (
+        "Grant Automation > Contacts to the bot's Python (System Settings > "
+        "Privacy & Security > Automation; approve the one-time prompt at the Mac). "
+        "Without it, looking a person up by name fails — pass a phone/email handle instead."
+    )
+    try:
+        con = sqlite3.connect(f"file:{tcc}?mode=ro&immutable=1", uri=True)
+        rows = con.execute(
+            "select client, auth_value from access "
+            "where service='kTCCServiceAppleEvents' "
+            "and indirect_object_identifier='com.apple.AddressBook'"
+        ).fetchall()
+        con.close()
+    except Exception as exc:
+        return True, "", "", f"TCC.db unreadable ({exc}) — skipped"
+    py = [(c, a) for (c, a) in rows if "python" in (c or "").lower()]
+    if any(a in (2, 3) for _c, a in py):
+        return True, "", "", "Contacts automation granted"
+    if py:
+        return False, "Contacts automation DENIED for Python", fix, str(py[:2])
+    return (
+        False,
+        "Contacts automation not yet granted for Python — name lookups will fail",
+        fix,
+        "",
+    )
+
+
 async def _run_all_inner(
     *,
     mcp_client: Any = None,
@@ -929,6 +1081,9 @@ async def _run_all_inner(
             await _run_probe("mcp_apple_calendar", WARN, lambda: probe_mcp_apple_calendar(mcp_client))
         )
         report.results.append(
+            await _run_probe("contacts", WARN, probe_contacts)
+        )
+        report.results.append(
             await _run_probe("mcp_github", WARN, lambda: probe_mcp_github(mcp_client))
         )
         report.results.append(
@@ -954,6 +1109,14 @@ async def _run_all_inner(
             await _run_probe("cursor_bridge", WARN, lambda: probe_cursor_bridge(cursor_bridge))
         )
 
+    # Voice + messaging environment — silent breakers that previously had no
+    # probe, so a missing ffmpeg / wrong voice id / missing Full Disk Access
+    # looked like a mysterious "voice/iMessages don't work".
+    report.results.append(await _run_probe("ffmpeg", WARN, probe_ffmpeg))
+    report.results.append(await _run_probe("authorized_voice_user", WARN, probe_authorized_voice_user))
+    report.results.append(await _run_probe("messages_fda", WARN, probe_messages_fda))
+    report.results.append(await _run_probe("messages_send", WARN, probe_messages_send))
+
     # Wake word + accessibility
     report.results.append(await _run_probe("wake_word_model", WARN, probe_wake_word_model))
     report.results.append(await _run_probe("accessibility", WARN, probe_accessibility))
@@ -976,6 +1139,27 @@ async def _run_all_inner(
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+
+def format_summary(report: PreflightReport, *, markdown: bool = True) -> str:
+    """One-line health summary for healthy / warn-only boots.
+
+    The full per-probe report is a wall of text that dominated #ucs-alerts on
+    every launch even when nothing was actually broken ("errors all over the
+    place"). On a clean (no-critical) boot we post only this summary; the full
+    report still goes to the logs and to the `!preflight` command.
+    """
+    passed = len(report.passed)
+    total = len(report.results)
+    warns = report.warnings
+    bold = "**" if markdown else ""
+    if not warns:
+        return f"{bold}Preflight OK{bold} \u2014 {passed}/{total} checks passed."
+    names = ", ".join((f"`{w.name}`" if markdown else w.name) for w in warns)
+    return (
+        f"{bold}Preflight OK{bold} \u2014 {passed}/{total} passed, "
+        f"{len(warns)} warning(s): {names}. (full detail in logs)"
+    )
 
 
 def format_report(report: PreflightReport, *, markdown: bool = True) -> str:

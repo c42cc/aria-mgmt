@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -374,6 +375,15 @@ _alert_callback: Callable[..., Coroutine] | None = None
 _thread_callback: Callable[..., Coroutine] | None = None
 _cursor_event_callback: Callable[..., Coroutine] | None = None
 _reconnect_callback: Callable[..., Coroutine] | None = None
+# Progress-spine sink. Injected by bot.py; the agent loop calls it before each
+# tool dispatch so a long task narrates itself live to the originating channel
+# (and keeps the voice session warm) instead of leaving the user staring at a
+# three-dot loading indicator.
+_progress_callback: Callable[..., Coroutine] | None = None
+# Recommend-an-approach sink. Injected by bot.py; posts a tap-to-approve card
+# to Corbin's phone and, on approval, runs the task autonomously. This is where
+# human decisions live now that per-command confirmation is off.
+_propose_callback: Callable[..., Coroutine] | None = None
 # Discord text-history fetchers injected at boot. Wired by bot.py so the
 # tools layer doesn't take a hard dependency on the discord client.
 _discord_history_callback: Callable[..., Coroutine] | None = None
@@ -434,6 +444,57 @@ def has_in_flight_loops() -> bool:
     """
     return any(s.lock.locked() for s in _session_states.values())
 
+
+def _humanize_step(tool_name: str, args: dict | None) -> str:
+    """One short, user-facing line describing a tool call for the progress spine.
+
+    Deliberately omits sensitive payloads (message bodies, passwords, shell
+    commands) — it conveys *what* Aria is doing, never the private *content*.
+    """
+    a = args or {}
+    name = (tool_name or "").lower()
+    if tool_name == "create_42c_account":
+        u = str(a.get("username", "")).strip()
+        label = f" '{u}'" if u else ""
+        return f"creating 42c.pw account{label} (deploy ~1-2 min)"
+    if "contact" in name:
+        who = str(a.get("search") or a.get("name") or "").strip()
+        return f"looking up contact{f' {who}' if who else ''}"
+    if "message" in name:
+        action = str(a.get("action") or "").lower()
+        if action == "read":
+            who = str(a.get("contact") or a.get("search") or "").strip()
+            return f"reading messages{f' with {who}' if who else ''}"
+        if action == "create":
+            who = str(a.get("to") or a.get("chatId") or "").strip()
+            return f"sending iMessage{f' to {who}' if who else ''}"
+        return "working with Messages"
+    if "calendar" in name:
+        return "checking the calendar"
+    if any(k in name for k in ("mail", "email", "gmail")):
+        return "checking email"
+    if any(name.startswith(p) for p in ("execute", "run", "shell")):
+        return "running a shell command"
+    if "github" in name:
+        return "working with GitHub"
+    if name.startswith(("read", "get", "list", "search")):
+        return f"reading via {tool_name}"
+    return f"running {tool_name}"
+
+
+async def _emit_progress(session_key: str, step: str) -> None:
+    """Fire one progress line to the originating channel (and voice).
+
+    Strictly non-fatal: a failed progress post must never break the agent loop.
+    """
+    if not _progress_callback or not step:
+        return
+    try:
+        await _progress_callback(f"\u2192 {step}", session_key)
+    except Exception:
+        log.debug("progress emit failed (non-fatal)", exc_info=True)
+
+
 # Alias-only configuration loaded from projects/registry.md. Maps a short
 # registered name to an absolute workspace path. After the unified-cursor-
 # agent migration the canonical resolver is `cursor_registry.lookup()`;
@@ -485,20 +546,29 @@ def init_tools(
     reconnect_callback: Callable[..., Coroutine] | None = None,
     discord_history_callback: Callable[..., Coroutine] | None = None,
     discord_threads_callback: Callable[..., Coroutine] | None = None,
+    progress_callback: Callable[..., Coroutine] | None = None,
+    propose_callback: Callable[..., Coroutine] | None = None,
 ) -> None:
     """Initialize tool dependencies. Call once at bot startup."""
     global _anthropic_client, _cursor_bridge
     global _post_callback, _alert_callback, _thread_callback, _cursor_event_callback
-    global _reconnect_callback
+    global _reconnect_callback, _progress_callback, _propose_callback
     global _discord_history_callback, _discord_threads_callback
 
-    _anthropic_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+    # timeout/max_retries bound each agent-loop request (see config note).
+    _anthropic_client = anthropic.Anthropic(
+        api_key=config.anthropic_api_key,
+        timeout=config.anthropic_timeout_sec,
+        max_retries=1,
+    )
     _cursor_bridge = cursor_bridge
     _post_callback = post_callback
     _alert_callback = alert_callback
     _thread_callback = thread_callback
     _cursor_event_callback = cursor_event_callback
     _reconnect_callback = reconnect_callback
+    _progress_callback = progress_callback
+    _propose_callback = propose_callback
     _discord_history_callback = discord_history_callback
     _discord_threads_callback = discord_threads_callback
     _load_project_registry()
@@ -550,6 +620,8 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "query_cursor": _query_cursor,
         "cursor_status": _cursor_status_new,
         "do_with_claude": _do_with_claude,
+        "create_42c_account": _create_42c_account,
+        "propose_action": _propose_action,
         "remember": _remember,
         "recall": _recall,
         "cancel_current_task": _cancel_current_task,
@@ -591,6 +663,12 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "cursor_agents", "cursor_read", "cursor_send", "cursor_spawn",
         "cursor_screenshot",
         "discord_recent_messages", "discord_list_threads",
+        # No paid API spend — just an htpasswd write + Fly deploy. Must remain
+        # usable even when the daily ceiling is hit (it's a user-requested action).
+        "create_42c_account",
+        # Just posts a card + spawns a waiter; the approved task pays its own
+        # spend when it runs. Proposing is free.
+        "propose_action",
     )
     if spend >= config.daily_spend_cap_usd and name not in _free_tools:
         return json.dumps({"error": f"Daily spend cap (${config.daily_spend_cap_usd}) reached. Current: ${spend:.2f}"})
@@ -947,6 +1025,143 @@ async def _discord_list_threads(channel: str = "ucs") -> str:
 # Do with Claude (MCP agent loop)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 42c.pw account provisioning
+#
+# 42c.pw is gated by a single shared HTTP Basic Auth file (c42_public/.htpasswd)
+# baked into the alive-river Fly image. "Creating an account" therefore means
+# upserting a `username:apr1hash` line and redeploying so the new login goes
+# live. This one deterministic tool replaces the fuzzy htpasswd/openssl shell
+# improvisation that caused the historical 42c.pw failure.
+# ---------------------------------------------------------------------------
+
+_CREATE_42C_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "create_42c_account",
+    "description": (
+        "Create a login account on the 42c.pw website so a person can access "
+        "what Corbin is working on. 42c.pw uses shared HTTP Basic Auth; this "
+        "adds the username/password credential and redeploys so it goes live "
+        "(takes ~1-2 minutes). Returns the login URL plus the username and "
+        "password to share. Use whenever the user asks to make/create an "
+        "account for someone."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "username": {"type": "string", "description": "The account username/login (a short handle)."},
+            "password": {"type": "string", "description": "The account password."},
+            "label": {"type": "string", "description": "Optional note about who the account is for, e.g. the person's name."},
+        },
+        "required": ["username", "password"],
+    },
+}
+
+
+def _apr1_hash(password: str) -> str:
+    """Apache apr1 (MD5) password hash via openssl — the format nginx expects.
+
+    Loud failure: a non-zero openssl exit raises so the caller can surface it.
+    """
+    proc = subprocess.run(
+        ["openssl", "passwd", "-apr1", password],
+        capture_output=True, text=True, timeout=15,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError(f"openssl apr1 failed: {proc.stderr.strip()[:200]}")
+    return proc.stdout.strip()
+
+
+def _upsert_htpasswd(htpasswd_path: str, username: str, hashed: str) -> None:
+    """Add or replace the `username:hash` line (durable, idempotent)."""
+    lines: list[str] = []
+    if os.path.exists(htpasswd_path):
+        with open(htpasswd_path) as f:
+            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+    lines = [ln for ln in lines if ln.split(":", 1)[0] != username]
+    lines.append(f"{username}:{hashed}")
+    with open(htpasswd_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _verify_42c_login(url: str, username: str, password: str) -> bool:
+    """Best-effort: do these Basic-Auth creds get a 2xx/3xx from the live site?"""
+    try:
+        proc = subprocess.run(
+            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+             "-u", f"{username}:{password}", url],
+            capture_output=True, text=True, timeout=30,
+        )
+        code = (proc.stdout or "").strip()
+        return code.startswith(("2", "3"))
+    except Exception:
+        log.debug("42c verify curl failed (non-fatal)", exc_info=True)
+        return False
+
+
+async def _create_42c_account(
+    username: str,
+    password: str,
+    label: str = "",
+    deploy: bool = True,
+    session_key: str = "",
+) -> str:
+    """Provision a 42c.pw Basic-Auth account: hash -> upsert -> deploy -> verify."""
+    username = (username or "").strip()
+    password = password or ""
+    if not username or not password:
+        return json.dumps({"error": "username and password are required"})
+    if ":" in username or any(c.isspace() for c in username):
+        return json.dumps({"error": "username must not contain ':' or whitespace"})
+
+    c42_dir = config.c42_public_dir
+    htpasswd_path = os.path.join(c42_dir, ".htpasswd")
+    deploy_script = os.path.join(c42_dir, "deploy.sh")
+    if not os.path.isdir(c42_dir) or not os.path.exists(deploy_script):
+        return json.dumps({"error": f"42c.pw project not found at {c42_dir}"})
+
+    try:
+        hashed = await asyncio.to_thread(_apr1_hash, password)
+        await asyncio.to_thread(_upsert_htpasswd, htpasswd_path, username, hashed)
+    except Exception as e:
+        log.exception("create_42c_account: hash/upsert failed")
+        return json.dumps({"error": f"failed to write credential: {e}"})
+
+    url = config.c42_url
+    if not deploy:
+        return json.dumps({
+            "ok": True, "deployed": False, "url": url,
+            "username": username, "password": password,
+            "note": "credential staged in .htpasswd but not deployed — not live yet.",
+        })
+
+    await _emit_progress(session_key, "deploying 42c.pw (~1-2 min)")
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            ["bash", deploy_script],
+            capture_output=True, text=True,
+            timeout=config.c42_deploy_timeout_sec, cwd=c42_dir,
+        )
+    except Exception as e:
+        log.exception("create_42c_account: deploy failed to run")
+        return json.dumps({"error": f"deploy failed to start: {e}", "username": username})
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-600:]
+        log.error("create_42c_account: deploy.sh exit %d: %s", proc.returncode, tail)
+        return json.dumps({
+            "error": f"deploy failed (exit {proc.returncode})",
+            "detail": tail, "username": username,
+        })
+
+    verified = await asyncio.to_thread(_verify_42c_login, url, username, password)
+    log.info("create_42c_account: provisioned %s (verified=%s)", username, verified)
+    return json.dumps({
+        "ok": True, "deployed": True, "verified": verified,
+        "url": url, "username": username, "password": password, "label": label,
+        "share_text": f"Login at {url} — username: {username}, password: {password}",
+    })
+
+
 async def _do_with_claude(
     task: str,
     session_key: str = "",
@@ -973,7 +1188,10 @@ async def _do_with_claude_legacy(
         from .mcp import mcp_client
         if not mcp_client:
             return json.dumps({"error": "MCP client not initialized"})
-        tools = mcp_client.list_tools_anthropic()
+        # Local deterministic tools the loop can dispatch alongside MCP tools.
+        # create_42c_account is injected here so Claude provisions a 42c.pw
+        # account as one step instead of improvising shell commands.
+        tools = mcp_client.list_tools_anthropic() + [_CREATE_42C_TOOL_SCHEMA]
     except ImportError:
         return json.dumps({"error": "MCP module not available"})
 
@@ -1119,10 +1337,16 @@ async def _do_with_claude_legacy(
                     block.name, prev_count + 1, session_key,
                 )
             else:
-                tool_result = await mcp_client.call_tool(
-                    block.name, tool_args, session_key=session_key,
-                )
-                result_str = str(tool_result)
+                await _emit_progress(session_key, _humanize_step(block.name, tool_args))
+                if block.name == "create_42c_account":
+                    local_args = dict(tool_args)
+                    local_args.setdefault("session_key", session_key)
+                    result_str = await _create_42c_account(**local_args)
+                else:
+                    tool_result = await mcp_client.call_tool(
+                        block.name, tool_args, session_key=session_key,
+                    )
+                    result_str = tool_result
                 called_tools[dedup_key] = (1, result_str)
 
             tool_results.append({
@@ -1309,6 +1533,32 @@ async def _cancel_current_task(session_key: str = "") -> str:
 async def _confirm_action_noop(**kwargs) -> str:
     """confirm_action is handled directly in GeminiSession, not here."""
     return json.dumps({"ok": True, "note": "handled by Gemini session"})
+
+
+async def _propose_action(
+    title: str,
+    why: str = "",
+    task: str = "",
+    session_key: str = "",
+) -> str:
+    """Recommend a consequential approach Corbin can approve with one tap.
+
+    Posts a context-rich card to his phone (DM) and #ucs-alerts; on approval
+    the task runs autonomously (handed to do_with_claude) with no further
+    per-command confirmation. This is the decision surface that replaces
+    confirming individual commands. Returns immediately with an ack — the
+    wait-for-approval and execution happen in the background.
+    """
+    if not _propose_callback:
+        return json.dumps({"error": "propose_action is not wired in this process"})
+    if not title or not task:
+        return json.dumps({"error": "title and task are required"})
+    try:
+        ack = await _propose_callback(title, why, task, session_key)
+        return json.dumps(ack if isinstance(ack, dict) else {"ok": True, "proposed": title})
+    except Exception as e:
+        log.exception("propose_action failed")
+        return json.dumps({"error": str(e)})
 
 
 # ---------------------------------------------------------------------------

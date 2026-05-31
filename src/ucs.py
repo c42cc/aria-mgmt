@@ -160,7 +160,13 @@ class ModelRouter:
         import anthropic
         if "anthropic" not in self._clients:
             api_key = os.getenv(spec.api_key_env, "")
-            self._clients["anthropic"] = anthropic.Anthropic(api_key=api_key)
+            # Bound each request so a hung call can't stall the loop for the SDK
+            # default (600s x 2). Mirrors the legacy path in tools.init_tools.
+            self._clients["anthropic"] = anthropic.Anthropic(
+                api_key=api_key,
+                timeout=config.anthropic_timeout_sec,
+                max_retries=1,
+            )
         client = self._clients["anthropic"]
 
         kwargs: dict[str, Any] = {
@@ -468,16 +474,22 @@ class IntelligenceLoop:
         # Cross-iteration dedup ledger. See _dedup_key in tools.py.
         # Maps "name:args_json" -> (call_count, cached_result_str).
         from .tools import (  # local import to avoid cycle at module load
+            _CREATE_42C_TOOL_SCHEMA,
             _DECLINE_PER_ACTION_ABORT,
             _DECLINE_TOTAL_ABORT,
             _GROUND_CHECK_MAX_RETRIES,
+            _create_42c_account,
             _dedup_key,
             _declined_reason,
+            _emit_progress,
             _format_decline_blocker,
             _ground_check,
             _ground_check_user_message,
+            _humanize_step,
             _is_declined_result,
         )
+        # Same local deterministic tool injection as the legacy loop.
+        tools = tools + [_CREATE_42C_TOOL_SCHEMA]
         called_tools: dict[str, tuple[int, str]] = {}
 
         # P1 retry counter — see _do_with_claude_legacy for full notes.
@@ -583,12 +595,18 @@ class IntelligenceLoop:
                         block["name"], prev_count + 1, session_key,
                     )
                 else:
-                    tool_result = await mcp_client.call_tool(
-                        block["name"],
-                        tool_args,
-                        session_key=session_key,
-                    )
-                    result_str = str(tool_result)
+                    await _emit_progress(session_key, _humanize_step(block["name"], tool_args))
+                    if block["name"] == "create_42c_account":
+                        local_args = dict(tool_args)
+                        local_args.setdefault("session_key", session_key)
+                        result_str = await _create_42c_account(**local_args)
+                    else:
+                        tool_result = await mcp_client.call_tool(
+                            block["name"],
+                            tool_args,
+                            session_key=session_key,
+                        )
+                        result_str = tool_result
                     called_tools[dedup_key] = (1, result_str)
 
                 tool_results.append({
