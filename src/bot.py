@@ -419,8 +419,11 @@ async def post_to_alerts(content: str, *, silent: bool = False) -> None:
     ch = bot.get_channel(int(config.discord_log_channel_id))
     if not ch:
         raise RuntimeError(f"Alert channel {config.discord_log_channel_id} not found — bot cannot post alerts")
+    # #ucs-alerts is a no-notification STREAM (Corbin's rule): glance at it any
+    # time, but it must never buzz. Decisions that warrant a buzz go to the main
+    # channel via propose_action. We force silent here regardless of caller.
     for chunk in _split_at_paragraphs(content):
-        await ch.send(chunk, silent=silent)
+        await ch.send(chunk, silent=True)
     conversation.add_alert(content)
 
 
@@ -507,21 +510,22 @@ async def _post_proposal_card(
     recommendation Corbin opts INTO, not a gate on something already decided.
     Primes the same check/cross reactions the reaction handler resolves.
     """
-    # @mention so it buzzes the phone via #ucs-alerts (Corbin's DMs are off,
-    # so the alerts channel is the real notification surface).
+    # Decisions are the ONE thing allowed to buzz. They go to the MAIN channel
+    # (#ucs), @mention Corbin, and post NON-silent — distinct from the silent
+    # #ucs-alerts stream. DMs are off, so the main channel is the buzz surface.
     mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
     mention = f"<@{mention_id}> " if mention_id else ""
+    # Plain language, no markdown noise — this is what shows in a phone push,
+    # so it has to read like a normal sentence, not asterisk soup.
     body = (
-        f"{mention}**Recommended approach** (id `{action_id}`)\n"
-        f"**{title}**\n"
+        f"{mention}Quick decision for you: {title}\n"
         + (f"{why}\n" if why else "")
-        + f"\n_What I'll do on approval:_ {task[:400]}\n\n"
-        f"Tap \u2705 to run it autonomously, or \u274c to skip "
-        f"(or reply `!ok {action_id}` / `!no {action_id}`)."
+        + f"\nWhat I'd do: {task[:400]}\n\n"
+        f"Tap \u2705 to go ahead, or \u274c to skip."
     )
-    ch = bot.get_channel(int(config.discord_log_channel_id))
+    ch = bot.get_channel(int(config.discord_text_channel_id))
     if not ch:
-        log.error("Alert channel not found — cannot post proposal card")
+        log.error("Text channel not found — cannot post decision card")
         return None
     try:
         message = await ch.send(body)
@@ -549,11 +553,13 @@ async def _await_and_run_proposal(
         _unregister_pending_confirmation(action_id)
 
     if not res.get("approved"):
-        note = "expired (no tap in time)" if res.get("timeout") else "skipped"
-        await post_to_alerts(f"Recommendation **{title}** {note}.", silent=True)
+        # The "got it / skipping" receipt already showed where Corbin tapped.
+        if res.get("timeout"):
+            await post_to_alerts(
+                f"The decision \u201c{title}\u201d expired with no answer.", silent=True
+            )
         return
 
-    await post_to_alerts(f"Approved \u2014 running **{title}** now.", silent=True)
     from .tools import handle_tool_call
     try:
         result = await handle_tool_call(
@@ -562,10 +568,12 @@ async def _await_and_run_proposal(
         )
     except Exception:
         log.exception("Proposal execution failed for %s", action_id)
-        await post_to_alerts(f"Recommendation **{title}** hit an error while running \u2014 see logs.")
+        await post_to_text(
+            f"That one hit a snag while running (\u201c{title}\u201d). Details are in the log."
+        )
         return
     try:
-        await post_to_text(f"**{title}** \u2014 done.\n\n{result}")
+        await post_to_text(f"Done with \u201c{title}\u201d.\n\n{result}")
     except Exception:
         log.exception("Failed to post proposal result")
 
@@ -587,16 +595,7 @@ async def _propose_action(
         pending.message_id = card.id
         _confirmation_message_index[card.id] = action_id
 
-    # Buzz the phone with the decision + context.
-    try:
-        await _dm_authorized_user(
-            f"**Recommended: {title}**\n"
-            + (f"{why}\n" if why else "")
-            + f"Tap \u2705 in #ucs-alerts (or reply `!ok {action_id}`) and I'll run it."
-        )
-    except Exception:
-        log.debug("proposal DM buzz failed (non-fatal)", exc_info=True)
-
+    # The @mention card in the main channel is the buzz; no DM (Corbin's are off).
     asyncio.create_task(
         _await_and_run_proposal(action_id, title, task, session_key),
         name=f"proposal_{action_id}",
@@ -1404,7 +1403,7 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
     mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
     mention = f"<@{mention_id}> " if mention_id else ""
     project = (agent.workspace_root or "").rstrip("/").split("/")[-1] or agent.workspace_root
-    lines = [f"{mention}**{evt.reason}** \u2014 _{project}_"]
+    lines = [f"{mention}{evt.reason} ({project})"]
     if agent.pending_question:
         lines.append(f"It's asking: {agent.pending_question[:300]}")
     elif agent.last_assistant_text:
@@ -1419,6 +1418,48 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
     else:
         lines.append("\u2192 Reply for a 1-line debrief, or ignore \u2014 I'll keep watching and only ping when it matters.")
     return "\n".join(lines)
+
+
+# Rate-limit auto-proposals so a burst of watched windows finishing at once
+# can't fire a wall of decision buzzes. One auto-proposal per project per window.
+_last_proposal_at: dict[str, float] = {}
+_AUTO_PROPOSAL_COOLDOWN_SEC = 600.0
+
+
+async def _maybe_propose_next_after_completion(agent: "CursorAgent") -> bool:
+    """A watched thread finished. Instead of a useless 'it's done' buzz, ask
+    Claude for the single best next action and push it as a decision (which
+    buzzes). Returns True if a proposal was posted. Rate-limited per project.
+    """
+    if not config.propose_next_on_completion:
+        return False
+    project = (agent.workspace_root or "").rstrip("/").split("/")[-1] or "project"
+    now = time.monotonic()
+    if now - _last_proposal_at.get(project, 0.0) < _AUTO_PROPOSAL_COOLDOWN_SEC:
+        return False
+    summary = (agent.last_assistant_text or agent.pending_question or "").strip()
+    if not summary:
+        return False
+    try:
+        from .tools import suggest_next_action
+        nxt = await suggest_next_action(project, summary)
+    except Exception:
+        log.exception("suggest_next_action raised")
+        return False
+    if not nxt:
+        return False
+    _last_proposal_at[project] = now
+    try:
+        await _propose_action(
+            title=f"Next step on {project}",
+            why=f"That thread just finished: {summary[:160]}",
+            task=nxt,
+            session_key="",
+        )
+        return True
+    except Exception:
+        log.exception("propose-next failed for %s", project)
+        return False
 
 
 async def _narrate_registry_event(evt: RegistryEvent) -> None:
@@ -1507,23 +1548,19 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                 "Failed to inject registry event into Gemini — falling back to DM rung"
             )
 
-    dm_landed = False
-    if config.cursor_dm_pager_enabled and evt.severity == "high":
-        dm_landed = await _dm_authorized_user(_format_registry_dm(evt))
-        # DM landing intentionally does NOT advance last_delivered_at:
-        # Corbin saw a phone notification but hasn't talked about it with
-        # Aria yet. The next time he joins voice the briefing should
-        # surface this event so she can debrief verbally.
-
-    if evt.severity == "high" and not dm_landed:
-        # DMs didn't land (Corbin keeps them off), so #ucs-alerts is the real
-        # phone channel. Post the full decision-oriented body — it already
-        # @mentions to buzz — instead of a terse audit one-liner. This is the
-        # difference between "useless ping" and "here's what happened + what I
-        # can do about it."
-        await _safe_post(_format_registry_dm(evt), silent=False)
+    # Not on voice. The ONLY thing allowed to buzz is a real decision. A bare
+    # "thread finished" is useless on its own (Corbin's rule), so on completion
+    # we turn it into a "here's the next move — approve?" proposal (which buzzes
+    # the main channel). Everything else just streams silently to #ucs-alerts.
+    if evt.severity == "high" and evt.kind in ("finished", "completed"):
+        proposed = await _maybe_propose_next_after_completion(agent)
+        if not proposed:
+            await _safe_post(audit_line, silent=True)
     else:
-        await _safe_post(audit_line, silent=True)
+        # Errors, questions, progress: context to the silent stream, no buzz.
+        # (A pending question is surfaced here; the proposal path is the buzz.)
+        body = _format_registry_dm(evt) if evt.severity == "high" else audit_line
+        await _safe_post(body, silent=True)
 
 
 def _undelivered_agents() -> list[CursorAgent]:
@@ -1969,21 +2006,23 @@ async def _handle_text_confirmation(
     """Resolve a pending confirmation from a !ok / !no command."""
     pending_ids = list(_pending_text_confirmations)
     if not pending_ids:
-        await ctx.send("No pending confirmations.")
+        await ctx.send("Nothing's waiting for your okay right now.")
         return
     if action_id is None:
         if len(pending_ids) > 1:
             ids = ", ".join(f"`{i}`" for i in pending_ids)
             await ctx.send(
-                f"Multiple pending confirmations — specify which: {ids}"
+                f"A few things are waiting — tell me which one: {ids}"
             )
             return
         action_id = pending_ids[0]
     if not _resolve_pending_confirmation(action_id, approved, source="text"):
-        await ctx.send(f"No pending confirmation with id `{action_id}`.")
+        await ctx.send("I couldn't find that one waiting for approval.")
         return
-    verb = "Approved" if approved else "Declined"
-    await ctx.send(f"{verb} `{action_id}`.")
+    if approved:
+        await ctx.send("Got it \u2014 on it now. I'll show each step as I go.")
+    else:
+        await ctx.send("Okay \u2014 skipping that one.")
 
 
 @bot.event
@@ -2003,10 +2042,22 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     if not action_id:
         return
     emoji = str(reaction.emoji)
+    # Subtle, instant receipt right where Corbin tapped so he's never left
+    # wondering whether Aria heard him. Silent so it doesn't double-buzz.
     if emoji in CONFIRM_APPROVE_EMOJIS:
-        _resolve_pending_confirmation(action_id, True, source="reaction")
+        if _resolve_pending_confirmation(action_id, True, source="reaction"):
+            try:
+                await msg.channel.send(
+                    "Got it \u2014 on it now. I'll show each step as I go.", silent=True
+                )
+            except Exception:
+                log.debug("approve receipt failed (non-fatal)", exc_info=True)
     elif emoji in CONFIRM_DECLINE_EMOJIS:
-        _resolve_pending_confirmation(action_id, False, source="reaction")
+        if _resolve_pending_confirmation(action_id, False, source="reaction"):
+            try:
+                await msg.channel.send("Okay \u2014 skipping that one.", silent=True)
+            except Exception:
+                log.debug("decline receipt failed (non-fatal)", exc_info=True)
 
 
 @bot.command()
@@ -2238,9 +2289,8 @@ async def _handle_text_conversation(message: discord.Message) -> None:
         if len(ack_preview) > 120:
             ack_preview = ack_preview[:120] + "…"
         await message.channel.send(
-            f"On it — working on: \"{ack_preview}\". Live steps and any "
-            f"approval prompts land in #ucs-alerts; the finished result "
-            f"comes back here. Reply `!ok <action_id>` to approve.",
+            f"Got it \u2014 working on: \u201c{ack_preview}\u201d. "
+            f"I'll show each step here as I go, then the result.",
             silent=True,
         )
     except Exception:
@@ -2284,6 +2334,27 @@ async def _handle_text_conversation(message: discord.Message) -> None:
             log.exception("Failed to inject Aria reply into Gemini live context")
 
 
+def _is_stream_or_capability_channel(channel) -> bool:
+    """True for channels Aria must NOT treat as conversation.
+
+    Excludes the silent #ucs-alerts STREAM (responding there would loop on her
+    own firehose) and capability-owned channels (e.g. SpicyLit's Grok voice
+    channel, which owns its own pipeline). Everything else — every text channel,
+    voice text chat, thread, and DM — is fair game so Corbin can talk to Aria
+    anywhere and actually get an answer back.
+    """
+    try:
+        cid = str(getattr(channel, "id", ""))
+    except Exception:
+        return False
+    excluded = {
+        str(config.discord_log_channel_id or ""),
+        str(config.discord_spicylit_channel_id or ""),
+    }
+    excluded.discard("")
+    return cid in excluded
+
+
 @bot.event
 async def on_message(message):
     """Route inbound Discord messages.
@@ -2292,11 +2363,11 @@ async def on_message(message):
       1. Bot/self messages: ignore (avoid loops).
       2. Webhook !ask: route to _run_ask (existing iOS-Shortcut path).
       3. Command prefix !: delegate to bot.process_commands.
-      4. Plain text from authorized user in #ucs: conversational path
-         through Claude.
-      5. Anything else: ignored, but #ucs-alerts content is already
-         recorded into the conversation buffer by post_to_alerts when
-         Aria/the bot posts it.
+      4. Plain text from the authorized user in ANY channel (or DM): the
+         conversational path through Claude. Corbin types to Aria all over;
+         she answers wherever he is. Only the silent alerts stream and
+         capability channels are excluded.
+      5. Other authors / excluded channels: ignored.
     """
     if message.author.id == bot.user.id:
         return
@@ -2314,10 +2385,9 @@ async def on_message(message):
         return
 
     if (
-        config.discord_text_channel_id
-        and message.channel.id == int(config.discord_text_channel_id)
-        and _is_authorized(message.author.id)
+        _is_authorized(message.author.id)
         and message.content.strip()
+        and not _is_stream_or_capability_channel(message.channel)
     ):
         await _handle_text_conversation(message)
         return

@@ -79,6 +79,10 @@ class Config:
     confirm_risky_tools: bool = os.getenv("CONFIRM_RISKY_TOOLS", "false").lower() == "true"
     # How long a propose_action recommendation waits for a tap before expiring.
     proposal_timeout_sec: float = float(os.getenv("PROPOSAL_TIMEOUT_SEC", "1800"))
+    # When a watched coding thread finishes, turn the bare "it's done" ping into
+    # a "here's the next move — approve?" decision (the only thing that should
+    # buzz). Off => completions just stream silently to #ucs-alerts.
+    propose_next_on_completion: bool = os.getenv("PROPOSE_NEXT_ON_COMPLETION", "true").lower() == "true"
 
     # 42c.pw account provisioning. 42c.pw is gated by shared HTTP Basic Auth on
     # the alive-river Fly app; "creating an account" = upserting a credential

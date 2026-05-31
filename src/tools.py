@@ -1494,6 +1494,41 @@ async def _do_with_claude_ucs(
 # Memory tools
 # ---------------------------------------------------------------------------
 
+async def suggest_next_action(project: str, summary: str) -> str:
+    """One cheap Claude call: given what a coding thread just finished, return a
+    single imperative next-action sentence, or '' if nothing obvious.
+
+    Turns a useless "thread is over" ping into a "here's the next move, approve?"
+    decision. Bounded to a tiny completion so it's cheap to run per completion.
+    """
+    if not _anthropic_client or not summary.strip():
+        return ""
+    try:
+        resp = await asyncio.to_thread(
+            _anthropic_client.messages.create,
+            model=config.claude_model,
+            max_tokens=200,
+            system=(
+                "A coding/agent thread just finished. Propose the SINGLE most "
+                "valuable next action the user should approve. Reply with ONE "
+                "imperative sentence (the action itself, ready to execute), or "
+                "exactly 'NONE' if the work looks complete with no obvious next "
+                "step. No preamble, no markdown."
+            ),
+            messages=[{
+                "role": "user",
+                "content": f"Project: {project}\nWhat just finished:\n{summary[:2000]}",
+            }],
+        )
+        text = "".join(
+            b.text for b in resp.content if hasattr(b, "text") and b.text
+        ).strip()
+        return "" if text.upper().startswith("NONE") else text[:300]
+    except Exception:
+        log.exception("suggest_next_action failed")
+        return ""
+
+
 async def _remember(text: str) -> str:
     mem_remember(text)
     return json.dumps({"ok": True, "remembered": text[:100]})
