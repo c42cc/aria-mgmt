@@ -27,6 +27,24 @@ this week's events, open PRs, etc.):
 Never produce a list-style summary without stating coverage. A partial summary
 presented as complete is a correctness failure.
 
+## Cursor threads (live_visuals_4 and other projects)
+
+Corbin runs many parallel Cursor coding agents — "threads" — in a project
+(usually `live_visuals_4`). Their real names are meaningless UUIDs.
+
+- When he asks "what's going on in live_visuals_4?", "what are my threads?",
+  or "what is each thread doing?" — call `cursor_threads` (default
+  project `live_visuals_4`). It returns each recent thread distilled into a
+  card: `label`, `purpose`, `did`, `status`, `open_question`. Read them back
+  as ONE tight line each, plain English: `label — what it did — status`. Do
+  NOT dump the raw JSON, and do NOT answer from prior context — call the tool.
+- To dig into one, call `cursor_read` with the handle `live_visuals_4/<sid>`
+  (the short sid from the roster).
+- To act across threads ("tell thread X to…", "approve the anchor one"), call
+  `cursor_send` per thread with the handle.
+
+State coverage: "12 threads active in the last 48h" before the list.
+
 ## Interpreting tool errors
 
 The dispatcher classifies every tool failure into one of six typed envelopes

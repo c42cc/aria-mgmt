@@ -111,6 +111,21 @@ CREATE TABLE IF NOT EXISTS verdicts (
     anchor_floor         TEXT,
     anchor_reports_json  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS thread_summaries (
+    sid             TEXT PRIMARY KEY,
+    workspace_root  TEXT NOT NULL,
+    project_label   TEXT,
+    mtime           REAL NOT NULL,
+    turns           INTEGER,
+    label           TEXT NOT NULL,
+    purpose         TEXT,
+    did             TEXT,
+    status          TEXT,
+    open_question   TEXT,
+    model_id        TEXT,
+    distilled_at    TEXT NOT NULL
+);
 """
 
 
@@ -224,6 +239,56 @@ def get_active_cursor_sessions() -> list[dict[str, Any]]:
             "SELECT * FROM cursor_sessions WHERE status IN ('running', 'waiting')"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Cursor thread distillation cache (durable summaries keyed by transcript sid)
+# ---------------------------------------------------------------------------
+
+def get_thread_summary(sid: str) -> dict[str, Any] | None:
+    """Return the cached distilled summary for a transcript sid, or None.
+
+    The cache is keyed by sid; freshness is the caller's job (compare the
+    stored `mtime` against the transcript's current mtime). The transcript
+    JSONL on disk is the durable truth — this is only a distillation cache.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM thread_summaries WHERE sid = ?", (sid,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_thread_summary(
+    sid: str,
+    workspace_root: str,
+    project_label: str,
+    mtime: float,
+    turns: int,
+    label: str,
+    purpose: str,
+    did: str,
+    status: str,
+    open_question: str,
+    model_id: str,
+) -> None:
+    """Insert or replace a thread's distilled summary, stamped with its mtime."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO thread_summaries "
+            "(sid, workspace_root, project_label, mtime, turns, label, purpose, "
+            "did, status, open_question, model_id, distilled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(sid) DO UPDATE SET "
+            "workspace_root=excluded.workspace_root, "
+            "project_label=excluded.project_label, mtime=excluded.mtime, "
+            "turns=excluded.turns, label=excluded.label, purpose=excluded.purpose, "
+            "did=excluded.did, status=excluded.status, "
+            "open_question=excluded.open_question, model_id=excluded.model_id, "
+            "distilled_at=excluded.distilled_at",
+            (sid, workspace_root, project_label, mtime, turns, label, purpose,
+             did, status, open_question, model_id, _now()),
+        )
 
 
 # ---------------------------------------------------------------------------

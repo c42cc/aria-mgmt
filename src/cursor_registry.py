@@ -500,7 +500,7 @@ class CursorAgentRegistry:
                         kind, severity, reason = (
                             "progress",
                             "low",
-                            f"{agent.project_label} produced an assistant turn.",
+                            f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn.",
                         )
         elif event == "completion":
             agent.status = "finished"
@@ -619,6 +619,11 @@ class CursorAgentRegistry:
                             text_lines = new.decode("utf-8", errors="replace").splitlines()
                             la, lu, plans = _parse_jsonl_turns(text_lines)
                             if la:
+                                # The session that just produced output IS the
+                                # current one. Without this, concurrent threads
+                                # in one workspace clobber agent-level fields and
+                                # the narration can't say which thread spoke.
+                                agent.current_sid = sess.sid
                                 agent.last_assistant_text = la[: self._truncate_chars]
                                 sess.last_assistant_text = agent.last_assistant_text
                                 q = _question_in_text(la)
@@ -628,7 +633,7 @@ class CursorAgentRegistry:
                                 reason = (
                                     f"{agent.project_label} asked: {q[:200]}"
                                     if q
-                                    else f"{agent.project_label} produced an assistant turn."
+                                    else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
                                 )
                                 await self._emit_event(
                                     RegistryEvent(

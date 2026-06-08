@@ -192,6 +192,164 @@ def read_last_n_turns(cwd: str, n: int = 3, *, explicit_path: str | None = None)
 
 
 # ---------------------------------------------------------------------------
+# Thread enumeration + digest (the durable per-thread primitive)
+#
+# A "thread" is one Cursor agent transcript: a `<sid>/<sid>.jsonl` under the
+# project's `agent-transcripts/`. These files are the durable truth — they
+# survive bot restarts and capture every thread the user ran, IDE or SDK.
+# Everything Aria knows about "what's going on in <project>" derives from
+# here, not from the lossy in-memory registry projection.
+# ---------------------------------------------------------------------------
+
+_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
+
+
+def _clean_intent(text: str) -> str:
+    """Strip the boilerplate wrappers Cursor prepends to the first user turn.
+
+    The IDE pastes `<timestamp>…</timestamp> <user_query>…</user_query>` and,
+    for file drops, `<uploaded_documents>…`. The real intent is inside
+    `<user_query>`; without this every thread's first turn looks identical
+    (the recurring "GOAL: …" boilerplate), which is exactly why naive
+    field-extraction can't tell threads apart.
+    """
+    if not text:
+        return ""
+    m = _USER_QUERY_RE.search(text)
+    if m:
+        text = m.group(1)
+    return text.strip()
+
+
+def list_recent_threads(
+    workspace_root: str, *, window_hours: float = 48.0, limit: int = 12
+) -> list[dict]:
+    """Recent Cursor threads for a workspace, newest first. Stat-only (cheap).
+
+    Returns `{sid, mtime, transcript_path}` per thread modified within
+    `window_hours`. No transcript bytes are read here; the digest is pulled
+    only on a distillation cache miss.
+    """
+    root = os.path.join(cursor_project_data_dir(workspace_root), "agent-transcripts")
+    if not os.path.isdir(root):
+        return []
+    cutoff = time.time() - max(0.0, window_hours) * 3600.0
+    out: list[dict] = []
+    try:
+        sids = os.listdir(root)
+    except OSError:
+        return []
+    for sid in sids:
+        jsonl = os.path.join(root, sid, f"{sid}.jsonl")
+        try:
+            mt = os.path.getmtime(jsonl)
+        except OSError:
+            continue
+        if mt < cutoff:
+            continue
+        out.append({"sid": sid, "mtime": mt, "transcript_path": jsonl})
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out[: max(1, limit)]
+
+
+def read_thread_digest(
+    transcript_path: str, *, recent_assistant: int = 6, field_chars: int = 1500
+) -> dict:
+    """One pass over a transcript → the signal a distiller needs.
+
+    Returns `{turns, first_user_text (intent, de-boilerplated), last_user_text,
+    recent_assistant_texts}`. Cursor agents end with a wrap-up turn, so the
+    first user intent plus the last few assistant turns capture both "why this
+    thread exists" and "what it actually did" without shipping the whole
+    transcript to the model.
+    """
+    empty = {
+        "turns": 0,
+        "first_user_text": "",
+        "last_user_text": "",
+        "recent_assistant_texts": [],
+    }
+    if not transcript_path or not os.path.exists(transcript_path):
+        return empty
+    first_user = ""
+    last_user = ""
+    assistants: list[str] = []
+    turns = 0
+    try:
+        with open(transcript_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                role = obj.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                message = obj.get("message") or {}
+                content = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(content, list):
+                    continue
+                text = " ".join(
+                    b.get("text", "")
+                    for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ).strip()
+                if not text:
+                    continue
+                turns += 1
+                if role == "user":
+                    if not first_user:
+                        first_user = text
+                    last_user = text
+                else:
+                    assistants.append(text)
+    except OSError:
+        return empty
+    return {
+        "turns": turns,
+        "first_user_text": _clean_intent(first_user)[:field_chars],
+        "last_user_text": _clean_intent(last_user)[:field_chars],
+        "recent_assistant_texts": [a[:field_chars] for a in assistants[-recent_assistant:]],
+    }
+
+
+def find_transcript_by_sid(workspace_root: str, sid_prefix: str) -> str | None:
+    """Locate a thread transcript by full or prefix sid (dormant threads too).
+
+    Lets Aria dig into any thread she names from the roster, even ones that
+    never fired a hook this process lifetime (so the in-memory registry has
+    never heard of them).
+    """
+    if not sid_prefix:
+        return None
+    root = os.path.join(cursor_project_data_dir(workspace_root), "agent-transcripts")
+    if not os.path.isdir(root):
+        return None
+    exact = os.path.join(root, sid_prefix, f"{sid_prefix}.jsonl")
+    if os.path.exists(exact):
+        return exact
+    matches: list[tuple[float, str]] = []
+    try:
+        for sid in os.listdir(root):
+            if sid.startswith(sid_prefix):
+                p = os.path.join(root, sid, f"{sid}.jsonl")
+                if os.path.exists(p):
+                    try:
+                        matches.append((os.path.getmtime(p), p))
+                    except OSError:
+                        continue
+    except OSError:
+        return None
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+# ---------------------------------------------------------------------------
 # Plan file discovery
 # ---------------------------------------------------------------------------
 

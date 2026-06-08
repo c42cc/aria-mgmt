@@ -26,11 +26,14 @@ Routing:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from datetime import datetime
 from typing import TYPE_CHECKING
 
+from .config import config
 from .cursor_registry import cursor_registry
 
 if TYPE_CHECKING:
@@ -82,69 +85,261 @@ async def _cursor_agents() -> str:
 
 
 # ---------------------------------------------------------------------------
-# cursor_read — fresh transcript, registry-fast / JSONL-fallback
+# Workspace resolution (shared by cursor_threads / cursor_read)
 # ---------------------------------------------------------------------------
 
-async def _cursor_read(agent_id: str, n_turns: int = 5) -> str:
-    """Return the most recent transcript turns for an agent.
+def _resolve_workspace_root(project: str) -> str | None:
+    """Map a project name/alias/path to an absolute workspace_root.
 
-    Fast path: if the registry's tailer has been running for this
-    session, `last_assistant_text` and `last_user_text` are already
-    fresh. For more context, the JSONL on disk is read with the
-    existing `read_last_n_turns` helper.
+    Resolution order: registry alias -> a live registry agent's label ->
+    an absolute path -> a sibling directory of the repo root
+    (…/agi_env_v1/<project>). Returns None when nothing matches.
     """
-    agent = cursor_registry.lookup(agent_id)
-    if agent is None:
-        return json.dumps(
-            {
-                "error": (
-                    f"Unknown agent_id: {agent_id!r}. "
-                    "Call cursor_agents to list current agents."
-                ),
-            }
+    p = (project or "").strip()
+    if not p:
+        return None
+    try:
+        from .tools import PROJECT_REGISTRY
+    except Exception:
+        PROJECT_REGISTRY = {}
+    if p in PROJECT_REGISTRY:
+        return PROJECT_REGISTRY[p].rstrip("/")
+    agent = cursor_registry.lookup(p)
+    if agent is not None:
+        return agent.workspace_root.rstrip("/")
+    if os.path.isabs(p) and os.path.isdir(p):
+        return p.rstrip("/")
+    sibling = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), p
+    )
+    if os.path.isdir(sibling):
+        return sibling.rstrip("/")
+    return None
+
+
+def _fmt_local(mtime: float) -> str:
+    try:
+        return datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# cursor_threads — the durable per-thread roster (disk truth + distill cache)
+# ---------------------------------------------------------------------------
+
+async def _cursor_threads(
+    project: str = "live_visuals_4",
+    window_hours: float = 48.0,
+    limit: int = 12,
+    refresh: bool = False,
+    session_key: str = "",
+) -> str:
+    """List recent Cursor threads in `project`, each distilled to a card.
+
+    Reads the durable transcripts on disk (not the lossy in-memory
+    registry), so it sees every recent thread across restarts and tells
+    them apart by what each actually did. Distillations are cached in
+    `thread_summaries` keyed by sid+mtime — a thread is only re-distilled
+    when its transcript grows (or `refresh=True`).
+    """
+    workspace_root = _resolve_workspace_root(project)
+    if not workspace_root:
+        return json.dumps({
+            "error": (
+                f"Could not resolve project {project!r} to a workspace. Pass an "
+                "absolute path or add it to projects/registry.md."
+            ),
+        })
+
+    from .cursor_external import list_recent_threads, read_thread_digest
+    from .db import get_thread_summary, upsert_thread_summary
+    from .tools import _distill_thread
+
+    threads = list_recent_threads(
+        workspace_root, window_hours=float(window_hours), limit=int(limit)
+    )
+    project_label = os.path.basename(workspace_root.rstrip("/")) or workspace_root
+    if not threads:
+        return json.dumps({
+            "project": project_label,
+            "workspace_root": workspace_root,
+            "window_hours": window_hours,
+            "count": 0,
+            "threads": [],
+            "note": f"No Cursor threads active in the last {float(window_hours):g}h.",
+        })
+
+    sem = asyncio.Semaphore(4)
+    errors = 0
+    total_cost = 0.0
+
+    async def resolve_one(t: dict) -> dict:
+        nonlocal errors, total_cost
+        sid = t["sid"]
+        mtime = t["mtime"]
+        cached = get_thread_summary(sid)
+        is_fresh = (
+            cached is not None
+            and not refresh
+            and abs(float(cached.get("mtime") or 0.0) - mtime) < 1.0
         )
+        if is_fresh:
+            return {
+                "sid": sid[:8],
+                "label": cached.get("label") or "(unlabeled)",
+                "purpose": cached.get("purpose") or "",
+                "did": cached.get("did") or "",
+                "status": cached.get("status") or "unknown",
+                "open_question": cached.get("open_question") or "",
+                "turns": cached.get("turns") or 0,
+                "last_active": _fmt_local(mtime),
+                "cached": True,
+            }
+        async with sem:
+            digest = await asyncio.to_thread(read_thread_digest, t["transcript_path"])
+            turns = int(digest.get("turns", 0))
+            try:
+                card, cost = await _distill_thread(
+                    project_label=project_label, digest=digest
+                )
+                total_cost += cost
+            except Exception as e:
+                log.exception("distill failed for thread %s", sid)
+                errors += 1
+                tail = (digest.get("recent_assistant_texts") or [""])[-1]
+                return {
+                    "sid": sid[:8],
+                    "label": "DISTILL FAILED",
+                    "purpose": "",
+                    "did": tail[:240],
+                    "status": "unknown",
+                    "open_question": "",
+                    "turns": turns,
+                    "last_active": _fmt_local(mtime),
+                    "error": str(e)[:200],
+                }
+        label = str(card.get("label") or "")[:120] or "(unlabeled)"
+        purpose = str(card.get("purpose") or "")[:600]
+        did = str(card.get("did") or "")[:800]
+        status = str(card.get("status") or "unknown")[:40]
+        open_q = str(card.get("open_question") or "")[:600]
+        upsert_thread_summary(
+            sid=sid,
+            workspace_root=workspace_root,
+            project_label=project_label,
+            mtime=mtime,
+            turns=turns,
+            label=label,
+            purpose=purpose,
+            did=did,
+            status=status,
+            open_question=open_q,
+            model_id=config.distill_model,
+        )
+        return {
+            "sid": sid[:8],
+            "label": label,
+            "purpose": purpose,
+            "did": did,
+            "status": status,
+            "open_question": open_q,
+            "turns": turns,
+            "last_active": _fmt_local(mtime),
+            "cached": False,
+        }
+
+    rows = await asyncio.gather(*(resolve_one(t) for t in threads))
+    out: dict = {
+        "project": project_label,
+        "workspace_root": workspace_root,
+        "window_hours": window_hours,
+        "count": len(rows),
+        "threads": rows,
+    }
+    if errors:
+        out["distill_errors"] = errors
+    if total_cost:
+        out["distill_cost_usd"] = round(total_cost, 4)
+    return json.dumps(out)
+
+
+# ---------------------------------------------------------------------------
+# cursor_read — fresh transcript for one thread (live or dormant), by handle
+# ---------------------------------------------------------------------------
+
+async def _cursor_read(agent_id: str, n_turns: int = 5, sid: str = "") -> str:
+    """Return recent transcript turns for one specific Cursor thread.
+
+    Honors a precise thread handle: `<project>/<sid_prefix>` (or an explicit
+    `sid`) reads THAT transcript off disk — even a dormant thread the live
+    registry never heard of — instead of always the workspace's current
+    session. A bare project/agent handle reads its current/latest session.
+    """
+    from .cursor_external import (
+        _latest_transcript_path,
+        find_transcript_by_sid,
+        list_recent_plans,
+        read_last_n_turns,
+    )
+    from .cursor_registry import _sid_from_transcript_path
+
+    raw = (agent_id or "").strip()
+    sid_prefix = (sid or "").strip()
+    label = raw
+    if not sid_prefix and "/" in raw and not raw.startswith("/"):
+        label, sid_prefix = raw.split("/", 1)
+
+    agent = cursor_registry.lookup(raw) or cursor_registry.lookup(label)
+    workspace_root = agent.workspace_root if agent else _resolve_workspace_root(label)
+    if not workspace_root:
+        return json.dumps({
+            "error": (
+                f"Unknown agent/thread {agent_id!r}. Call cursor_threads or "
+                "cursor_agents to list current threads."
+            ),
+        })
+
+    transcript_path = None
+    if sid_prefix:
+        transcript_path = find_transcript_by_sid(workspace_root, sid_prefix)
+        if not transcript_path:
+            return json.dumps({
+                "error": f"No transcript for sid {sid_prefix!r} in {label}.",
+            })
+    elif agent and agent.current_sid:
+        sess = agent.sessions.get(agent.current_sid)
+        transcript_path = sess.transcript_path if sess else None
+    if not transcript_path:
+        transcript_path = _latest_transcript_path(workspace_root)
 
     n = max(1, min(int(n_turns) if n_turns else 5, 25))
     turns: list[dict] = []
-    sess = agent.sessions.get(agent.current_sid)
-    transcript_path = sess.transcript_path if sess else None
-
-    from .cursor_external import list_recent_plans, read_last_n_turns
-
     if transcript_path and os.path.exists(transcript_path):
-        turns = read_last_n_turns(
-            agent.workspace_root, n=n, explicit_path=transcript_path
-        )
-    if not turns:
+        turns = read_last_n_turns(workspace_root, n=n, explicit_path=transcript_path)
+    if not turns and agent:
         if agent.last_user_text:
             turns.append(
                 {"role": "user", "text": agent.last_user_text, "has_tool_use": False}
             )
         if agent.last_assistant_text:
             turns.append(
-                {
-                    "role": "assistant",
-                    "text": agent.last_assistant_text,
-                    "has_tool_use": False,
-                }
+                {"role": "assistant", "text": agent.last_assistant_text, "has_tool_use": False}
             )
 
     plans = list_recent_plans(max_age_sec=600, limit=5)
-
-    return json.dumps(
-        {
-            "agent_id": agent.agent_id,
-            "workspace_root": agent.workspace_root,
-            "project_label": agent.project_label,
-            "source": agent.source,
-            "status": agent.status,
-            "current_sid": agent.current_sid,
-            "pending_question": agent.pending_question,
-            "turns_returned": len(turns),
-            "turns": turns,
-            "recent_plans": plans,
-        }
-    )
+    return json.dumps({
+        "agent_id": raw,
+        "workspace_root": workspace_root,
+        "project_label": agent.project_label if agent else os.path.basename(workspace_root),
+        "source": agent.source if agent else "disk",
+        "status": agent.status if agent else "unknown",
+        "sid": _sid_from_transcript_path(transcript_path),
+        "pending_question": agent.pending_question if agent else None,
+        "turns_returned": len(turns),
+        "turns": turns,
+        "recent_plans": plans,
+    })
 
 
 # ---------------------------------------------------------------------------

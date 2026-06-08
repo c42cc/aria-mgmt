@@ -29,6 +29,7 @@ from .db import (
     tool_to_product,
     upsert_cursor_session,
 )
+from .cursor_registry import cursor_registry
 from .cursor_tools import (
     _cursor_agents,
     _cursor_read,
@@ -36,7 +37,9 @@ from .cursor_tools import (
     _cursor_send,
     _cursor_spawn,
     _cursor_status_new,
+    _cursor_threads,
 )
+from .conversation import conversation
 from .memory import recall as mem_recall, remember as mem_remember, forget as mem_forget
 from .prompts import (
     clear_cache as prompts_clear_cache,
@@ -616,6 +619,7 @@ async def handle_tool_call(name: str, args: dict) -> str:
     """Dispatch a tool call by name. Returns JSON string."""
     handlers = {
         "plan_with_claude": _plan_with_claude,
+        "package_audit_findings": _package_audit_findings,
         "build_with_cursor": _build_with_cursor,
         "query_cursor": _query_cursor,
         "cursor_status": _cursor_status_new,
@@ -647,6 +651,7 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "cursor_send": _cursor_send,
         "cursor_spawn": _cursor_spawn,
         "cursor_screenshot": _cursor_screenshot,
+        "cursor_threads": _cursor_threads,
         # Discord text-history tools — read-only.
         "discord_recent_messages": _discord_recent_messages,
         "discord_list_threads": _discord_list_threads,
@@ -895,6 +900,185 @@ async def _plan_with_claude_ucs(
 
 
 # ---------------------------------------------------------------------------
+# Package audit findings
+# ---------------------------------------------------------------------------
+
+AUDIT_FINDINGS_FILENAME = "audit_findings.md"
+
+
+async def _package_audit_findings(
+    agent_id: str,
+    scope_hint: str = "",
+    n_recent_turns: int = 20,
+    session_key: str = "",
+) -> str:
+    """Synthesize the recent voice dialogue into structured audit findings.
+
+    The audit-review flow has two distinct moments. (1) Corbin and Aria
+    have a normal dialogue while he watches Cursor's visible audit run.
+    (2) When he says "package that up," Aria calls this tool — once —
+    and Claude turns the dialogue into structured findings appended to
+    `<workspace_root>/audit_findings.md`. Nothing is sent to Cursor here;
+    that is a separate `cursor_send` (or `propose_action`) on Corbin's
+    explicit yes.
+
+    Reads:
+    - last `n_recent_turns` from the shared `conversation` buffer.
+    - existing `<workspace_root>/audit_findings.md` (Cursor's first pass).
+
+    Writes:
+    - appends a `# Human review — <ts>` block to `audit_findings.md`.
+    - posts a plain-English summary to `#ucs` via the post callback.
+    """
+    if not _anthropic_client:
+        return json.dumps({"error": "Anthropic client not initialized"})
+
+    agent = cursor_registry.lookup(agent_id)
+    if agent is None:
+        return json.dumps({
+            "error": (
+                f"Unknown agent_id: {agent_id!r}. "
+                "Call cursor_agents to list current agents."
+            ),
+        })
+
+    workspace_root = agent.workspace_root
+    if not workspace_root or not os.path.isdir(workspace_root):
+        return json.dumps({
+            "error": (
+                f"agent.workspace_root is not a directory on disk: "
+                f"{workspace_root!r}"
+            ),
+        })
+
+    findings_path = os.path.join(workspace_root, AUDIT_FINDINGS_FILENAME)
+    existing_findings = ""
+    if os.path.exists(findings_path):
+        with open(findings_path) as f:
+            existing_findings = f.read()
+
+    recent = conversation.recent(max_turns=max(1, int(n_recent_turns)))
+    if not recent:
+        return json.dumps({
+            "error": (
+                "No recent conversation turns to package. Talk through the "
+                "findings with Aria first, then ask her to package them."
+            ),
+        })
+
+    dialogue_lines: list[str] = []
+    for t in recent:
+        if t.role == "user":
+            speaker = "Corbin"
+        elif t.role == "aria":
+            speaker = "Aria"
+        else:
+            continue
+        dialogue_lines.append(f"{speaker} ({t.medium}): {t.short()}")
+
+    if not dialogue_lines:
+        return json.dumps({
+            "error": (
+                "Recent turns contain no user or Aria speech — nothing to "
+                "package."
+            ),
+        })
+
+    sections: list[str] = []
+    if scope_hint.strip():
+        sections.append(f"## Scope hint from Corbin\n{scope_hint.strip()}")
+    sections.append(
+        "## Recent dialogue (oldest first)\n" + "\n".join(dialogue_lines)
+    )
+    sections.append(
+        "## Existing audit_findings.md\n"
+        + (existing_findings.strip() or
+           "(empty — Cursor has not written a first pass yet)")
+    )
+    context = "\n\n".join(sections)
+
+    template = load_template("audit_packaging")
+
+    started_at = time.monotonic()
+    started_at_iso = _now_iso()
+    response = await asyncio.to_thread(
+        _anthropic_client.messages.create,
+        model=config.claude_model,
+        system=template,
+        messages=[{"role": "user", "content": context}],
+        max_tokens=4096,
+    )
+    latency_ms = int((time.monotonic() - started_at) * 1000)
+    result_text = response.content[0].text.strip()
+
+    cost = 0.0
+    if response.usage:
+        cost = _estimate_cost(
+            response.usage.input_tokens, response.usage.output_tokens
+        )
+    log_event(
+        "package_audit_findings",
+        {
+            "agent_id": agent_id,
+            "scope_hint": scope_hint,
+            "n_recent_turns": n_recent_turns,
+            "session_key": session_key,
+        },
+        result_text[:200],
+        latency_ms,
+        session_key,
+        cost,
+    )
+    log_loop_execution(
+        tool_name="package_audit_findings",
+        session_key=session_key,
+        prompt_template="audit_packaging",
+        model_id=config.claude_model,
+        tokens_in=response.usage.input_tokens if response.usage else None,
+        tokens_out=response.usage.output_tokens if response.usage else None,
+        cost_usd=cost,
+        latency_ms=latency_ms,
+        iterations=1,
+        status="completed",
+        started_at=started_at_iso,
+    )
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    new_block = f"\n\n# Human review — {timestamp}\n\n{result_text}\n"
+    with open(findings_path, "a") as f:
+        f.write(new_block)
+
+    finding_titles = [
+        ln[3:].strip()
+        for ln in result_text.splitlines()
+        if ln.startswith("## ") and not ln.startswith("## Dispatch note")
+    ]
+
+    project_label = agent.project_label or os.path.basename(
+        workspace_root.rstrip("/")
+    )
+    post_body = (
+        f"**Audit review packaged — {len(finding_titles)} finding"
+        f"{'s' if len(finding_titles) != 1 else ''}**\n"
+        f"Project: `{project_label}`. File: `{findings_path}`.\n"
+        f"Next: tell Aria \"send to Cursor\" to dispatch, or talk through "
+        f"changes first.\n\n"
+        f"{result_text}"
+    )
+    if _post_callback:
+        await _post_callback(post_body)
+
+    return json.dumps({
+        "ok": True,
+        "agent_id": agent.agent_id,
+        "workspace_root": workspace_root,
+        "findings_path": findings_path,
+        "finding_count": len(finding_titles),
+        "finding_titles": finding_titles,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Build with Cursor
 # ---------------------------------------------------------------------------
 
@@ -1035,6 +1219,83 @@ async def _discord_list_threads(channel: str = "ucs") -> str:
 # improvisation that caused the historical 42c.pw failure.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cursor thread distillation (cheap-model summaries for the thread roster)
+# ---------------------------------------------------------------------------
+
+# claude-haiku per-million-token rates (models.yaml::claude-haiku). The
+# distiller runs on config.distill_model — a Haiku — so spend is tracked at
+# Haiku rates, not Opus. If distill_model is repointed at a pricier model,
+# update these to match so the daily cap stays honest.
+_DISTILL_COST_PER_M_IN = 0.25
+_DISTILL_COST_PER_M_OUT = 1.25
+
+
+def _parse_distill_json(text: str) -> dict:
+    """Extract the JSON object a distill turn returned. Loud on failure."""
+    if not text:
+        raise ValueError("distiller returned empty text")
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"distiller returned no JSON object: {text[:160]!r}")
+    return json.loads(text[start : end + 1])
+
+
+async def _distill_thread(*, project_label: str, digest: dict) -> tuple[dict, float]:
+    """Distill one thread digest into a card via the cheap model. Raises loud.
+
+    Returns (card, cost_usd). `card` has label/purpose/did/status/open_question.
+    No silent fallback: a missing client or unparseable output raises so the
+    caller surfaces the failure on that thread's row rather than hiding it.
+    """
+    if not _anthropic_client:
+        raise RuntimeError("Anthropic client not initialized — cannot distill thread")
+    template = load_template("distill_thread")
+    payload = {
+        "project": project_label,
+        "intent": digest.get("first_user_text", ""),
+        "turns": digest.get("turns", 0),
+        "recent_assistant_turns": digest.get("recent_assistant_texts", []),
+    }
+    started = time.monotonic()
+    started_iso = _now_iso()
+    resp = await asyncio.to_thread(
+        _anthropic_client.messages.create,
+        model=config.distill_model,
+        system=template,
+        messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        max_tokens=500,
+    )
+    latency_ms = int((time.monotonic() - started) * 1000)
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    ).strip()
+    cost = 0.0
+    if resp.usage:
+        cost = (
+            resp.usage.input_tokens / 1_000_000 * _DISTILL_COST_PER_M_IN
+            + resp.usage.output_tokens / 1_000_000 * _DISTILL_COST_PER_M_OUT
+        )
+    log_loop_execution(
+        tool_name="distill_thread",
+        session_key="",
+        prompt_template="distill_thread",
+        model_id=config.distill_model,
+        tokens_in=resp.usage.input_tokens if resp.usage else None,
+        tokens_out=resp.usage.output_tokens if resp.usage else None,
+        cost_usd=cost,
+        latency_ms=latency_ms,
+        iterations=1,
+        status="completed",
+        started_at=started_iso,
+    )
+    # Record spend in events too so the daily cap accounts for distillation.
+    log_event("distill_thread", {"project": project_label}, text[:200], latency_ms, "", cost)
+    card = _parse_distill_json(text)
+    return card, cost
+
+
 _CREATE_42C_TOOL_SCHEMA: dict[str, Any] = {
     "name": "create_42c_account",
     "description": (
@@ -1053,6 +1314,71 @@ _CREATE_42C_TOOL_SCHEMA: dict[str, Any] = {
             "label": {"type": "string", "description": "Optional note about who the account is for, e.g. the person's name."},
         },
         "required": ["username", "password"],
+    },
+}
+
+
+# Cursor-thread tools, mirrored into the text (do_with_claude) agent loop so a
+# "#ucs" message gets the same durable, per-thread answers Aria gives in voice.
+_CURSOR_THREADS_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "cursor_threads",
+    "description": (
+        "List the recent Cursor coding threads in a project (default "
+        "live_visuals_4), each distilled into a plain-English card: a short "
+        "label, what it set out to do, what it actually did, status, and any "
+        "open question. THIS is how you answer 'what's going on in <project>?' "
+        "or 'what is each thread?' — call it instead of guessing from watch "
+        "events. Threads are the user's parallel Cursor agents; their real "
+        "names are UUIDs, so read back the distilled labels."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "project": {"type": "string", "description": "Project name (default 'live_visuals_4'), a registry alias, or an absolute workspace path."},
+            "window_hours": {"type": "number", "description": "Only threads active within this many hours (default 48)."},
+            "limit": {"type": "integer", "description": "Max threads to return, newest first (default 12)."},
+            "refresh": {"type": "boolean", "description": "Re-distill even cached threads (default false). Use only if asked for a fresh read."},
+        },
+        "required": [],
+    },
+}
+
+_CURSOR_READ_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "cursor_read",
+    "description": (
+        "Read the recent transcript turns of a specific Cursor thread to dig "
+        "deeper after cursor_threads. Pass the thread handle as "
+        "'<project>/<sid_prefix>' (e.g. 'live_visuals_4/57480d46') to target "
+        "one exact thread, or a project/agent handle for its current session."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string", "description": "Thread/agent handle, e.g. 'live_visuals_4/57480d46' or a workspace path."},
+            "n_turns": {"type": "integer", "description": "How many recent turns to return (default 5, max 25)."},
+            "sid": {"type": "string", "description": "Optional explicit transcript sid (full or prefix) if not encoded in agent_id."},
+        },
+        "required": ["agent_id"],
+    },
+}
+
+_CURSOR_SEND_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "cursor_send",
+    "description": (
+        "Send a message/instruction to a Cursor thread (chat), or approve / "
+        "reject / cancel it. Use to act across threads after cursor_threads. "
+        "SDK-spawned threads accept any kind; an IDE thread routes to its "
+        "focused window."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string", "description": "Thread/agent handle from cursor_threads/cursor_agents."},
+            "message": {"type": "string", "description": "The message to send (for kind=chat/new_agent/cancel)."},
+            "kind": {"type": "string", "description": "chat | new_agent | approve | reject | cancel. Default chat."},
+            "note": {"type": "string", "description": "Optional note appended to approve/reject."},
+        },
+        "required": ["agent_id"],
     },
 }
 
@@ -1114,10 +1440,15 @@ async def _create_42c_account(
         return json.dumps({"error": "username must not contain ':' or whitespace"})
 
     c42_dir = config.c42_public_dir
+    # The credential's single home is c42_public/.htpasswd; the canonical deploy
+    # script that ships it lives one level up at the repo root (it bakes
+    # c42_public into the alive-river Fly image). c42_public has no deploy.sh of
+    # its own.
+    repo_root = os.path.dirname(c42_dir)
     htpasswd_path = os.path.join(c42_dir, ".htpasswd")
-    deploy_script = os.path.join(c42_dir, "deploy.sh")
+    deploy_script = os.path.join(repo_root, "deploy.sh")
     if not os.path.isdir(c42_dir) or not os.path.exists(deploy_script):
-        return json.dumps({"error": f"42c.pw project not found at {c42_dir}"})
+        return json.dumps({"error": f"42c.pw deploy script not found at {deploy_script}"})
 
     try:
         hashed = await asyncio.to_thread(_apr1_hash, password)
@@ -1140,7 +1471,7 @@ async def _create_42c_account(
             subprocess.run,
             ["bash", deploy_script],
             capture_output=True, text=True,
-            timeout=config.c42_deploy_timeout_sec, cwd=c42_dir,
+            timeout=config.c42_deploy_timeout_sec, cwd=repo_root,
         )
     except Exception as e:
         log.exception("create_42c_account: deploy failed to run")
@@ -1160,6 +1491,26 @@ async def _create_42c_account(
         "url": url, "username": username, "password": password, "label": label,
         "share_text": f"Login at {url} — username: {username}, password: {password}",
     })
+
+
+# Local (non-MCP) tools the do_with_claude loop can dispatch alongside the MCP
+# catalog. create_42c_account provisions a login deterministically; the cursor_*
+# tools give the text agent the same durable Cursor-thread introspection and
+# dispatch Aria has in voice, so "#ucs: what are the live_visuals_4 threads?" is
+# answered from transcripts, not two clobbered watch events. One table, one
+# dispatch site — no per-tool special-casing.
+_LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    _CREATE_42C_TOOL_SCHEMA,
+    _CURSOR_THREADS_TOOL_SCHEMA,
+    _CURSOR_READ_TOOL_SCHEMA,
+    _CURSOR_SEND_TOOL_SCHEMA,
+]
+_LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
+    "create_42c_account": _create_42c_account,
+    "cursor_threads": _cursor_threads,
+    "cursor_read": _cursor_read,
+    "cursor_send": _cursor_send,
+}
 
 
 async def _do_with_claude(
@@ -1188,10 +1539,10 @@ async def _do_with_claude_legacy(
         from .mcp import mcp_client
         if not mcp_client:
             return json.dumps({"error": "MCP client not initialized"})
-        # Local deterministic tools the loop can dispatch alongside MCP tools.
-        # create_42c_account is injected here so Claude provisions a 42c.pw
-        # account as one step instead of improvising shell commands.
-        tools = mcp_client.list_tools_anthropic() + [_CREATE_42C_TOOL_SCHEMA]
+        # Local deterministic tools the loop can dispatch alongside MCP tools
+        # (account provisioning + the durable Cursor-thread surface). Dispatched
+        # below via _LOCAL_TOOL_HANDLERS — one table, no per-tool branch.
+        tools = mcp_client.list_tools_anthropic() + _LOCAL_TOOL_SCHEMAS
     except ImportError:
         return json.dumps({"error": "MCP module not available"})
 
@@ -1338,10 +1689,12 @@ async def _do_with_claude_legacy(
                 )
             else:
                 await _emit_progress(session_key, _humanize_step(block.name, tool_args))
-                if block.name == "create_42c_account":
+                local_handler = _LOCAL_TOOL_HANDLERS.get(block.name)
+                if local_handler is not None:
                     local_args = dict(tool_args)
-                    local_args.setdefault("session_key", session_key)
-                    result_str = await _create_42c_account(**local_args)
+                    if block.name == "create_42c_account":
+                        local_args.setdefault("session_key", session_key)
+                    result_str = await local_handler(**local_args)
                 else:
                     tool_result = await mcp_client.call_tool(
                         block.name, tool_args, session_key=session_key,

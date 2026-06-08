@@ -1,0 +1,42 @@
+---
+description: How 42c.pw / c42.io login accounts are created and where the credential lives
+globs: src/tools.py,scripts/e2e_42c_invite.py
+alwaysApply: false
+---
+
+# Hub login accounts (42c.pw + c42.io)
+
+Aria provisions website logins with the `create_42c_account` tool in
+[`src/tools.py`](src/tools.py). 42c.pw (the gated hub) and the c42.io login form
+run on ONE nginx and share ONE credential file, so a single account works for
+both. Do not build a second account path.
+
+## The credential has one home
+
+`c42_public/.htpasswd` (apr1 hashes) is the single home for every login. The
+plaintext admin credential lives once in the repo-root `.env`
+(`HUB_BASIC_AUTH_USER` / `HUB_BASIC_AUTH_PASSWORD`); `.htpasswd` is its hashed
+copy. Rotation edits both in the same change.
+
+- NEVER bake a password into `c42_public/Dockerfile` (no `RUN htpasswd -b ...`).
+  The image only `COPY`s `.htpasswd` in; a baked password leaks in an image layer.
+- NEVER ask the user for the password and never improvise `openssl`/`htpasswd`
+  shell commands. `create_42c_account` is the only writer of `.htpasswd`.
+
+## The flow (already implemented — do not reinvent)
+
+`create_42c_account(username, password)`:
+1. `_apr1_hash` — `openssl passwd -apr1` (the format nginx reads).
+2. `_upsert_htpasswd` — idempotent add/replace of the `user:hash` line.
+3. deploy — runs the **repo-root** `deploy.sh` (NOT `c42_public/deploy.sh`,
+   which does not exist). It bakes `c42_public` into the `alive-river` Fly image.
+4. `_verify_42c_login` — curls the live site with the new creds.
+
+The deploy needs flyctl plus the sibling repos the root `deploy.sh` stages
+(`alive_river`, `live_visuals_4`, the protein venv). If those are missing the
+deploy fails loudly — surface the error, don't swallow it.
+
+## Verify
+
+`python scripts/e2e_42c_invite.py --no-deploy --no-send` for a dry run, or no
+flags for the real create-account-then-text path.

@@ -34,6 +34,56 @@ TOOL_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="package_audit_findings",
+        description=(
+            "Turn the recent voice dialogue between you and Corbin into "
+            "structured audit findings appended to "
+            "`<workspace_root>/audit_findings.md`. Call this ONLY when "
+            "Corbin explicitly asks you to package, wrap up, or write up "
+            "what you just discussed during a UI audit review — never on "
+            "every utterance. The tool reads the conversation buffer "
+            "itself; you do not pass the dialogue as an argument. It "
+            "posts a plain-English summary to #ucs and returns the "
+            "finding titles. It does NOT send anything to Cursor — after "
+            "this returns, ask Corbin \"Send to Cursor?\" and on yes "
+            "call cursor_send (or wrap in propose_action for a "
+            "tap-to-approve card)."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(
+                    type="STRING",
+                    description=(
+                        "Agent handle from cursor_agents — the Cursor "
+                        "agent whose workspace owns audit_findings.md."
+                    ),
+                ),
+                "scope_hint": types.Schema(
+                    type="STRING",
+                    description=(
+                        "Optional short phrase from Corbin bounding "
+                        "which part of the dialogue to package "
+                        "(e.g. \"the date picker stuff\"). Leave empty "
+                        "for the whole recent review."
+                    ),
+                ),
+                "n_recent_turns": types.Schema(
+                    type="INTEGER",
+                    description=(
+                        "How many recent conversation turns to read "
+                        "(default 20, plenty for a short review)."
+                    ),
+                ),
+                "session_key": types.Schema(
+                    type="STRING",
+                    description="Discord thread/channel id.",
+                ),
+            },
+            required=["agent_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="build_with_cursor",
         description="Start a Cursor agent to build/edit code on a project using an approved plan.",
         parameters=types.Schema(
@@ -273,18 +323,44 @@ TOOL_DECLARATIONS = [
         parameters=types.Schema(type="OBJECT", properties={}),
     ),
     types.FunctionDeclaration(
-        name="cursor_read",
+        name="cursor_threads",
         description=(
-            "Read the most recent transcript turns for a Cursor agent identified "
-            "by `agent_id`. Fresh from the registry's live JSONL tailer, with a "
-            "fallback to the on-disk transcript if the tailer hasn't started. "
-            "Includes recent plan files for the workspace."
+            "The way to answer 'what's going on in <project>?' or 'what is each "
+            "thread?'. Lists the recent Cursor coding threads in a project "
+            "(default live_visuals_4), each distilled into a plain-English card: "
+            "a short label, what it set out to do, what it actually did, status, "
+            "and any open question. Threads are Corbin's parallel Cursor agents; "
+            "their real names are UUIDs, so read back the distilled labels — one "
+            "tight line each (label — what it did — status). Reads the durable "
+            "transcripts, so it is correct across restarts; do NOT answer thread "
+            "questions from memory or watch events when you can call this."
         ),
         parameters=types.Schema(
             type="OBJECT",
             properties={
-                "agent_id": types.Schema(type="STRING", description="Agent handle from cursor_agents."),
+                "project": types.Schema(type="STRING", description="Project name (default 'live_visuals_4'), registry alias, or absolute workspace path."),
+                "window_hours": types.Schema(type="NUMBER", description="Only threads active within this many hours (default 48)."),
+                "limit": types.Schema(type="INTEGER", description="Max threads, newest first (default 12)."),
+                "refresh": types.Schema(type="BOOLEAN", description="Re-distill even cached threads (default false)."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="cursor_read",
+        description=(
+            "Read the most recent transcript turns for ONE specific Cursor "
+            "thread, to dig deeper after cursor_threads. Pass the thread handle "
+            "as '<project>/<sid_prefix>' (e.g. 'live_visuals_4/57480d46') to "
+            "target one exact thread — including a dormant one — or a bare "
+            "project/agent handle for its current session. Includes recent plan "
+            "files for the workspace."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(type="STRING", description="Thread handle, e.g. 'live_visuals_4/57480d46', or a workspace/agent handle."),
                 "n_turns": types.Schema(type="INTEGER", description="Number of recent turns to return (default 5, max 25)."),
+                "sid": types.Schema(type="STRING", description="Optional explicit transcript sid (full or prefix) if not encoded in agent_id."),
             },
             required=["agent_id"],
         ),

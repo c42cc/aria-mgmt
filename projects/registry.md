@@ -15,6 +15,7 @@ unicode →). Names should be short and pronounceable for voice — Aria says
 them out loud.
 
 - ucs → /Users/corbin/PycharmProjects/agi_env_v1/ucs2
+- live_visuals_4 → /Users/corbin/PycharmProjects/agi_env_v1/live_visuals_4
 
 <!--
 ADD YOUR TWO OTHER PRODUCT PROJECTS HERE. Examples:

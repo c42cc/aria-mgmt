@@ -36,6 +36,11 @@ class Config:
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     claude_model: str = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
     cursor_model: str = os.getenv("CURSOR_MODEL", "composer-2")
+    # Cheap distillation model for high-volume, low-stakes summarization
+    # (Cursor thread roster). This is the sanctioned "memory synthesis may
+    # use Haiku" exception to the Opus-only rule — never Sonnet. The slug is
+    # set only here / via .env.
+    distill_model: str = os.getenv("CLAUDE_DISTILL_MODEL", "claude-haiku-4-5")
 
     # Cost guardrails
     daily_spend_cap_usd: float = float(os.getenv("DAILY_SPEND_CAP_USD", "20"))

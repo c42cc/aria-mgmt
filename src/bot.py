@@ -57,6 +57,13 @@ _grok_paused: bool = False
 
 _pending_voice_channel_id: str | None = None
 
+# Background task that follows the authorized user into voice after a bare
+# Discord gateway RESUME (which re-establishes the session WITHOUT re-firing
+# on_ready, so the post-preflight rescan that normally follows the user is
+# skipped). Started once in on_ready's boot-only init.
+_voice_reconcile_task: asyncio.Task | None = None
+_VOICE_RECONCILE_INTERVAL_SEC = 30.0
+
 _wake_listener = None          # WakeWordListener | None (typed loosely to avoid import at module level)
 _local_speaker: SpeakerOutput | None = None
 _local_session_active: bool = False
@@ -338,6 +345,36 @@ def _looks_like_control_plane_error(result: str) -> bool:
     return False
 
 
+def _clip(text: str, max_len: int) -> str:
+    """Truncate `text` to <= max_len chars at a clean boundary, with an ellipsis.
+
+    Decision/proposal cards quote a thread's last message so Corbin has the
+    context to approve or skip. The old `text[:n]` slices cut those quotes
+    mid-word — often mid-sentence, right before the detail that justified the
+    decision — and dropped the rest silently. Because the slice happened
+    *before* the card was sent, the discarded text never reached Discord at
+    all: the card looked complete but the substance was gone.
+
+    This prefers a sentence end, then a word boundary, in the back half of the
+    window (so a boundary-free run can't collapse the quote to almost nothing),
+    and appends a single ellipsis so the cut is visibly a cut rather than a
+    surprise stop.
+    """
+    body = text.strip()
+    if len(body) <= max_len:
+        return body
+    window = body[: max_len - 1]  # reserve one char for the ellipsis
+    floor = max_len // 2
+    sentence_cut = max(window.rfind(". "), window.rfind("! "),
+                       window.rfind("? "), window.rfind("\n"))
+    if sentence_cut >= floor:
+        return window[: sentence_cut + 1].rstrip() + "\u2026"
+    space_cut = window.rfind(" ")
+    if space_cut >= floor:
+        return window[:space_cut].rstrip() + "\u2026"
+    return window.rstrip() + "\u2026"
+
+
 def _split_at_paragraphs(text: str, max_len: int = 1900) -> list[str]:
     """Split text into Discord-safe chunks (<= max_len), preferring paragraph
     then line boundaries. Falls back to a hard slice for runs that contain
@@ -520,7 +557,7 @@ async def _post_proposal_card(
     body = (
         f"{mention}Quick decision for you: {title}\n"
         + (f"{why}\n" if why else "")
-        + f"\nWhat I'd do: {task[:400]}\n\n"
+        + f"\nWhat I'd do: {_clip(task, 400)}\n\n"
         f"Tap \u2705 to go ahead, or \u274c to skip."
     )
     ch = bot.get_channel(int(config.discord_text_channel_id))
@@ -1017,15 +1054,17 @@ async def _on_voice_exit_timeout() -> None:
         log.exception("Failed to post voice exit alert")
 
 
-async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
-    """Join the voice channel and bring up the right AI session for it.
+async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> bool:
+    """Reconcile voice to `channel` and bring up the right AI session for it.
 
-    Used by both on_voice_state_update (when user joins voice) and the
-    on_ready post-preflight rescan (when the user was already in voice
-    or joined during preflight).
-
-    Picks the Grok/SpicyLit pipeline when the channel matches
+    The single voice-presence entry point. Used by on_voice_state_update
+    (user joins/moves), the on_ready post-preflight rescan, and the !join
+    command. Picks the Grok/SpicyLit pipeline when the channel matches
     DISCORD_SPICYLIT_CHANNEL_ID, otherwise the Gemini/Aria pipeline.
+
+    Returns True when voice + the AI pipeline are live in `channel`, False
+    on any refusal (bridge down, transition busy, pipeline bring-up failed)
+    so callers surface it instead of claiming success.
     """
     global _spicylit_active, _grok_session, _grok_session_started_at
     global _last_audio_received_at
@@ -1035,43 +1074,48 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
         and str(channel.id) == config.discord_spicylit_channel_id
     )
 
-    if voice_controller.in_voice:
+    # Idempotent no-op only when already correctly connected in THIS
+    # channel. The channel comparison is load-bearing: without it a lurking
+    # Aria treats a join to any other channel as "already here" and never
+    # follows the user out of the channel she is parked in.
+    already_here = (
+        voice_controller.in_voice
+        and voice_controller.channel_id == str(channel.id)
+    )
+    if already_here:
         if is_spicylit and _spicylit_active and _grok_session and _grok_session.connected:
-            log.info("SpicyLit already active in %s — skipping duplicate join", channel.name)
-            return
+            log.info("SpicyLit already active in %s — nothing to reconcile", channel.name)
+            return True
         if not is_spicylit and gemini and gemini.connected:
-            log.info("Gemini already active in voice — skipping duplicate join")
-            return
+            log.info("Gemini already active in %s — nothing to reconcile", channel.name)
+            return True
 
     if not voice_bridge.alive:
         log.warning("Asked to auto-join %s but voice bridge not alive", channel.name)
-        return
+        return False
 
     if _local_session_active:
         await _close_local_session()
     if _wake_listener:
         _wake_listener.pause()
 
-    # Lurk-mode rejoin: bridge is already in the channel (we never called
-    # leave when the user left). Skip bridge.join — it's a no-op — and
-    # respawn just the silence watchdog + AI pipeline below.
-    lurk_rejoin = voice_controller.in_voice and config.aria_lurk_in_voice
-    if lurk_rejoin:
-        log.info("Lurk-mode rejoin for %s — re-arming AI pipeline only", channel.name)
-        await voice_controller.rearm_watchdog_for_lurk(
-            audio_callback=_on_voice_audio,
-            on_watchdog_expire=_on_voice_exit_timeout,
-        )
-    else:
-        joined = await voice_controller.join(
+    # One presence primitive reconciles voice to this channel: fresh
+    # connect, channel move, and lurk re-entry are the same call. Lurk is a
+    # leave-time policy (we never depart when the user does); it does not
+    # fork the join path. A move out of a lurked channel works because the
+    # sidecar's doJoin tears down the old connection first.
+    try:
+        await voice_controller.ensure_in_channel(
             str(channel.id),
             audio_callback=_on_voice_audio,
             on_watchdog_expire=_on_voice_exit_timeout,
         )
-        if not joined:
-            log.info("Voice join skipped for %s (already in voice or transition in progress)", channel.name)
-            return
-        log.info("Joined voice channel %s", channel.name)
+    except VoiceTransitionBusy:
+        log.warning(
+            "Voice transition already in flight — not reconciling to %s", channel.name
+        )
+        return False
+    log.info("Voice reconciled to %s", channel.name)
 
     _last_audio_received_at = 0.0
     _cancel_audio_tasks()
@@ -1079,7 +1123,7 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
     if is_spicylit:
         if not config.grok_api_key:
             log.error("Joined #spicy-lit but GROK_API_KEY not set — no audio pipeline")
-            return
+            return False
 
         if _grok_session and _grok_session.connected:
             log.warning("Closing leaked Grok session before creating new one")
@@ -1119,7 +1163,7 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
                 await gemini.connect()
             except Exception:
                 log.exception("Failed to connect Gemini on auto-join")
-                return
+                return False
 
         _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
         _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
@@ -1138,6 +1182,8 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> None:
             except Exception:
                 log.exception("Failed to inject join context into Gemini")
 
+    return True
+
 
 def _find_authorized_user_voice_channel() -> discord.VoiceChannel | None:
     """Return the voice channel the authorized user is currently in, if any."""
@@ -1147,6 +1193,50 @@ def _find_authorized_user_voice_channel() -> discord.VoiceChannel | None:
                 if str(m.id) in config.authorized_user_ids:
                     return vc
     return None
+
+
+async def _voice_presence_reconcile_loop() -> None:
+    """Slow self-healer that follows the user into voice after a gateway RESUME.
+
+    `on_voice_state_update` only fires on a *transition*; a bare Discord
+    gateway RESUME re-attaches to a session whose voice state predates the
+    reconnect, so no join event is replayed and `on_ready` (which would run
+    the rescan) does not re-fire either. The result is Aria sitting idle
+    while the user waits in a channel. This loop closes that gap: on a slow
+    cadence, if the authorized user is in a voice channel Aria is NOT in,
+    route it through the single presence path so she follows.
+
+    It only ever FOLLOWS — when the user is in no voice channel it does
+    nothing, leaving lurk policy (the leave-time "don't depart" rule) to own
+    presence. Steady state is a cheap membership scan with no side effects.
+    """
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(_VOICE_RECONCILE_INTERVAL_SEC)
+            if not _preflight_passed or not voice_bridge.alive:
+                continue
+            target = _find_authorized_user_voice_channel()
+            if target is None:
+                continue
+            already_following = (
+                voice_controller.in_voice
+                and voice_controller.channel_id == str(target.id)
+            )
+            if already_following:
+                continue
+            log.info(
+                "Voice reconciler: user in %s but Aria is %s — following",
+                target.name,
+                f"parked in channel {voice_controller.channel_id}"
+                if voice_controller.in_voice
+                else "not in voice",
+            )
+            await _auto_join_voice_channel(target)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Voice presence reconciler iteration failed — continuing")
 
 
 # ---------------------------------------------------------------------------
@@ -1349,6 +1439,27 @@ async def _dm_authorized_user(content: str) -> bool:
     return True
 
 
+def _cached_thread_label(sid: str) -> str:
+    """Distilled human label for a thread sid from the summaries cache, or ''.
+
+    Best-effort enrichment so concurrent threads in one workspace narrate
+    with distinct names instead of the identical `project_label`. A cache
+    miss (thread not distilled yet) is the normal case and returns ''. A
+    real DB error is logged loudly but must never break narration.
+    """
+    if not sid:
+        return ""
+    try:
+        from .db import get_thread_summary
+        row = get_thread_summary(sid)
+    except Exception:
+        log.exception("thread-summary cache lookup failed for sid=%s", sid[:8])
+        return ""
+    if not row:
+        return ""
+    return str(row.get("label") or "").strip()
+
+
 def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
     """Structured silent-context block for Gemini before the heads-up trigger.
 
@@ -1361,6 +1472,11 @@ def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
     lines.append(f"  agent_id: {agent.agent_id}")
     lines.append(f"  workspace_root: {agent.workspace_root}")
     lines.append(f"  project_label: {agent.project_label}")
+    if agent.current_sid:
+        lines.append(f"  thread_handle: {agent.project_label}/{agent.current_sid[:8]}")
+        thread_label = _cached_thread_label(agent.current_sid)
+        if thread_label:
+            lines.append(f"  thread_label: {thread_label}")
     lines.append(f"  source: {agent.source}")
     lines.append(f"  status: {agent.status}")
     lines.append(f"  kind: {evt.kind}")
@@ -1376,8 +1492,10 @@ def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
             "  recent_plan_files: " + ", ".join(agent.recent_plan_files[-3:])
         )
     lines.append(
-        "  For follow-ups: pass agent_id above to cursor_read or cursor_send "
-        "(kind=chat/new_agent/approve/reject/cancel).]"
+        "  For follow-ups: read this exact thread with "
+        "cursor_read(thread_handle above), or cursor_send to it. For the full "
+        "picture of every thread in this project, call cursor_threads. "
+        "(cursor_send kind=chat/new_agent/approve/reject/cancel).]"
     )
     return "\n".join(lines)
 
@@ -1452,7 +1570,7 @@ async def _maybe_propose_next_after_completion(agent: "CursorAgent") -> bool:
     try:
         await _propose_action(
             title=f"Next step on {project}",
-            why=f"That thread just finished: {summary[:160]}",
+            why=f"That thread just finished: {_clip(summary, 600)}",
             task=nxt,
             session_key="",
         )
@@ -1669,6 +1787,7 @@ async def on_ready():
     global _pending_voice_channel_id
     global _on_ready_done
     global cursor_observer
+    global _voice_reconcile_task
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
 
     if not _on_ready_done:
@@ -1853,6 +1972,15 @@ async def on_ready():
             log.exception("Wake-word listener failed to start — local voice unavailable")
             _wake_listener = None
 
+        # Self-heal voice presence after bare gateway RESUMEs that skip the
+        # on_ready rescan. Started once here in boot-only init so a Discord
+        # WS resume (which re-fires on_ready into the else branch) can't spawn
+        # a duplicate.
+        if _voice_reconcile_task is None or _voice_reconcile_task.done():
+            _voice_reconcile_task = asyncio.create_task(
+                _voice_presence_reconcile_loop(), name="voice_presence_reconcile"
+            )
+
         _on_ready_done = True
     else:
         log.info("on_ready re-fired (Discord WS resume) — skipping boot-only init")
@@ -1881,18 +2009,12 @@ async def on_ready():
 
 @bot.command()
 async def join(ctx: commands.Context):
-    """Join the voice channel and start Gemini session.
+    """Join the authorized user's voice channel via the single presence path.
 
-    Idempotent: if we are already in voice with a healthy Gemini session,
-    short-circuits with a one-liner. The VoiceController serializes all
-    voice transitions so concurrent !join / auto-join cannot race.
+    Thin wrapper: all the connect/move/reconnect logic lives in
+    `_auto_join_voice_channel` so manual `!join` and automatic join can
+    never diverge.
     """
-    global _last_audio_received_at
-
-    if voice_controller.in_voice and gemini and gemini.connected:
-        await ctx.send("Already in voice.")
-        return
-
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
         return
@@ -1904,50 +2026,26 @@ async def join(ctx: commands.Context):
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("You're not in a voice channel.")
         return
-
     if not voice_bridge.alive:
         await ctx.send("Voice bridge not running — check DISCORD_VOICE_BOT_TOKEN.")
         return
 
-    if voice_controller.locked:
-        await ctx.send("A voice join is already in progress — skipping duplicate.")
+    channel = ctx.author.voice.channel
+    if (
+        voice_controller.in_voice
+        and voice_controller.channel_id == str(channel.id)
+        and gemini and gemini.connected
+    ):
+        await ctx.send("Already in voice.")
         return
 
-    if _local_session_active:
-        await _close_local_session()
-    if _wake_listener:
-        _wake_listener.pause()
-
-    joined = await voice_controller.join(
-        str(ctx.author.voice.channel.id),
-        audio_callback=_on_voice_audio,
-        on_watchdog_expire=_on_voice_exit_timeout,
-    )
-    if not joined:
-        if voice_controller.in_voice:
-            await ctx.send("Already in voice (resolved by auto-join while you typed `!join`).")
-        else:
-            await ctx.send("A voice transition completed — try again.")
-        return
-
-    _last_audio_received_at = 0.0
-    _cancel_audio_tasks()
-
-    await ctx.send(f"Joined {ctx.author.voice.channel.name}")
-
-    if gemini and not gemini.connected:
-        await gemini.connect()
-
-    if gemini and gemini.connected:
-        try:
-            buffer_ctx = conversation.as_gemini_injection(max_turns=10)
-            if buffer_ctx:
-                await gemini.inject_text(buffer_ctx, turn_complete=False)
-        except Exception:
-            log.exception("Failed to inject conversation buffer on !join")
-
-    _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
-    _audio_tasks.append(asyncio.create_task(_watchdog_task(gemini)))
+    if await _auto_join_voice_channel(channel):
+        await ctx.send(f"Joined {channel.name}")
+    else:
+        await ctx.send(
+            "Couldn't join — a voice transition is in progress or the bridge is down. "
+            "Check #ucs-alerts."
+        )
 
 
 @bot.command()
@@ -2638,9 +2736,10 @@ async def on_voice_state_update(
         if gemini and gemini.connected:
             await gemini.close()
         if lurk:
-            # Keep the voice WebSocket alive. The next rejoin will see
-            # voice_controller.in_voice == True and re-arm only the
-            # AI-pipeline half of _auto_join_voice_channel.
+            # Keep the voice WebSocket parked in this channel. The next join
+            # reconciles through _auto_join_voice_channel / ensure_in_channel:
+            # same channel re-arms in place, a different channel moves the
+            # sidecar. Lurk is purely this leave-time "don't depart" policy.
             await voice_controller.note_external_disconnect_lurk()
         else:
             await voice_controller.note_external_disconnect()
