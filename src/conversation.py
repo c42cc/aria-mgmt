@@ -50,6 +50,11 @@ class Turn:
     channel: str
     text: str
     ts: float = field(default_factory=time.time)
+    # The request-thread this turn belongs to (Discord thread id). Empty for
+    # ambient turns (voice with no thread, alerts, cursor events). The text
+    # agent loop filters context to one session_key so two request-threads
+    # never bleed into each other; voice keeps reading the whole buffer.
+    session_key: str = ""
 
     def short(self) -> str:
         body = self.text.strip()
@@ -71,17 +76,17 @@ class ConversationBuffer:
 
     # -- writers --------------------------------------------------------
 
-    def add_user_text(self, channel: str, text: str) -> None:
-        self._append(Turn(role="user", medium="text", channel=channel, text=text))
+    def add_user_text(self, channel: str, text: str, session_key: str = "") -> None:
+        self._append(Turn(role="user", medium="text", channel=channel, text=text, session_key=session_key))
 
-    def add_aria_text(self, channel: str, text: str) -> None:
-        self._append(Turn(role="aria", medium="text", channel=channel, text=text))
+    def add_aria_text(self, channel: str, text: str, session_key: str = "") -> None:
+        self._append(Turn(role="aria", medium="text", channel=channel, text=text, session_key=session_key))
 
-    def add_user_voice(self, channel: str, text: str) -> None:
-        self._append(Turn(role="user", medium="voice", channel=channel, text=text))
+    def add_user_voice(self, channel: str, text: str, session_key: str = "") -> None:
+        self._append(Turn(role="user", medium="voice", channel=channel, text=text, session_key=session_key))
 
-    def add_aria_voice(self, channel: str, text: str) -> None:
-        self._append(Turn(role="aria", medium="voice", channel=channel, text=text))
+    def add_aria_voice(self, channel: str, text: str, session_key: str = "") -> None:
+        self._append(Turn(role="aria", medium="voice", channel=channel, text=text, session_key=session_key))
 
     def add_alert(self, text: str) -> None:
         """Record a system alert (preflight, error, confirmation) so Aria
@@ -168,6 +173,7 @@ class ConversationBuffer:
         max_turns: int = 10,
         exclude_last: int = 0,
         include_alerts: bool = False,
+        session_key: str = "",
     ) -> str:
         """Format recent turns as a context preamble for `do_with_claude`.
 
@@ -192,6 +198,24 @@ class ConversationBuffer:
         candidates = self.recent(max_turns + exclude_last + 10)
         if not include_alerts:
             candidates = [t for t in candidates if t.role != "alert"]
+
+        # Per-thread isolation: when a session_key is supplied, the agent loop
+        # is running a FOCUSED request in its own Discord thread, so it should
+        # see only THIS thread's turns. The ambient Cursor-watch firehose is
+        # deliberately excluded here — on 2026-06-09 a `live_visuals_4` watch
+        # narration bled into the focused `#keys` tailscale thread because the
+        # old carve-out let `cursor_event` flow into every session. Voice and
+        # global callers (no session_key) still receive cursor events below.
+        # Opted-in alerts (already gated by `include_alerts`) remain ambient.
+        # This is the primitive that kills cross-request context bleed: a
+        # brand-new thread sees none of a sibling thread's turns nor the
+        # watcher's noise, so request B never inherits request A's preamble.
+        if session_key:
+            candidates = [
+                t
+                for t in candidates
+                if t.role == "alert" or t.session_key == session_key
+            ]
 
         # Cap cursor_event turns *first* so they don't claim slots that
         # the user's actual messages need. We keep the most recent

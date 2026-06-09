@@ -213,6 +213,41 @@ def append_planning_history(session_key: str, role: str, content: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Discord work-thread registry — one thread per request.
+#
+# A request's identity is its Discord thread, not the channel it landed in.
+# `thread_id` IS the `session_key` for the agent loop, so two requests can
+# never share a lock or a context window. The table is the durable record of
+# which threads are Aria work threads, so a follow-up typed into an old thread
+# after a restart still resolves to the same isolated session.
+# ---------------------------------------------------------------------------
+
+def bind_thread(thread_id: str, session_key: str) -> None:
+    """Register `thread_id` as an Aria work thread bound to `session_key`.
+
+    Idempotent on the thread: a second bind of the same thread keeps the
+    original binding (the thread's identity never changes under it).
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO discord_threads (thread_id, session_key, created_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(thread_id) DO NOTHING",
+            (thread_id, session_key, _now()),
+        )
+
+
+def session_for_thread(thread_id: str) -> str | None:
+    """Return the session_key bound to `thread_id`, or None if it isn't a
+    known Aria work thread."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT session_key FROM discord_threads WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+    return row["session_key"] if row else None
+
+
 def upsert_cursor_session(
     session_id: str, project: str, status: str = "running"
 ) -> None:

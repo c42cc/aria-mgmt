@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -145,6 +146,151 @@ def _format_decline_blocker(
         f"confirmation card in #ucs-alerts, or say \"yes\" in voice. Then "
         f"send the task again. Stopping early so we don't burn the rest of "
         f"the iteration budget on retries."
+    )
+
+
+# Stuck-detection — the generalization of the decline-abort above. The decline
+# path only fires when the *user* refuses a tier-X/I command. The far more
+# common failure (the spark2-SSH grind, loops 200/205 on 2026-06-09: 30 iters,
+# ~$20, ~6min, ending in "iteration limit / partial progress") is the loop
+# running into a *wall* — a missing credential / permission / unreachable host —
+# and retrying the same KIND of action with endless textual variation. Every
+# command was unique, so `_dedup_key`'s exact-match ledger never fired. These
+# counters watch *failing results* and abort early with an actionable blocker.
+#
+# Per-family catches a tight grind on one kind of action (ssh attempt after ssh
+# attempt); total catches a thrash that sprays across families. Env-overridable.
+_STUCK_PER_FAMILY_ABORT = int(os.getenv("DO_WITH_CLAUDE_STUCK_PER_FAMILY_ABORT", "3"))
+_STUCK_TOTAL_ABORT = int(os.getenv("DO_WITH_CLAUDE_STUCK_TOTAL_ABORT", "6"))
+
+# Hard ceiling on what a *single* agent loop may spend before it stops and
+# checks in. The `max_tokens_budget` output-token guard never bounds cost
+# because cost is dominated by *input* tokens — each iteration resends the
+# growing message history, so a 30-iteration grind reached ~1.3M input tokens
+# / ~$20 (the entire daily cap) in one call. This is the missing dollar floor.
+_LOOP_COST_CAP_USD = float(os.getenv("DO_WITH_CLAUDE_LOOP_COST_CAP_USD", "5.0"))
+
+
+def _is_failed_result(result_str: str) -> bool:
+    """True if a tool result indicates the action *failed* — as opposed to the
+    user *declining* it (`_is_declined_result`) or it *succeeding*.
+
+    Catches the two shapes the dispatcher actually emits:
+      - shell envelope `{"stdout": ..., "stderr": ..., "exitCode": N}` with a
+        non-zero exit (the spark2-SSH attempts: `exitCode: 1`), and
+      - any typed `{"_error_class": ...}` envelope from src/mcp.py.
+
+    A success (`exitCode: 0`, real stdout, plain data) returns False so the
+    stuck counters only advance on genuine failures.
+    """
+    if not result_str:
+        return False
+    s = result_str.strip()
+    if s[:1] in ("{", "["):
+        try:
+            obj = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            obj = None
+        if isinstance(obj, dict):
+            if obj.get("_error_class"):
+                return True
+            ec = obj.get("exitCode", obj.get("exit_code"))
+            if isinstance(ec, bool):
+                return False
+            if isinstance(ec, (int, float)):
+                return ec != 0
+            if isinstance(ec, str) and ec.strip().lstrip("-").isdigit():
+                return int(ec) != 0
+    # Last-resort substring checks for results that arrive wrapped (e.g. a
+    # stringified MCP TextContent list rather than a bare JSON object).
+    low = s.lower()
+    if '"exitcode": 0' in low or '"exit_code": 0' in low:
+        return False
+    if re.search(r'"exit_?code":\s*-?[1-9]', low):
+        return True
+    if "command failed:" in low:
+        return True
+    return False
+
+
+def _action_family(tool_name: str, args: dict | None) -> str:
+    """Coarse signature for 'the same KIND of action', for the stuck governor.
+
+    Finer than nothing, deliberately coarser than `_dedup_key`. The spark2-SSH
+    grind issued 40+ textually-distinct commands — different hosts, users,
+    flags, guessed passwords — that `_dedup_key` saw as all-unique, so its
+    exact-match ledger never tripped. Keying on the primary verb collapses
+    `ssh a@b`, `ssh c@d.local`, `ssh e@1.2.3.4` into ONE family `exec:ssh`, so
+    three failures of that family trip the abort regardless of surface variation.
+    Comment lines and leading `VAR=val` / `sudo` wrappers are stripped so the
+    *real* verb wins.
+    """
+    if tool_name == "execute_command":
+        cmd = str((args or {}).get("command", ""))
+        for raw in cmd.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            toks = line.split()
+            i = 0
+            # Skip leading env-assignments (FOO=bar) and common wrappers.
+            while i < len(toks) and not toks[i].startswith("-") and "=" in toks[i].split("/", 1)[0]:
+                i += 1
+            while i < len(toks) and toks[i] in ("sudo", "command", "exec", "env", "time", "nohup"):
+                i += 1
+            verb = toks[i] if i < len(toks) else (toks[0] if toks else "?")
+            return f"exec:{verb}"
+        return "exec:?"
+    return f"tool:{tool_name}"
+
+
+def _short_failure_reason(result_str: str) -> str:
+    """Pull a short, human error string out of a failed tool result."""
+    s = (result_str or "").strip()
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            for k in ("stderr", "_message", "_raw", "error"):
+                v = obj.get(k)
+                if v:
+                    return str(v).strip().replace("\n", " ")[:300]
+            ec = obj.get("exitCode", obj.get("exit_code"))
+            if ec not in (None, 0, "0"):
+                return f"exit code {ec}"
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return s.replace("\n", " ")[:300]
+
+
+def _format_stuck_blocker(
+    family: str, last_error: str, per_family_count: int, total_count: int
+) -> str:
+    """User-facing blocker when the loop is stuck on a wall, replacing the old
+    silent 'iteration limit / partial progress'. Names what kept failing and
+    the single thing needed to proceed, instead of grinding the budget."""
+    err = (last_error or "").strip().replace("\n", " ")
+    if len(err) > 300:
+        err = err[:300] + " […]"
+    return (
+        f"**Blocked — I hit a wall and stopped instead of grinding.**\n"
+        f"Action that kept failing: `{family}` "
+        f"({per_family_count}x same kind, {total_count} failure(s) total this task).\n"
+        f"Last error: {err}\n"
+        f"I need one thing to proceed: the missing access / credential / "
+        f"permission for that step — or tell me a different approach. I did "
+        f"**not** keep guessing; say the word with what you'd like me to use "
+        f"and I'll continue."
+    )
+
+
+def _format_cost_blocker(spent_usd: float, iterations: int) -> str:
+    """User-facing blocker when a single loop hits its per-task cost ceiling."""
+    return (
+        f"**Paused — this one task hit its ${_LOOP_COST_CAP_USD:.2f} budget** "
+        f"(spent ${spent_usd:.2f} over {iterations} steps) before finishing.\n"
+        f"That's a deliberate ceiling so a single request can't drain the daily "
+        f"cap. If it's worth continuing, tell me to keep going (or narrow the "
+        f"task) and I'll pick up from here."
     )
 
 
@@ -1382,6 +1528,39 @@ _CURSOR_SEND_TOOL_SCHEMA: dict[str, Any] = {
     },
 }
 
+_CURSOR_SPAWN_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "cursor_spawn",
+    "description": (
+        "Start a NEW Cursor coding thread (a fresh Claude-backed agent) in a "
+        "project and hand it an instruction. THIS is how you act on 'put this "
+        "in its own thread', 'spin up a new thread for X', or 'send it to a "
+        "new thread' — do it, don't explain that you can't. Returns the "
+        "agent_id handle; follow up with cursor_read (to see what it did) or "
+        "cursor_send (to steer it). For an existing project pass its name as "
+        "workspace_root (e.g. 'live_visuals_4'); it resolves via the registry."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "workspace_root": {"type": "string", "description": "Project name/alias (e.g. 'live_visuals_4') or an absolute workspace path to spawn the thread in."},
+            "instruction": {"type": "string", "description": "The full task/instruction the new thread should carry out."},
+            "model": {"type": "string", "description": "Optional model override; omit to use the configured default."},
+        },
+        "required": ["workspace_root", "instruction"],
+    },
+}
+
+_CURSOR_AGENTS_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "cursor_agents",
+    "description": (
+        "List every live Cursor agent/thread the system can see right now "
+        "(IDE windows the user opened and threads you spawned), with each "
+        "one's agent_id handle, status, and last message. Use it to find the "
+        "handle for a thread before cursor_read / cursor_send / cursor_spawn."
+    ),
+    "input_schema": {"type": "object", "properties": {}, "required": []},
+}
+
 
 def _apr1_hash(password: str) -> str:
     """Apache apr1 (MD5) password hash via openssl — the format nginx expects.
@@ -1504,12 +1683,16 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _CURSOR_THREADS_TOOL_SCHEMA,
     _CURSOR_READ_TOOL_SCHEMA,
     _CURSOR_SEND_TOOL_SCHEMA,
+    _CURSOR_SPAWN_TOOL_SCHEMA,
+    _CURSOR_AGENTS_TOOL_SCHEMA,
 ]
 _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "create_42c_account": _create_42c_account,
     "cursor_threads": _cursor_threads,
     "cursor_read": _cursor_read,
     "cursor_send": _cursor_send,
+    "cursor_spawn": _cursor_spawn,
+    "cursor_agents": _cursor_agents,
 }
 
 
@@ -1517,9 +1700,19 @@ async def _do_with_claude(
     task: str,
     session_key: str = "",
 ) -> str:
+    # One request == one Discord thread == one session_key, so two top-level
+    # requests never share this lock — they run in parallel, each isolated.
+    # A follow-up typed into the SAME thread while its loop is still running
+    # serializes behind it (it awaits the lock) instead of being rejected.
+    #
+    # The old `if lock.locked(): return {"error": "...already running..."}`
+    # envelope was a symptom-handler for the previous channel-keyed design,
+    # where unrelated `#ucs` requests collided on one lock (judged failure
+    # session 144). Thread-per-request removes the collision at the root, so
+    # the rejection is deleted, not reworded. Out-of-band control (`!stop`)
+    # sets the per-session cancel flag directly and does not pass through
+    # this lock, so a stuck loop is still interruptible while queued.
     lock = _agent_lock_for(session_key or "global")
-    if lock.locked():
-        return json.dumps({"error": "An agent loop is already running for this session. Wait for it to finish or use !stop."})
     async with lock:
         if config.ucs_enabled:
             return await _do_with_claude_ucs(task, session_key)
@@ -1591,6 +1784,15 @@ async def _do_with_claude_legacy(
     decline_total = 0
     decline_per_action: dict[str, int] = {}
     decline_blocker: str | None = None
+
+    # Stuck accounting — the generalization of decline accounting to *failing*
+    # (not just *declined*) actions. `stuck_blocker` doubles as the carrier for
+    # the per-loop cost ceiling; both stop the loop early with a clear message
+    # instead of grinding to the iteration cap.
+    failure_total = 0
+    failure_per_family: dict[str, int] = {}
+    last_failure_error = ""
+    stuck_blocker: str | None = None
 
     while iteration < max_iterations + ground_check_retries and not state.cancel:
         iteration += 1
@@ -1736,12 +1938,37 @@ async def _do_with_claude_legacy(
                     )
                     break
 
+            elif _is_failed_result(result_str):
+                family = _action_family(block.name, tool_args)
+                failure_total += 1
+                fam_count = failure_per_family.get(family, 0) + 1
+                failure_per_family[family] = fam_count
+                last_failure_error = _short_failure_reason(result_str)
+                log.warning(
+                    "stuck-watch: %s failed (family=%s per-family=%d total=%d) session=%s",
+                    block.name, family, fam_count, failure_total, session_key,
+                )
+                if (
+                    fam_count >= _STUCK_PER_FAMILY_ABORT
+                    or failure_total >= _STUCK_TOTAL_ABORT
+                ):
+                    stuck_blocker = _format_stuck_blocker(
+                        family, last_failure_error, fam_count, failure_total,
+                    )
+                    break
+
         messages.append({"role": "user", "content": tool_results})
 
         if decline_blocker is not None:
             final_status = "declined_abort"
             if _alert_callback:
                 asyncio.create_task(_alert_callback(decline_blocker))
+            break
+
+        if stuck_blocker is not None:
+            final_status = "stuck_abort"
+            if _alert_callback:
+                asyncio.create_task(_alert_callback(stuck_blocker))
             break
 
         if total_output_tokens > max_tokens_budget:
@@ -1752,9 +1979,18 @@ async def _do_with_claude_legacy(
                 ))
             break
 
+        if total_cost >= _LOOP_COST_CAP_USD:
+            final_status = "cost_budget"
+            stuck_blocker = _format_cost_blocker(total_cost, iteration)
+            if _alert_callback:
+                asyncio.create_task(_alert_callback(stuck_blocker))
+            break
+
     if state.cancel:
         final_status = "cancelled"
-    elif final_status not in ("token_budget", "declined_abort"):
+    elif final_status not in (
+        "token_budget", "declined_abort", "stuck_abort", "cost_budget"
+    ):
         final_status = "iteration_limit"
 
     log_loop_execution(
@@ -1779,9 +2015,22 @@ async def _do_with_claude_legacy(
     if decline_blocker is not None:
         return decline_blocker
 
+    # Stuck/cost abort: return the actionable blocker instead of the generic
+    # "iteration limit / partial progress" string (which the judge auto-fails
+    # and which tells the user nothing about what to do next).
+    if stuck_blocker is not None:
+        return stuck_blocker
+
     partial = (
         f"Task reached iteration limit ({max_iterations}). Partial progress made."
     )
+    if failure_total > 0:
+        partial += (
+            f"\n\nNote: {failure_total} tool call(s) failed during this task "
+            f"(most recent: {last_failure_error[:200]}). The work may be "
+            f"blocked on a missing prerequisite — tell me what access or "
+            f"approach to use and I'll continue."
+        )
     if decline_total > 0:
         partial += (
             f"\n\nNote: {decline_total} tier-X/I command(s) were declined "

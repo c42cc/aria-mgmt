@@ -397,6 +397,9 @@ points; cross-references inside the code are reliable.
 | macOS permissions helper | `ops/grant_permissions.sh` |
 | Swift binary build for Apple MCP | `ops/build_macos_swift.sh` |
 | Google OAuth bootstrap | `ops/google_oauth_bootstrap.py` |
+| DGX Spark node setup (Section A, user-level, idempotent) | `ops/spark/setup_node.sh` |
+| DGX Spark acceptance harness (capture + Gemini visual verify) | `scripts/spark_acceptance.py` |
+| DGX Spark ops notes + future Aria capability design | `ops/spark/NODES.md` |
 
 ### Runtime state (gitignored)
 

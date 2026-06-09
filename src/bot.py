@@ -19,7 +19,10 @@ from .conversation import conversation
 from .cursor_bridge import CursorBridge
 from .cursor_external import CursorExternalObserver
 from .cursor_registry import CursorAgent, RegistryEvent, cursor_registry
-from .db import init_db, get_daily_spend, log_event, upsert_cursor_session, update_cursor_session_event
+from .db import (
+    init_db, get_daily_spend, log_event, upsert_cursor_session,
+    update_cursor_session_event, bind_thread, session_for_thread,
+)
 from .discord_voice import VoiceTransitionBusy, voice_bridge, voice_controller
 from .gemini_session import GeminiSession
 from .local_audio import SpeakerOutput
@@ -432,11 +435,21 @@ async def post_to_text(content: str, thread: discord.Thread | None = None) -> No
     ch = bot.get_channel(int(config.discord_text_channel_id))
     if not ch:
         raise RuntimeError(f"Text channel {config.discord_text_channel_id} not found — bot cannot post")
-    target = thread or ch
+    await _send_chunked(thread or ch, content)
+
+
+async def _send_chunked(target, content: str) -> None:
+    """Send possibly-long content to any messageable target — a request
+    thread, a channel, or a DM — chunked at paragraph boundaries, with a
+    file attachment for very long output. One sender for every conversational
+    reply so a thread, a #ucs post, and a DM all chunk identically.
+    """
+    if not content:
+        return
     if len(content) > 6000:
         await target.send(
-            "Full output attached:",
-            file=discord.File(io.BytesIO(content.encode()), filename="output.md"),
+            "Full result attached:",
+            file=discord.File(io.BytesIO(content.encode()), filename="result.md"),
         )
     else:
         for chunk in _split_at_paragraphs(content):
@@ -467,33 +480,38 @@ async def post_to_alerts(content: str, *, silent: bool = False) -> None:
 async def _emit_progress_to_user(text: str, session_key: str = "") -> None:
     """Progress-spine sink injected into tools.init_tools.
 
-    A per-tool step is incidental detail, not a finished answer. It goes to
-    #ucs-alerts — the catch-all — and is kept OUT of #ucs and the other
-    channels, which carry only consolidated, quality results. The step is
-    tagged with its originating channel so concurrent tasks stay legible in
-    the shared catch-all, and also fed to a connected Gemini voice session
-    as background context so Aria narrates "still working" coherently and
-    the session stays warm.
+    A step lands in the request's OWN thread (session_key == the Discord
+    thread id), so the live trail sits right under the request the user is
+    watching — which makes the ack "I'll show each step here" literally
+    true instead of secretly routing the steps to a different channel.
+
+    Only when there is no thread to post into — a voice/global loop with an
+    empty session_key, or a thread the gateway cache hasn't surfaced yet —
+    does the step go to the #ucs-alerts catch-all. A connected Gemini voice
+    session also gets the step as background context so Aria narrates
+    "still working" coherently and the session stays warm.
 
     Strictly non-fatal. Posted directly (not via post_to_alerts) so it is
     never recorded in the conversation buffer — that is reserved for real
     turns, not tool-by-tool narration that would drown out Claude/Gemini
     context on the next request.
     """
-    origin = ""
+    posted = False
     try:
         if session_key and str(session_key).isdigit():
-            src = bot.get_channel(int(session_key))
-            if src is not None:
-                origin = f"[#{getattr(src, 'name', session_key)}] "
+            target = bot.get_channel(int(session_key))
+            if target is not None:
+                await target.send(text, silent=True)
+                posted = True
     except Exception:
-        origin = ""
-    try:
-        alerts = bot.get_channel(int(config.discord_log_channel_id))
-        if alerts is not None:
-            await alerts.send(f"{origin}{text}", silent=True)
-    except Exception:
-        log.debug("progress post failed (non-fatal)", exc_info=True)
+        log.debug("progress thread post failed (non-fatal)", exc_info=True)
+    if not posted:
+        try:
+            alerts = bot.get_channel(int(config.discord_log_channel_id))
+            if alerts is not None:
+                await alerts.send(text, silent=True)
+        except Exception:
+            log.debug("progress alerts post failed (non-fatal)", exc_info=True)
     try:
         if gemini and gemini.connected:
             await gemini.inject_text(f"[progress] {text}", turn_complete=False)
@@ -2276,36 +2294,83 @@ async def ask(ctx: commands.Context, *, message: str):
     await _run_ask(ctx.channel, message)
 
 
+# ---------------------------------------------------------------------------
+# Request threads — one Discord thread per request (the isolation primitive)
+# ---------------------------------------------------------------------------
+
+_THREAD_NAME_MAX = 90  # Discord caps thread names at 100; leave headroom.
+
+
+def _thread_title(text: str) -> str:
+    """A short, human thread name distilled mechanically from the request.
+
+    No model call: the request text, whitespace-collapsed and capped. Cheap
+    and deterministic, so opening a thread never adds latency or cost.
+    """
+    flat = " ".join((text or "").strip().split())
+    return flat[:_THREAD_NAME_MAX] if flat else "Request"
+
+
+async def _ensure_work_thread(channel, title_seed: str, anchor=None):
+    """Resolve the Discord thread a request runs in. Returns (target, session_key).
+
+    The dysfunctional primitive this fixes: a request used to be identified
+    by its CHANNEL, so every #ucs message shared one agent lock and one
+    context window (judged failure 144: "an agent loop is already running").
+    Now a request is identified by its own thread:
+
+    - already inside a thread     -> that thread is the session (a follow-up).
+    - top-level in a text channel -> open a thread (anchored to the opener
+      message when we have one, so the opener stays in #ucs as a clean index
+      entry and the work happens in the thread).
+    - a DM / non-threadable place  -> the channel itself is the session.
+      Discord has no threads there; this is the correct medium, not a silent
+      fallback.
+
+    `session_key` is the thread id, so two requests can never collide. The
+    binding is persisted (discord_threads) so a follow-up in an old thread
+    still resolves to the same isolated session after a restart. A
+    thread-create failure is raised to the caller, never swallowed.
+    """
+    if isinstance(channel, discord.Thread):
+        sk = str(channel.id)
+        bind_thread(sk, sk)
+        return channel, sk
+    if isinstance(channel, discord.TextChannel):
+        name = _thread_title(title_seed)
+        if anchor is not None:
+            thread = await anchor.create_thread(name=name)
+        else:
+            thread = await channel.create_thread(
+                name=name, type=discord.ChannelType.public_thread
+            )
+        sk = str(thread.id)
+        bind_thread(sk, sk)
+        return thread, sk
+    return channel, str(getattr(channel, "id", "") or "")
+
+
 async def _run_ask(channel, message: str) -> None:
     """Shared implementation for !ask — works for both commands and webhook messages.
 
-    This is the *programmatic* entry point (iOS Shortcuts, webhook tests,
-    automated callers). Every invocation is a clean slate: we do **not**
-    prepend conversation buffer context here. Two reasons:
-
-    1. Test reproducibility — the same `!ask` should produce the same
-       agent loop regardless of what previous text exchanges polluted
-       the buffer.
-    2. Programmatic callers do not have a 'conversation' — they have a
-       request. Borrowing context from a prior session can short-circuit
-       tool calls the new request actually requires (verified: the agent
-       once skipped `mail_messages` because the prior reply was in the
-       task body).
-
-    The natural-text-in-`#ucs` path (`_handle_text_conversation`) is
-    where conversational continuity belongs.
+    The *programmatic* entry point (iOS Shortcuts, webhook tests, automated
+    callers). It opens its own request thread so each !ask is isolated and
+    self-contained — ack, live steps, and the result all land in that one
+    thread. It is a clean slate: no prior conversation context is prepended
+    (a fresh thread has none anyway), so the same !ask reproduces the same
+    agent loop regardless of what else was said.
     """
-    channel_name = f"#{getattr(channel, 'name', channel.id)}"
-    conversation.add_user_text(channel=channel_name, text=message)
-    # Status acknowledgement: silent so the user doesn't get a ding for a
-    # placeholder. The real answer below is the message that should notify.
-    await channel.send(
-        "Working on it... (live steps and any approvals land in #ucs-alerts — "
-        "reply `!ok <action_id>` to confirm; the result comes back here).",
+    target, session_key = await _ensure_work_thread(channel, message)
+    channel_name = f"#{getattr(target, 'name', getattr(target, 'id', ''))}"
+    conversation.add_user_text(channel=channel_name, text=message, session_key=session_key)
+    # Silent placeholder so the user doesn't get a ding for an ack; the real
+    # answer below is what should notify.
+    await target.send(
+        "Working on it — I'll show each step here, then the result. "
+        "Any approval prompt lands in #ucs-alerts (reply `!ok <action_id>`).",
         silent=True,
     )
     from .tools import handle_tool_call
-    session_key = str(channel.id)
     try:
         result = await handle_tool_call("do_with_claude", {
             "task": message,
@@ -2314,44 +2379,46 @@ async def _run_ask(channel, message: str) -> None:
         # P4: never leak control-plane errors to the user. Log raw, send friendly.
         if _looks_like_control_plane_error(result):
             log.error("control-plane error quarantined (!ask): %s", result[:500])
-            await channel.send(_CONTROL_PLANE_FRIENDLY)
+            await target.send(_CONTROL_PLANE_FRIENDLY)
             return
-        if len(result) > 1900:
-            # post_to_text dings #ucs (real answer). The pointer in `channel`
-            # is a courtesy redirect; silent so it doesn't ding twice.
-            await post_to_text(result)
-            await channel.send("Done — full result posted to #ucs.", silent=True)
-        else:
-            await channel.send(result)
-        conversation.add_aria_text(channel=channel_name, text=result)
-    except Exception as e:
+        await _send_chunked(target, result)
+        conversation.add_aria_text(channel=channel_name, text=result, session_key=session_key)
+    except Exception:
         log.exception("_run_ask raised")
-        await channel.send(_CONTROL_PLANE_FRIENDLY)
+        await target.send(_CONTROL_PLANE_FRIENDLY)
 
 
-def _augment_with_context(user_text: str) -> str:
-    """Prepend recent conversation thread to a Claude task, if any.
+def _augment_with_context(user_text: str, session_key: str = "") -> str:
+    """Prepend this thread's recent turns to a Claude task, if any.
 
-    `exclude_last=1` drops the user turn the caller already recorded so
-    it isn't repeated in the task body.
+    Scoped to `session_key` (the request's thread) so request B never
+    inherits request A's preamble — the context-bleed primitive, fixed at
+    the buffer. `exclude_last=1` drops the user turn the caller already
+    recorded so it isn't repeated in the task body. A brand-new thread has
+    no prior turns, so this returns the task unchanged (a clean slate).
     """
-    ctx = conversation.as_claude_context(max_turns=10, exclude_last=1)
+    ctx = conversation.as_claude_context(
+        max_turns=10, exclude_last=1, session_key=session_key
+    )
     if not ctx:
         return user_text
     return f"{ctx}\nUser just said: {user_text}"
 
 
 async def _handle_text_conversation(message: discord.Message) -> None:
-    """Route a conversational message in #ucs through Claude.
+    """Route a conversational message through Claude in its own thread.
 
-    Same dispatch as !ask but without requiring the prefix, and the
-    user's message + Aria's reply are recorded in the conversation
-    buffer so the next voice session has full context.
+    Every top-level message opens a dedicated Discord thread; the opener
+    stays in the channel as a clean index entry and the work — ack, live
+    steps, result — happens in the thread. A message typed inside an
+    existing thread continues that thread's isolated session. `session_key`
+    is the thread id, so concurrent requests never collide and never bleed
+    context into each other.
 
-    If a Gemini session is currently connected (user is on voice while
-    also typing), we forward the exchange into Gemini's live context so
-    voice-Aria stays in sync turn-by-turn — but the *reply* still comes
-    back as text. The user gets the medium they asked for.
+    The user's message and Aria's reply are recorded (tagged with the
+    thread's session_key) so this thread's next turn has continuity and a
+    live Gemini voice session stays in sync — but the reply comes back as
+    text. The user gets the medium they asked for.
     """
     user_text = message.content.strip()
     if not user_text:
@@ -2366,27 +2433,41 @@ async def _handle_text_conversation(message: discord.Message) -> None:
             f"attachment and ask the user to share its contents inline if needed.]"
         )
 
-    channel_name = f"#{getattr(message.channel, 'name', message.channel.id)}"
-    conversation.add_user_text(channel=channel_name, text=user_text)
+    # The isolation primitive: resolve (or open) this request's own thread.
+    # A create failure is surfaced loudly — never silently downgraded to an
+    # in-channel reply.
+    try:
+        target, session_key = await _ensure_work_thread(
+            message.channel, user_text, anchor=message
+        )
+    except discord.Forbidden:
+        log.exception("Cannot open a thread in %s — missing permission", message.channel)
+        await message.channel.send(
+            "I couldn't open a thread here — I need the **Create Public Threads** "
+            "permission in this channel. Grant it and resend."
+        )
+        return
+
+    channel_name = f"#{getattr(target, 'name', getattr(target, 'id', ''))}"
+    conversation.add_user_text(channel=channel_name, text=user_text, session_key=session_key)
 
     if gemini and gemini.connected:
         try:
             await gemini.inject_text(
-                f"[Heads-up: user just sent text in {channel_name}: {user_text[:4000]}]",
+                f"[Heads-up: user just sent text in thread {channel_name}: {user_text[:4000]}]",
                 turn_complete=False,
             )
         except Exception:
             log.exception("Failed to inject user text into Gemini live context")
 
-    # Loud one-line ack so a long do_with_claude loop (the 42c.pw failure
-    # ran for 36 min) does not appear silent to the user. The body
-    # quotes the first ~120 chars of the request so the user can verify
-    # we read it correctly.
+    # Loud one-line ack in the thread so a long do_with_claude loop (the
+    # 42c.pw failure ran for 36 min) never looks silent. The body quotes the
+    # first ~120 chars so the user can verify we read the request correctly.
     try:
         ack_preview = user_text.strip().replace("\n", " ")
         if len(ack_preview) > 120:
             ack_preview = ack_preview[:120] + "…"
-        await message.channel.send(
+        await target.send(
             f"Got it \u2014 working on: \u201c{ack_preview}\u201d. "
             f"I'll show each step here as I go, then the result.",
             silent=True,
@@ -2395,15 +2476,15 @@ async def _handle_text_conversation(message: discord.Message) -> None:
         log.debug("Failed to send text-conversation ack (non-fatal)", exc_info=True)
 
     from .tools import handle_tool_call
-    async with message.channel.typing():
+    async with target.typing():
         try:
             result = await handle_tool_call("do_with_claude", {
-                "task": _augment_with_context(user_text),
-                "session_key": str(message.channel.id),
+                "task": _augment_with_context(user_text, session_key),
+                "session_key": session_key,
             })
         except Exception:
             log.exception("Text conversation route failed")
-            await message.channel.send(
+            await target.send(
                 "Something went wrong handling that — check #ucs-alerts for details."
             )
             return
@@ -2411,21 +2492,15 @@ async def _handle_text_conversation(message: discord.Message) -> None:
     # P4: never leak control-plane errors to the user. Log raw, send friendly.
     if _looks_like_control_plane_error(result):
         log.error("control-plane error quarantined (text-conv): %s", result[:500])
-        await message.channel.send(_CONTROL_PLANE_FRIENDLY)
+        await target.send(_CONTROL_PLANE_FRIENDLY)
         return
-    if len(result) <= 1900:
-        await message.channel.send(result)
-    else:
-        # post_to_text dings #ucs (real answer). The pointer in the source
-        # channel is a courtesy redirect; silent so it doesn't ding twice.
-        await post_to_text(result)
-        await message.channel.send("Done — full result posted to #ucs.", silent=True)
-    conversation.add_aria_text(channel=channel_name, text=result)
+    await _send_chunked(target, result)
+    conversation.add_aria_text(channel=channel_name, text=result, session_key=session_key)
 
     if gemini and gemini.connected:
         try:
             await gemini.inject_text(
-                f"[You just replied via text in {channel_name}: {result[:4000]}]",
+                f"[You just replied via text in thread {channel_name}: {result[:4000]}]",
                 turn_complete=False,
             )
         except Exception:
@@ -2450,7 +2525,14 @@ def _is_stream_or_capability_channel(channel) -> bool:
         str(config.discord_spicylit_channel_id or ""),
     }
     excluded.discard("")
-    return cid in excluded
+    if cid in excluded:
+        return True
+    # A thread inherits its parent's exclusion: a thread hanging off the silent
+    # #ucs-alerts stream is still part of that stream, so Aria must not treat
+    # it as conversation (which would loop on her own firehose).
+    if isinstance(channel, discord.Thread):
+        return str(getattr(channel, "parent_id", "") or "") in excluded
+    return False
 
 
 @bot.event
