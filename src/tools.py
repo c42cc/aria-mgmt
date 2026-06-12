@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -19,7 +18,6 @@ import anthropic
 from .config import config
 from .cursor_bridge import CursorBridge
 from .db import (
-    JUDGE_WORTHY_PRODUCTS,
     append_planning_history,
     get_active_cursor_sessions,
     get_daily_spend,
@@ -41,6 +39,7 @@ from .cursor_tools import (
     _cursor_threads,
 )
 from .conversation import conversation
+from .outcomes import classify_outcome, format_block, TRANSIENT_RETRY_BUDGET
 from .memory import recall as mem_recall, remember as mem_remember, forget as mem_forget
 from .prompts import (
     clear_cache as prompts_clear_cache,
@@ -51,6 +50,7 @@ from .prompts import (
     rollback_template,
     save_template,
 )
+from . import spark
 
 log = logging.getLogger(__name__)
 
@@ -92,206 +92,12 @@ def _dedup_key(tool_name: str, args: dict) -> str:
     return f"{tool_name}:{args_json}"
 
 
-# Maximum number of tier-X/I declines (timeouts or explicit no) allowed
-# across an entire agent loop before we abort early and surface an
-# explicit blocker. Independent of per-action repeats below.
-_DECLINE_TOTAL_ABORT = 3
-# Maximum number of declines for a single (tool, args) pair before we
-# abort. The 42c.pw failure repeatedly retried htpasswd/openssl variants;
-# 2 is enough headroom for one accidental decline + one retry.
-_DECLINE_PER_ACTION_ABORT = 2
-
-
-def _is_declined_result(result_str: str) -> bool:
-    """True if `result_str` is the typed ERR_DECLINED envelope from src/mcp.py."""
-    if not result_str:
-        return False
-    s = result_str.strip()
-    if not s.startswith("{"):
-        return False
-    try:
-        obj = json.loads(s)
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return isinstance(obj, dict) and obj.get("_error_class") == "declined"
-
-
-def _declined_reason(result_str: str) -> str:
-    """Short reason from the ERR_DECLINED envelope, or 'declined' as fallback."""
-    try:
-        obj = json.loads(result_str)
-        msg = str(obj.get("_message") or obj.get("_raw") or "declined")
-        return msg[:300]
-    except Exception:
-        return "declined"
-
-
-def _format_decline_blocker(
-    tool_name: str, args: dict, reason: str, per_action_count: int, total_count: int
-) -> str:
-    """Build the user-facing blocker message for an early decline-driven abort.
-
-    Names the exact command and tells the user how to approve. This is
-    the "loud failure" your rules require — the prior behavior was to
-    silently burn the iteration budget and emit a generic 'iteration
-    limit' string.
-    """
-    args_preview = json.dumps(args, default=str)[:300]
-    return (
-        f"**Blocked: approval required for `{tool_name}`** "
-        f"(declined {per_action_count}x, {total_count} total decline(s) this task).\n"
-        f"Args: `{args_preview}`\n"
-        f"Reason: {reason}\n"
-        f"To unblock: reply `!ok <action_id>` (or react \u2705) on the next "
-        f"confirmation card in #ucs-alerts, or say \"yes\" in voice. Then "
-        f"send the task again. Stopping early so we don't burn the rest of "
-        f"the iteration budget on retries."
-    )
-
-
-# Stuck-detection — the generalization of the decline-abort above. The decline
-# path only fires when the *user* refuses a tier-X/I command. The far more
-# common failure (the spark2-SSH grind, loops 200/205 on 2026-06-09: 30 iters,
-# ~$20, ~6min, ending in "iteration limit / partial progress") is the loop
-# running into a *wall* — a missing credential / permission / unreachable host —
-# and retrying the same KIND of action with endless textual variation. Every
-# command was unique, so `_dedup_key`'s exact-match ledger never fired. These
-# counters watch *failing results* and abort early with an actionable blocker.
-#
-# Per-family catches a tight grind on one kind of action (ssh attempt after ssh
-# attempt); total catches a thrash that sprays across families. Env-overridable.
-_STUCK_PER_FAMILY_ABORT = int(os.getenv("DO_WITH_CLAUDE_STUCK_PER_FAMILY_ABORT", "3"))
-_STUCK_TOTAL_ABORT = int(os.getenv("DO_WITH_CLAUDE_STUCK_TOTAL_ABORT", "6"))
-
 # Hard ceiling on what a *single* agent loop may spend before it stops and
 # checks in. The `max_tokens_budget` output-token guard never bounds cost
 # because cost is dominated by *input* tokens — each iteration resends the
 # growing message history, so a 30-iteration grind reached ~1.3M input tokens
 # / ~$20 (the entire daily cap) in one call. This is the missing dollar floor.
 _LOOP_COST_CAP_USD = float(os.getenv("DO_WITH_CLAUDE_LOOP_COST_CAP_USD", "5.0"))
-
-
-def _is_failed_result(result_str: str) -> bool:
-    """True if a tool result indicates the action *failed* — as opposed to the
-    user *declining* it (`_is_declined_result`) or it *succeeding*.
-
-    Catches the two shapes the dispatcher actually emits:
-      - shell envelope `{"stdout": ..., "stderr": ..., "exitCode": N}` with a
-        non-zero exit (the spark2-SSH attempts: `exitCode: 1`), and
-      - any typed `{"_error_class": ...}` envelope from src/mcp.py.
-
-    A success (`exitCode: 0`, real stdout, plain data) returns False so the
-    stuck counters only advance on genuine failures.
-    """
-    if not result_str:
-        return False
-    s = result_str.strip()
-    if s[:1] in ("{", "["):
-        try:
-            obj = json.loads(s)
-        except (json.JSONDecodeError, ValueError):
-            obj = None
-        if isinstance(obj, dict):
-            if obj.get("_error_class"):
-                return True
-            ec = obj.get("exitCode", obj.get("exit_code"))
-            if isinstance(ec, bool):
-                return False
-            if isinstance(ec, (int, float)):
-                return ec != 0
-            if isinstance(ec, str) and ec.strip().lstrip("-").isdigit():
-                return int(ec) != 0
-    # Last-resort substring checks for results that arrive wrapped (e.g. a
-    # stringified MCP TextContent list rather than a bare JSON object).
-    low = s.lower()
-    if '"exitcode": 0' in low or '"exit_code": 0' in low:
-        return False
-    if re.search(r'"exit_?code":\s*-?[1-9]', low):
-        return True
-    if "command failed:" in low:
-        return True
-    return False
-
-
-def _action_family(tool_name: str, args: dict | None) -> str:
-    """Coarse signature for 'the same KIND of action', for the stuck governor.
-
-    Finer than nothing, deliberately coarser than `_dedup_key`. The spark2-SSH
-    grind issued 40+ textually-distinct commands — different hosts, users,
-    flags, guessed passwords — that `_dedup_key` saw as all-unique, so its
-    exact-match ledger never tripped. Keying on the primary verb collapses
-    `ssh a@b`, `ssh c@d.local`, `ssh e@1.2.3.4` into ONE family `exec:ssh`, so
-    three failures of that family trip the abort regardless of surface variation.
-    Comment lines and leading `VAR=val` / `sudo` wrappers are stripped so the
-    *real* verb wins.
-    """
-    if tool_name == "execute_command":
-        cmd = str((args or {}).get("command", ""))
-        for raw in cmd.splitlines():
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            toks = line.split()
-            i = 0
-            # Skip leading env-assignments (FOO=bar) and common wrappers.
-            while i < len(toks) and not toks[i].startswith("-") and "=" in toks[i].split("/", 1)[0]:
-                i += 1
-            while i < len(toks) and toks[i] in ("sudo", "command", "exec", "env", "time", "nohup"):
-                i += 1
-            verb = toks[i] if i < len(toks) else (toks[0] if toks else "?")
-            return f"exec:{verb}"
-        return "exec:?"
-    return f"tool:{tool_name}"
-
-
-def _short_failure_reason(result_str: str) -> str:
-    """Pull a short, human error string out of a failed tool result."""
-    s = (result_str or "").strip()
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict):
-            for k in ("stderr", "_message", "_raw", "error"):
-                v = obj.get(k)
-                if v:
-                    return str(v).strip().replace("\n", " ")[:300]
-            ec = obj.get("exitCode", obj.get("exit_code"))
-            if ec not in (None, 0, "0"):
-                return f"exit code {ec}"
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return s.replace("\n", " ")[:300]
-
-
-def _format_stuck_blocker(
-    family: str, last_error: str, per_family_count: int, total_count: int
-) -> str:
-    """User-facing blocker when the loop is stuck on a wall, replacing the old
-    silent 'iteration limit / partial progress'. Names what kept failing and
-    the single thing needed to proceed, instead of grinding the budget."""
-    err = (last_error or "").strip().replace("\n", " ")
-    if len(err) > 300:
-        err = err[:300] + " […]"
-    return (
-        f"**Blocked — I hit a wall and stopped instead of grinding.**\n"
-        f"Action that kept failing: `{family}` "
-        f"({per_family_count}x same kind, {total_count} failure(s) total this task).\n"
-        f"Last error: {err}\n"
-        f"I need one thing to proceed: the missing access / credential / "
-        f"permission for that step — or tell me a different approach. I did "
-        f"**not** keep guessing; say the word with what you'd like me to use "
-        f"and I'll continue."
-    )
-
-
-def _format_cost_blocker(spent_usd: float, iterations: int) -> str:
-    """User-facing blocker when a single loop hits its per-task cost ceiling."""
-    return (
-        f"**Paused — this one task hit its ${_LOOP_COST_CAP_USD:.2f} budget** "
-        f"(spent ${spent_usd:.2f} over {iterations} steps) before finishing.\n"
-        f"That's a deliberate ceiling so a single request can't drain the daily "
-        f"cap. If it's worth continuing, tell me to keep going (or narrow the "
-        f"task) and I'll pick up from here."
-    )
 
 
 def _truncate_trace_args(args: dict, max_chars: int = _TRACE_ARG_MAX_CHARS) -> dict:
@@ -801,6 +607,10 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # Discord text-history tools — read-only.
         "discord_recent_messages": _discord_recent_messages,
         "discord_list_threads": _discord_list_threads,
+        # DGX Spark control (shared with the CLI harness via src/spark.py).
+        "spark_status": _spark_status,
+        "spark_verify": _spark_verify,
+        "spark_setup": _spark_setup,
     }
     handler = handlers.get(name)
     if not handler:
@@ -820,6 +630,10 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # Just posts a card + spawns a waiter; the approved task pays its own
         # spend when it runs. Proposing is free.
         "propose_action",
+        # Spark ops/diagnostics must stay usable even at the daily cap: status
+        # is read-only, setup spends nothing on our API, and verify only spends
+        # a few cents on Gemini visual checks. Operability beats the gate here.
+        "spark_status", "spark_verify", "spark_setup",
     )
     if spend >= config.daily_spend_cap_usd and name not in _free_tools:
         return json.dumps({"error": f"Daily spend cap (${config.daily_spend_cap_usd}) reached. Current: ${spend:.2f}"})
@@ -883,36 +697,19 @@ def _emit_session_record(
     outputs = {"result": result[:1_000_000], "duration_ms": duration_ms, "status": status}
     context = {"tool_trace": tool_trace} if tool_trace else None
 
-    record_id = record_session(
+    # EMIT only — the record is judged durably by the periodic sweep in
+    # src/judge.py (sweep_unjudged, scheduled from bot.on_ready). The previous
+    # inline `asyncio.create_task(...)` was a fire-and-forget orphan dropped on
+    # process churn, so the longest/failed sessions went unjudged (~45%). The
+    # sweep finds every record that still lacks a verdict via a DB LEFT JOIN,
+    # so judging now survives restarts with exactly one path.
+    record_session(
         session_key=session_key or "unknown",
         tool_name=tool_name,
         inputs=inputs,
         outputs=outputs,
         context=context,
     )
-
-    if record_id and product in JUDGE_WORTHY_PRODUCTS:
-        _maybe_judge(record_id, product)
-
-
-def _maybe_judge(record_id: int, product: str) -> None:
-    """Fire-and-forget correctness judge on a session record."""
-    try:
-        from .judge import evaluate_record
-        asyncio.create_task(_judge_and_alert(record_id, product))
-    except Exception:
-        log.debug("Judge not available, skipping evaluation", exc_info=True)
-
-
-async def _judge_and_alert(record_id: int, product: str) -> None:
-    """Run the judge and alert on failures."""
-    from .judge import evaluate_record
-    verdict = await evaluate_record(record_id, product)
-    if verdict and verdict.verdict == "failed" and _alert_callback:
-        reasons = "; ".join(verdict.reasons[:3]) if verdict.reasons else "no details"
-        await _alert_callback(
-            f"**Correctness FAILED** [{product}] score={verdict.score:.2f}\n{reasons}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1672,11 +1469,155 @@ async def _create_42c_account(
     })
 
 
+# ---------------------------------------------------------------------------
+# DGX Spark — Aria's first-class handle on the two GB10 nodes (spark1, spark2)
+# ---------------------------------------------------------------------------
+# These reuse the shared catalog in src/spark.py — the CLI acceptance harness
+# (scripts/spark_acceptance.py) calls the exact same code, so there is one
+# implementation, not two. status() is read-only and free; verify() runs the
+# full "prove it twice" capture+Gemini acceptance; setup() is executable (seeds
+# the node via setup_node.sh). The blocking spark.* calls run in a worker thread
+# so the event loop is never stalled. See ops/spark/NODES.md.
+
+def _spark_known_nodes() -> str:
+    return ", ".join(spark.NODES)
+
+
+async def _spark_status(node: str = "", session_key: str = "") -> str:
+    """Read-only health for one spark node, or BOTH when node is empty/'all'."""
+    target = (node or "").strip().lower()
+    try:
+        if target in ("", "all", "both", "*"):
+            names = list(spark.NODES)
+            reports = await asyncio.gather(
+                *(asyncio.to_thread(spark.status, n) for n in names)
+            )
+            return json.dumps({"ok": all(r.get("ok") for r in reports), "nodes": list(reports)})
+        if target not in spark.NODES:
+            return json.dumps({"error": f"unknown node {node!r}; known: {_spark_known_nodes()}"})
+        return json.dumps(await asyncio.to_thread(spark.status, target))
+    except Exception as e:
+        log.exception("spark_status failed")
+        return json.dumps({"error": f"spark_status failed: {e}"})
+
+
+async def _spark_verify(node: str = "", role: str = "", only: str = "", session_key: str = "") -> str:
+    """Full Section-A acceptance on ONE node: machine assertion AND Gemini agree."""
+    target = (node or "").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    only_list = [g.strip() for g in (only or "").split(",") if g.strip()] or None
+    await _emit_progress(
+        session_key,
+        f"verifying {target} (opens Terminal windows + independent Gemini checks; ~a few minutes)",
+    )
+    try:
+        report = await asyncio.to_thread(spark.verify, target, role or None, only_list)
+    except Exception as e:
+        log.exception("spark_verify failed")
+        return json.dumps({"error": f"spark_verify failed: {e}"})
+
+    summary = report["summary"]
+    failed = [g for g in report["gates"] if g["verdict"] != "PASS"]
+    if _post_callback:
+        lines = [
+            f"**Spark acceptance — {report['node']} (role {report['role']}): "
+            f"{summary['pass']}/{summary['total']} green**"
+        ]
+        for g in report["gates"]:
+            mark = "\u2705" if g["verdict"] == "PASS" else "\u274c"
+            lines.append(f"{mark} `{g['id']}` — {g['title']}")
+            if g["verdict"] != "PASS":
+                lines.append(f"    machine: {g['machine_detail']}")
+                lines.append(f"    gemini : {g['gemini_reason']}")
+                lines.append(f"    fix    : {g['fix']}")
+        lines.append(f"_artifacts: data/spark/{report['node']}/ (one PNG per gate + acceptance.json)_")
+        try:
+            await _post_callback("\n".join(lines))
+        except Exception:
+            log.debug("spark_verify channel post failed (non-fatal)", exc_info=True)
+    return json.dumps({"ok": not failed, **report})
+
+
+async def _spark_setup(node: str = "", role: str = "", session_key: str = "") -> str:
+    """EXECUTABLE: run ops/spark/setup_node.sh on the node (idempotent)."""
+    target = (node or "").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    await _emit_progress(session_key, f"seeding {target} via setup_node.sh (~1-3 min)")
+    try:
+        return json.dumps(await asyncio.to_thread(spark.setup, target, role or ""))
+    except Exception as e:
+        log.exception("spark_setup failed")
+        return json.dumps({"error": f"spark_setup failed: {e}"})
+
+
+_SPARK_STATUS_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_status",
+    "description": (
+        "Read-only health of the DGX Spark nodes (the two GB10 boxes, spark1 and "
+        "spark2). Returns each node's identity, GPU + unified memory, the user-level "
+        "toolchain, tool versions, and the high-speed cluster-link state. Free and "
+        "fast — no model spend, no side effects. Leave `node` empty to check BOTH. "
+        "Use for 'how are the sparks?', 'are the sparks up?', 'check spark2'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1, spark2, or empty/'all' for both nodes."},
+        },
+    },
+}
+
+_SPARK_VERIFY_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_verify",
+    "description": (
+        "Run the full Section-A acceptance on ONE spark node: every good-state gate is "
+        "proven TWICE — a machine assertion over the live SSH output AND an independent "
+        "Gemini reading of a screenshot of a real macOS Terminal — and a disagreement "
+        "is a loud FAIL. Opens Terminal windows + takes screenshots on the Mac and "
+        "takes a few minutes; posts a per-gate report to the text channel and saves "
+        "PNGs under data/spark/<node>/. Use when the user wants the sparks PROVEN good, "
+        "not just pinged."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (required)."},
+            "role": {"type": "string", "description": "Worker role A or B; defaults to the node's role (spark1=A, spark2=B)."},
+            "only": {"type": "string", "description": "Optional comma-separated gate ids to run (e.g. 'gpu,mcp'); default all."},
+        },
+        "required": ["node"],
+    },
+}
+
+_SPARK_SETUP_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_setup",
+    "description": (
+        "EXECUTABLE: provision/repair a spark node by running ops/spark/setup_node.sh "
+        "over SSH (idempotent — installs Claude Code + the user-level toolchain, writes "
+        "settings + node identity, registers the filesystem MCP, seeds the API key). "
+        "Use to fix a node that spark_verify flagged red, or to bring a fresh node to "
+        "the good state. Consequential — prefer wrapping in propose_action for a "
+        "tap-to-approve."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (required)."},
+            "role": {"type": "string", "description": "Worker role A or B; defaults to the node's role."},
+        },
+        "required": ["node"],
+    },
+}
+
+
 # Local (non-MCP) tools the do_with_claude loop can dispatch alongside the MCP
 # catalog. create_42c_account provisions a login deterministically; the cursor_*
 # tools give the text agent the same durable Cursor-thread introspection and
 # dispatch Aria has in voice, so "#ucs: what are the live_visuals_4 threads?" is
-# answered from transcripts, not two clobbered watch events. One table, one
+# answered from transcripts, not two clobbered watch events; the spark_* tools
+# give it the same handle on the GB10 nodes Aria has in voice. One table, one
 # dispatch site — no per-tool special-casing.
 _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _CREATE_42C_TOOL_SCHEMA,
@@ -1685,6 +1626,9 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _CURSOR_SEND_TOOL_SCHEMA,
     _CURSOR_SPAWN_TOOL_SCHEMA,
     _CURSOR_AGENTS_TOOL_SCHEMA,
+    _SPARK_STATUS_TOOL_SCHEMA,
+    _SPARK_VERIFY_TOOL_SCHEMA,
+    _SPARK_SETUP_TOOL_SCHEMA,
 ]
 _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "create_42c_account": _create_42c_account,
@@ -1693,6 +1637,9 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "cursor_send": _cursor_send,
     "cursor_spawn": _cursor_spawn,
     "cursor_agents": _cursor_agents,
+    "spark_status": _spark_status,
+    "spark_verify": _spark_verify,
+    "spark_setup": _spark_setup,
 }
 
 
@@ -1777,22 +1724,13 @@ async def _do_with_claude_legacy(
     # the agent legitimately needed for tool work.
     ground_check_retries = 0
 
-    # Decline accounting — abort early so we don't burn the iteration
-    # budget retrying tier-X/I commands the user is never going to approve.
-    # 42c.pw failure mode: 11 declined execute_command variants × 30 iters
-    # × $7+/iter with no user-facing report.
-    decline_total = 0
-    decline_per_action: dict[str, int] = {}
-    decline_blocker: str | None = None
-
-    # Stuck accounting — the generalization of decline accounting to *failing*
-    # (not just *declined*) actions. `stuck_blocker` doubles as the carrier for
-    # the per-loop cost ceiling; both stop the loop early with a clear message
-    # instead of grinding to the iteration cap.
-    failure_total = 0
-    failure_per_family: dict[str, int] = {}
-    last_failure_error = ""
-    stuck_blocker: str | None = None
+    # Outcome accounting — one classifier (src/outcomes.py) reads the *meaning*
+    # of every tool result and says continue / retry-once / stop. `retry_used`
+    # budgets one retry per transient family; `blocker` carries the single
+    # user-facing message when we hit a wall (a permanent failure, an exhausted
+    # transient, a decline, or the per-loop cost cap).
+    retry_used: dict[str, int] = {}
+    blocker: str | None = None
 
     while iteration < max_iterations + ground_check_retries and not state.cancel:
         iteration += 1
@@ -1894,7 +1832,10 @@ async def _do_with_claude_legacy(
                 local_handler = _LOCAL_TOOL_HANDLERS.get(block.name)
                 if local_handler is not None:
                     local_args = dict(tool_args)
-                    if block.name == "create_42c_account":
+                    if block.name in (
+                        "create_42c_account",
+                        "spark_status", "spark_verify", "spark_setup",
+                    ):
                         local_args.setdefault("session_key", session_key)
                     result_str = await local_handler(**local_args)
                 else:
@@ -1918,57 +1859,44 @@ async def _do_with_claude_legacy(
                 "deduped": prev_count >= 1,
             })
 
-            if _is_declined_result(result_str):
-                decline_total += 1
-                per_count = decline_per_action.get(dedup_key, 0) + 1
-                decline_per_action[dedup_key] = per_count
+            # One deterministic classifier decides what this result means.
+            # BLOCKED (a permanent wall or a decline) stops at the first
+            # occurrence — no count threshold to defeat, no exit-code to mask.
+            # TRANSIENT gets one bounded retry per family, then becomes a wall.
+            outcome = classify_outcome(block.name, tool_args, result_str)
+            if outcome.is_blocked:
                 log.warning(
-                    "tier-X/I declined: %s args=%s (per-action=%d, total=%d) session=%s",
-                    block.name, str(tool_args)[:200], per_count, decline_total,
-                    session_key,
+                    "blocked: %s args=%s reason=%s session=%s",
+                    block.name, str(tool_args)[:200],
+                    outcome.reason[:200], session_key,
                 )
-                if (
-                    per_count >= _DECLINE_PER_ACTION_ABORT
-                    or decline_total >= _DECLINE_TOTAL_ABORT
-                ):
-                    decline_blocker = _format_decline_blocker(
-                        block.name, tool_args,
-                        _declined_reason(result_str),
-                        per_count, decline_total,
+                blocker = format_block(outcome.reason, outcome.need)
+                break
+            if outcome.is_transient:
+                used = retry_used.get(outcome.family, 0)
+                if used >= TRANSIENT_RETRY_BUDGET:
+                    log.warning(
+                        "transient exhausted: %s family=%s reason=%s session=%s",
+                        block.name, outcome.family,
+                        outcome.reason[:200], session_key,
+                    )
+                    blocker = format_block(
+                        outcome.reason,
+                        outcome.need or "a stable connection, or a different approach",
                     )
                     break
-
-            elif _is_failed_result(result_str):
-                family = _action_family(block.name, tool_args)
-                failure_total += 1
-                fam_count = failure_per_family.get(family, 0) + 1
-                failure_per_family[family] = fam_count
-                last_failure_error = _short_failure_reason(result_str)
-                log.warning(
-                    "stuck-watch: %s failed (family=%s per-family=%d total=%d) session=%s",
-                    block.name, family, fam_count, failure_total, session_key,
+                retry_used[outcome.family] = used + 1
+                log.info(
+                    "transient retry budgeted: %s family=%s (used=%d) session=%s",
+                    block.name, outcome.family, used + 1, session_key,
                 )
-                if (
-                    fam_count >= _STUCK_PER_FAMILY_ABORT
-                    or failure_total >= _STUCK_TOTAL_ABORT
-                ):
-                    stuck_blocker = _format_stuck_blocker(
-                        family, last_failure_error, fam_count, failure_total,
-                    )
-                    break
 
         messages.append({"role": "user", "content": tool_results})
 
-        if decline_blocker is not None:
-            final_status = "declined_abort"
+        if blocker is not None:
+            final_status = "blocked"
             if _alert_callback:
-                asyncio.create_task(_alert_callback(decline_blocker))
-            break
-
-        if stuck_blocker is not None:
-            final_status = "stuck_abort"
-            if _alert_callback:
-                asyncio.create_task(_alert_callback(stuck_blocker))
+                asyncio.create_task(_alert_callback(blocker))
             break
 
         if total_output_tokens > max_tokens_budget:
@@ -1979,18 +1907,22 @@ async def _do_with_claude_legacy(
                 ))
             break
 
+        # The per-loop dollar cap is itself a deterministic wall — express it
+        # as a BLOCKED outcome through the same formatter, not a separate path.
         if total_cost >= _LOOP_COST_CAP_USD:
-            final_status = "cost_budget"
-            stuck_blocker = _format_cost_blocker(total_cost, iteration)
+            final_status = "blocked"
+            blocker = format_block(
+                f"this one task hit its ${_LOOP_COST_CAP_USD:.2f} budget "
+                f"(spent ${total_cost:.2f} over {iteration} steps) before finishing",
+                "a go-ahead to keep spending on it, or a narrower task",
+            )
             if _alert_callback:
-                asyncio.create_task(_alert_callback(stuck_blocker))
+                asyncio.create_task(_alert_callback(blocker))
             break
 
     if state.cancel:
         final_status = "cancelled"
-    elif final_status not in (
-        "token_budget", "declined_abort", "stuck_abort", "cost_budget"
-    ):
+    elif final_status not in ("token_budget", "blocked"):
         final_status = "iteration_limit"
 
     log_loop_execution(
@@ -2012,32 +1944,16 @@ async def _do_with_claude_legacy(
     if state.cancel:
         return "Task cancelled by user."
 
-    if decline_blocker is not None:
-        return decline_blocker
-
-    # Stuck/cost abort: return the actionable blocker instead of the generic
-    # "iteration limit / partial progress" string (which the judge auto-fails
-    # and which tells the user nothing about what to do next).
-    if stuck_blocker is not None:
-        return stuck_blocker
+    # A wall (permanent failure / exhausted transient / decline / cost cap):
+    # return the actionable blocker instead of the generic "iteration limit /
+    # partial progress" string (which the judge auto-fails and which tells the
+    # user nothing about what to do next).
+    if blocker is not None:
+        return blocker
 
     partial = (
         f"Task reached iteration limit ({max_iterations}). Partial progress made."
     )
-    if failure_total > 0:
-        partial += (
-            f"\n\nNote: {failure_total} tool call(s) failed during this task "
-            f"(most recent: {last_failure_error[:200]}). The work may be "
-            f"blocked on a missing prerequisite — tell me what access or "
-            f"approach to use and I'll continue."
-        )
-    if decline_total > 0:
-        partial += (
-            f"\n\nNote: {decline_total} tier-X/I command(s) were declined "
-            f"during this task — approval was required but never granted. "
-            f"That likely prevented the work from completing. Reply "
-            f"`!ok <action_id>` to the next confirmation card in #ucs-alerts."
-        )
     if _alert_callback:
         asyncio.create_task(_alert_callback(partial))
     return partial

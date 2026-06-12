@@ -1025,6 +1025,44 @@ async def probe_contacts() -> tuple[bool, str, str, str]:
     )
 
 
+async def probe_sparks() -> tuple[bool, str, str, str]:
+    """Both DGX Spark nodes answer SSH over Tailscale. Advisory (WARN).
+
+    Aria's spark_* tools (status/verify/setup) reach the two GB10 nodes over
+    Tailscale SSH. This is deliberately NON-blocking: a spark being powered off
+    must never stop the bot from going ready — it only surfaces here so Aria
+    knows the node is down before a user asks. Each node is checked in parallel
+    with a short timeout; ssh's own ConnectTimeout governs the unreachable case.
+    """
+    from . import spark
+
+    async def _one(node: str) -> tuple[str, bool]:
+        out, rc = await asyncio.to_thread(spark.ssh_probe, node, "echo ok", timeout=12.0)
+        return node, (rc == 0 and "ok" in out)
+
+    outcomes = await asyncio.gather(
+        *(_one(n) for n in spark.NODES), return_exceptions=True
+    )
+    detail_bits: list[str] = []
+    down: list[str] = []
+    for o in outcomes:
+        if isinstance(o, Exception):
+            down.append(f"?({type(o).__name__})")
+            continue
+        node, ok = o
+        detail_bits.append(f"{node}={'up' if ok else 'down'}")
+        if not ok:
+            down.append(node)
+    if down:
+        return (
+            False,
+            f"spark node(s) unreachable over Tailscale SSH: {', '.join(down)}",
+            "tailscale status | grep spark   # confirm the node is powered on; re-auth Tailscale SSH if prompted",
+            ", ".join(detail_bits),
+        )
+    return True, "", "", ", ".join(detail_bits) or "no spark nodes configured"
+
+
 async def _run_all_inner(
     *,
     mcp_client: Any = None,
@@ -1131,6 +1169,10 @@ async def _run_all_inner(
     report.results.append(
         await _run_probe("applescript_cursor", WARN, probe_applescript_cursor)
     )
+
+    # DGX Spark nodes — advisory reachability. Non-blocking by design: a spark
+    # being off is surfaced in #ucs-alerts, never a ready-state blocker.
+    report.results.append(await _run_probe("sparks", WARN, probe_sparks))
 
     report.finished_at = datetime.now(timezone.utc).isoformat()
     return report

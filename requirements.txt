@@ -86,6 +86,9 @@ pydantic_core==2.46.4
 Pygments==2.20.0
 PyJWT==2.12.1
 PyNaCl==1.6.2
+pyobjc-core==12.2
+pyobjc-framework-Cocoa==12.2
+pyobjc-framework-Quartz==12.2
 PyPika==0.51.1
 pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0

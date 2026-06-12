@@ -485,6 +485,36 @@ def get_recent_verdicts(hours: int = 24) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def get_unjudged_records(hours: int = 24) -> list[dict[str, Any]]:
+    """Session records from the last `hours` in a judge-worthy product that
+    still have no verdict — the durable judge sweep's worklist.
+
+    `verdicts.session_id` is the record id stringified (the judge writes
+    `str(record_id)`), so the LEFT JOIN is exact and the sweep is idempotent:
+    once a record has a verdict it never reappears here. No new table, no new
+    store — this is the durable replacement for the fire-and-forget inline
+    judge task that process churn used to drop (the longest/failed sessions
+    were the ones most likely to be lost).
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    products = sorted(JUDGE_WORTHY_PRODUCTS)
+    placeholders = ",".join("?" for _ in products)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT sr.id AS id, sr.product AS product, "
+            "sr.session_key AS session_key, sr.timestamp AS timestamp "
+            "FROM session_records sr "
+            "LEFT JOIN verdicts v ON v.session_id = CAST(sr.id AS TEXT) "
+            "WHERE sr.timestamp >= ? "
+            f"AND sr.product IN ({placeholders}) "
+            "AND v.id IS NULL "
+            "ORDER BY sr.id ASC",
+            (cutoff, *products),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_correctness_summary(hours: int = 24) -> dict[str, dict[str, Any]]:
     """Correctness rates by product over the last N hours."""
     from datetime import timedelta

@@ -1,20 +1,17 @@
-"""Proof that the agent loop's *progress governor* behaves.
+"""Proof that the live agent loop stops at the first wall instead of grinding.
 
 The dysfunctional primitive (forensic 2026-06-09, `#keys` thread): the loop's
-only governor was a blunt iteration cap. With no progress signal it could not
-perceive that it was *stuck* — repeating one kind of failing action against an
-immovable wall (SSH into a host whose Tailscale identity we don't hold). So a
-wall became a 30-iteration, ~$20, 6-minute grind that ended in the spec-FAILED
-string "Task reached iteration limit (30). Partial progress made." — and along
-the way it brute-forced guessed SSH passwords. The byte-identical dedup ledger
-never fired because every command was textually unique.
+governor counted failures and read exit codes, so a wrapper that exited 0 while
+printing `Permission denied (publickey)` defeated it — a wall became a
+30-iteration, ~$20, 6-minute grind ending in the spec-FAILED string "Task
+reached iteration limit (30). Partial progress made."
 
-The fix generalizes the existing *decline*-abort (which only triggers when the
-user refuses a tier-X/I command) into a *failure*-abort: count failing tool
-results per action-family and in total, and stop early with an actionable
-blocker. A per-loop cost ceiling backstops the rare expensive-but-not-stuck
-case. These tests drive the REAL `_do_with_claude_legacy` loop with a scripted
-fake model + MCP, and prove it now stops early instead of grinding.
+The fix replaced the whole count-based governor with one deterministic
+classifier (`src/outcomes.classify_outcome`) wired into the single result seam:
+a permanent wall is BLOCKED on the FIRST occurrence (no threshold to defeat, no
+exit code to mask), a transient gets one bounded retry per family, and a
+recoverable failure stays PROGRESS so the model can work through it. These tests
+drive the REAL `_do_with_claude_legacy` loop with a scripted fake model + MCP.
 
 Run with:
     .venv/bin/python -m unittest tests.test_stuck_loop_governor -v
@@ -63,7 +60,7 @@ class _Resp:
 class _FakeMessages:
     """Returns scripted responses; once exhausted, repeats the last one (with a
     fresh, unique command) so a never-stopping model can't end the loop — only
-    the governor can."""
+    the outcome policy can."""
 
     def __init__(self, script, tail=None):
         self._script = list(script)
@@ -107,9 +104,27 @@ class _FakeMcp:
         return self._result
 
 
-_SHELL_FAIL = json.dumps({
+# A real SSH auth failure (exitCode 1) and — the key fixture — the SAME failure
+# MASKED behind an exitCode:0 wrapper, which the old governor could not see.
+_SSH_FAIL = json.dumps({
     "stdout": "",
     "stderr": "Command failed: ssh: connect to host port 22: Permission denied (publickey).",
+    "exitCode": 1,
+})
+_SSH_MASKED = json.dumps({
+    "stdout": "Permission denied (publickey,password).\nEXIT:255",
+    "stderr": "",
+    "exitCode": 0,
+})
+_SSH_TIMEOUT = json.dumps({
+    "stdout": "",
+    "stderr": "ssh: connect to host spark2 port 22: Operation timed out",
+    "exitCode": 1,
+})
+# A recoverable failure (non-fast-forward) the model should work through.
+_GIT_RECOVERABLE = json.dumps({
+    "stdout": "",
+    "stderr": "error: failed to push some refs to 'origin' (non-fast-forward)",
     "exitCode": 1,
 })
 _SHELL_OK = json.dumps({"stdout": "ok", "stderr": "", "exitCode": 0})
@@ -136,78 +151,77 @@ def _patched_loop(client, mcp, *, cost_per_call=0.001):
         yield tools
 
 
-def _run(tools, task="do the thing", session_key="K"):
-    import asyncio
-    return asyncio.run(tools._do_with_claude_legacy(task, session_key))
-
-
 # --------------------------------------------------------------------------
-# 1. The loop stops EARLY on a wall instead of grinding to the iteration cap.
+# 1. A permanent wall stops the loop at the FIRST strike (not strike 3, not 30).
 # --------------------------------------------------------------------------
 
-class TestStuckAbort(unittest.IsolatedAsyncioTestCase):
-    async def test_same_family_failures_abort_fast(self):
-        """The spark2-SSH grind: the model keeps emitting (textually unique)
-        ssh commands that all fail. The per-family threshold trips at 3 and
-        the loop returns an actionable blocker — not the iteration-limit
-        string, and nowhere near 30 iterations."""
-        from src import tools
+class TestWallStopsImmediately(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_denied_blocks_on_first_call(self):
         client = _FakeClient([])  # default tail = unique failing ssh forever
-        mcp = _FakeMcp(_SHELL_FAIL)
+        mcp = _FakeMcp(_SSH_FAIL)
         with _patched_loop(client, mcp) as t:
             result = await t._do_with_claude_legacy("ssh into spark2", "K")
 
         self.assertIn("Blocked", result)
         self.assertIn("hit a wall", result.lower())
         self.assertNotIn("iteration limit", result.lower())
-        # Aborted at the per-family threshold (3), not the 30-iteration cap.
-        self.assertEqual(client.messages.calls, tools._STUCK_PER_FAMILY_ABORT)
-        self.assertLess(client.messages.calls, 10)
+        # First strike — no count threshold, nowhere near the 30-iteration cap.
+        self.assertEqual(client.messages.calls, 1)
 
-    async def test_total_failures_across_families_abort(self):
-        """A thrash that sprays across DIFFERENT verbs never trips the
-        per-family counter, but the total-failure backstop still stops it."""
-        verbs = ["ssh", "ping", "curl", "nc", "nmap", "dig", "telnet", "scp"]
-        script = [
-            _Resp([_Block("tool_use", name="execute_command",
-                          input={"command": f"{v} spark2"}, id=f"t{i}")])
-            for i, v in enumerate(verbs)
-        ]
-        client = _FakeClient(script)
-        mcp = _FakeMcp(_SHELL_FAIL)
-        with _patched_loop(client, mcp) as t:
-            result = await t._do_with_claude_legacy("probe spark2 every way", "K")
-
-        self.assertIn("Blocked", result)
-        self.assertEqual(client.messages.calls, t._STUCK_TOTAL_ABORT)
-
-    async def test_blocker_names_the_failing_family(self):
-        from src import tools
+    async def test_masked_exit0_still_blocks_on_first_call(self):
+        """THE regression: the wrapper exits 0, so the old exit-code governor
+        saw success. The classifier reads the text and BLOCKS anyway."""
         client = _FakeClient([])
-        mcp = _FakeMcp(_SHELL_FAIL)
+        mcp = _FakeMcp(_SSH_MASKED)
         with _patched_loop(client, mcp) as t:
             result = await t._do_with_claude_legacy("ssh into spark2", "K")
-        self.assertIn("exec:ssh", result)
+
+        self.assertIn("Blocked", result)
+        self.assertEqual(client.messages.calls, 1)
+
+    async def test_blocker_is_actionable(self):
+        client = _FakeClient([])
+        mcp = _FakeMcp(_SSH_FAIL)
+        with _patched_loop(client, mcp) as t:
+            result = await t._do_with_claude_legacy("ssh into spark2", "K")
         self.assertIn("Permission denied", result)
+        self.assertIn("What I need to proceed", result)
 
 
 # --------------------------------------------------------------------------
-# 2. No false positives: a productive task with a couple of failures that
-#    then succeeds must COMPLETE normally — the governor must not abort it.
+# 2. A transient gets exactly one bounded retry per family, then becomes a wall.
+# --------------------------------------------------------------------------
+
+class TestTransientRetry(unittest.IsolatedAsyncioTestCase):
+    async def test_same_family_timeout_blocks_after_one_retry(self):
+        from src import tools
+        client = _FakeClient([])  # unique ssh each time, all time out (same family)
+        mcp = _FakeMcp(_SSH_TIMEOUT)
+        with _patched_loop(client, mcp) as t:
+            result = await t._do_with_claude_legacy("ssh into spark2", "K")
+
+        self.assertIn("Blocked", result)
+        # One budgeted retry (call 1), then BLOCK on the second occurrence.
+        self.assertEqual(client.messages.calls, tools.TRANSIENT_RETRY_BUDGET + 1)
+
+
+# --------------------------------------------------------------------------
+# 3. No false positives: a productive task with recoverable failures that then
+#    succeeds must COMPLETE — the policy must not stop on a recoverable error.
 # --------------------------------------------------------------------------
 
 class TestNoFalsePositive(unittest.IsolatedAsyncioTestCase):
-    async def test_two_failures_then_success_completes(self):
+    async def test_recoverable_failures_then_success_completes(self):
         script = [
             _Resp([_Block("tool_use", name="execute_command",
                           input={"command": "git push"}, id="t1")]),
             _Resp([_Block("tool_use", name="execute_command",
-                          input={"command": "python build.py"}, id="t2")]),
+                          input={"command": "git push --force-with-lease"}, id="t2")]),
             _Resp([_Block("text", text="DONE: deployed cleanly")],
                   stop_reason="end_turn"),
         ]
         client = _FakeClient(script)
-        mcp = _FakeMcp(_SHELL_FAIL)  # the two tool calls fail, model recovers
+        mcp = _FakeMcp(_GIT_RECOVERABLE)  # the two pushes fail recoverably, model recovers
         with _patched_loop(client, mcp) as t:
             result = await t._do_with_claude_legacy("deploy", "K")
 
@@ -217,8 +231,8 @@ class TestNoFalsePositive(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------
-# 3. Cost backstop: a non-stuck but expensive loop stops at the per-task
-#    dollar ceiling before draining the daily cap.
+# 4. Cost backstop: a non-stuck but expensive loop stops at the per-task dollar
+#    ceiling before draining the daily cap — now expressed as a BLOCKED outcome.
 # --------------------------------------------------------------------------
 
 class TestCostBackstop(unittest.IsolatedAsyncioTestCase):
@@ -233,67 +247,9 @@ class TestCostBackstop(unittest.IsolatedAsyncioTestCase):
             result = await t._do_with_claude_legacy("read everything", "K")
 
         self.assertIn("budget", result.lower())
+        self.assertIn("Blocked", result)
         expected = int(tools._LOOP_COST_CAP_USD // 2.0) + 1
         self.assertEqual(client.messages.calls, expected)
-
-
-# --------------------------------------------------------------------------
-# 4. Failure/family/reason primitives (pure functions).
-# --------------------------------------------------------------------------
-
-class TestFailurePrimitives(unittest.TestCase):
-    def test_is_failed_result_shell_nonzero(self):
-        from src.tools import _is_failed_result
-        self.assertTrue(_is_failed_result(_SHELL_FAIL))
-
-    def test_is_failed_result_shell_zero_is_not_failure(self):
-        from src.tools import _is_failed_result
-        self.assertFalse(_is_failed_result(_SHELL_OK))
-
-    def test_is_failed_result_typed_envelope(self):
-        from src.tools import _is_failed_result
-        env = json.dumps({"_error_class": "permission", "_message": "no FDA"})
-        self.assertTrue(_is_failed_result(env))
-
-    def test_is_failed_result_plain_and_empty(self):
-        from src.tools import _is_failed_result
-        self.assertFalse(_is_failed_result(""))
-        self.assertFalse(_is_failed_result("here are your 3 emails"))
-
-    def test_is_failed_result_wrapped_textcontent(self):
-        from src.tools import _is_failed_result
-        wrapped = '[TextContent(text=\'{"exitCode": 1, "stderr": "boom"}\')]'
-        self.assertTrue(_is_failed_result(wrapped))
-
-    def test_action_family_collapses_ssh_variants(self):
-        from src.tools import _action_family
-        a = _action_family("execute_command", {"command": "ssh -o X u@spark2.local 'echo'"})
-        b = _action_family("execute_command", {"command": "ssh root@10.0.0.199 'id'"})
-        c = _action_family("execute_command", {"command": "# try tailscale\nssh u@spark2"})
-        self.assertEqual(a, "exec:ssh")
-        self.assertEqual(a, b)
-        self.assertEqual(a, c)  # comment line stripped before the verb
-
-    def test_action_family_strips_env_and_sudo(self):
-        from src.tools import _action_family
-        self.assertEqual(
-            _action_family("execute_command", {"command": "SSH_AUTH_SOCK=/x ssh u@h"}),
-            "exec:ssh",
-        )
-        self.assertEqual(
-            _action_family("execute_command", {"command": "sudo systemctl restart x"}),
-            "exec:systemctl",
-        )
-
-    def test_action_family_non_shell_is_tool_keyed(self):
-        from src.tools import _action_family
-        self.assertEqual(_action_family("search_emails", {"q": "x"}), "tool:search_emails")
-
-    def test_short_failure_reason_prefers_stderr(self):
-        from src.tools import _short_failure_reason
-        self.assertIn("Permission denied", _short_failure_reason(_SHELL_FAIL))
-        env = json.dumps({"_error_class": "permission", "_message": "grant Full Disk Access"})
-        self.assertIn("Full Disk Access", _short_failure_reason(env))
 
 
 # --------------------------------------------------------------------------

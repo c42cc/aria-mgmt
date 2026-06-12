@@ -24,6 +24,11 @@ dependencies = [
     "aiohttp>=3.9.0",
     "sounddevice>=0.4.0",
     "openwakeword>=0.6.0",
+    # macOS window capture by CoreGraphics window-id (screencapture -l), used by
+    # the DGX Spark acceptance harness so a fullscreen app can't occlude the
+    # grab. Optional at runtime (the harness falls back to a region grab) but
+    # declared so a clean install captures robustly.
+    "pyobjc-framework-Quartz>=10.0",
 ]
 
 [project.scripts]

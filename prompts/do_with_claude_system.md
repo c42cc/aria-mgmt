@@ -41,7 +41,9 @@ read a thread" is a FAILED outcome — if a tool below can do it, do it.
   into a card: `label`, `purpose`, `did`, `status`, `open_question`. Read them
   back as ONE tight line each, plain English: `label — what it did — status`.
   Do NOT dump raw JSON, and do NOT answer from prior/watch context — call the
-  tool. State coverage first: "12 threads active in the last 48h".
+  tool. State coverage first: "12 threads active in the last 48h". For recency,
+  use each card's `last_active_rel` (e.g. "8h ago") VERBATIM — never compute
+  elapsed time yourself.
 - **Read one in full:** to dig into a thread — including "what did that thread
   actually say?", "give me the full last message", or any follow-up on a watch
   event — call `cursor_read` with the handle `live_visuals_4/<sid>` (the short

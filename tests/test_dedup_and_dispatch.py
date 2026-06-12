@@ -289,58 +289,55 @@ class TestConversationBufferAlertFilter(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestDeclineDetection(unittest.TestCase):
-    """tools._is_declined_result / _declined_reason: ERR_DECLINED envelope id."""
+    """A declined tier-X/I confirmation is BLOCKED at the outcome classifier,
+    with an actionable approval path — replacing the old count-based decline
+    governor (now src/outcomes.classify_outcome / format_block)."""
 
     def test_recognizes_declined_envelope(self):
-        from src.tools import _is_declined_result
+        from src.outcomes import classify_outcome, BLOCKED
         envelope = json.dumps({
             "_error_class": "declined",
             "_message": "Tier-X/I confirmation timed out — the user did not respond.",
             "_hint": "Ask the user whether to retry.",
             "_raw": "confirmation timed out",
         })
-        self.assertTrue(_is_declined_result(envelope))
+        o = classify_outcome("execute_command", {"command": "openssl passwd -apr1 x"}, envelope)
+        self.assertEqual(o.kind, BLOCKED)
+        self.assertIn("timed out", o.reason)
 
-    def test_rejects_non_declined_envelope(self):
-        from src.tools import _is_declined_result
+    def test_permission_envelope_blocks_but_is_not_a_decline(self):
+        from src.outcomes import classify_outcome, BLOCKED
         envelope = json.dumps({
             "_error_class": "permission",
             "_message": "Missing scope.",
             "_raw": "permission denied",
         })
-        self.assertFalse(_is_declined_result(envelope))
+        o = classify_outcome("search_files", {}, envelope)
+        self.assertEqual(o.kind, BLOCKED)
+        # A permission wall names the permission, not the approval path.
+        self.assertNotIn("!ok", o.need)
 
-    def test_rejects_plain_text_result(self):
-        from src.tools import _is_declined_result
-        self.assertFalse(_is_declined_result(""))
-        self.assertFalse(_is_declined_result("ok"))
-        self.assertFalse(_is_declined_result("[TextContent(text='ok')]"))
+    def test_plain_results_are_progress(self):
+        from src.outcomes import classify_outcome, PROGRESS
+        self.assertEqual(classify_outcome("x", {}, "").kind, PROGRESS)
+        self.assertEqual(classify_outcome("x", {}, "ok").kind, PROGRESS)
+        self.assertEqual(classify_outcome("x", {}, "[TextContent(text='ok')]").kind, PROGRESS)
 
-    def test_extracts_reason_from_envelope(self):
-        from src.tools import _declined_reason
+    def test_decline_blocker_names_unblock_path(self):
+        """The blocker must tell the user how to approve. Without this, the
+        prior loop silently emitted 'Task reached iteration limit (30).
+        Partial progress made.' for what was really a string of declined
+        shell commands."""
+        from src.outcomes import classify_outcome, format_block
         envelope = json.dumps({
             "_error_class": "declined",
-            "_message": "Tier-X/I confirmation timed out — the user did not respond.",
+            "_message": "Tier-X/I confirmation timed out",
         })
-        self.assertIn("timed out", _declined_reason(envelope))
-
-    def test_decline_blocker_names_command_and_unblock_path(self):
-        """Plan §3: the blocker message must name the tool and tell the user
-        how to approve it. Without this, the prior loop silently emitted
-        'Task reached iteration limit (30). Partial progress made.' for
-        what was really a string of declined shell commands."""
-        from src.tools import _format_decline_blocker
-        msg = _format_decline_blocker(
-            "execute_command",
-            {"command": "openssl passwd -apr1 42pw"},
-            "Tier-X/I confirmation timed out", 2, 2,
-        )
-        self.assertIn("execute_command", msg)
-        self.assertIn("openssl passwd -apr1 42pw", msg)
+        o = classify_outcome("execute_command", {"command": "openssl passwd -apr1 42pw"}, envelope)
+        msg = format_block(o.reason, o.need)
         self.assertIn("!ok", msg)
-        # "approval required" should appear so it reads like a blocker,
-        # not a generic iteration-limit message.
         self.assertIn("approval", msg.lower())
+        self.assertIn("Blocked", msg)
 
 
 class TestCursorEventCapInClaudeContext(unittest.TestCase):

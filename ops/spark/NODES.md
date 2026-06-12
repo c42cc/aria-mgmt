@@ -149,44 +149,73 @@ identity with no key or password — symmetric with spark1. (`tailscale set` is
 preferred over `tailscale up --ssh`, which resets other prefs.) For future
 nodes, enabling Tailscale SSH up front is the least-friction path.
 
-## 8. Future: an Aria "manage the sparks" capability
+## 8. Aria "manage the sparks" capability — BUILT
 
-Goal (later): Aria can set up and health-check the sparks by voice, reusing this
-machinery rather than rebuilding it. The smallest natural shape:
+Aria can health-check, prove, and (re)provision the sparks by voice or `#ucs`
+text, reusing this machinery rather than rebuilding it. Shipped as designed:
 
-- **Factor the gate catalog** out of `scripts/spark_acceptance.py` into a shared
-  module (e.g. `src/spark.py`) exposing `probe(node, gate)`, `verify(node, role)
-  -> report`, and `setup(node, role)`. The CLI harness and the Aria tools both
-  call it — no second implementation.
-- **New tools in `src/tools.py`** (per the "new behavior is a new tool, not a new
-  layer" rule), wired into the dispatcher:
-  - `spark_status(node)` — tier R: run the read-only probes, return JSON.
-  - `spark_verify(node, role)` — tier R/X: run the full capture+Gemini gate set,
-    post the report + screenshots to the text channel; Aria narrates pass/fail.
-  - `spark_setup(node, role)` — tier **X** (executable): runs `setup_node.sh`;
-    confirms before firing via the existing risk-tier path.
-- **Reuse, don't rebuild:** SSH as the `spark<N>` user (least privilege, not
-  root); `screencapture` via the existing `_screenshot_cursor_window` helper;
+- **Shared module `src/spark.py`** holds the node registry, the SSH ground-truth
+  probe, the gate catalog (machine assertion + Gemini question + fix), the macOS
+  Terminal capture, the Gemini verdict, and three high-level ops: `status(node)`,
+  `verify(node, role)`, `setup(node, role)`. The CLI harness
+  (`scripts/spark_acceptance.py`) and `scripts/spark_cluster.py` import from it —
+  **one implementation, not two.**
+- **Three tools in `src/tools.py`**, dispatched by `handle_tool_call` and exposed
+  in both Aria's voice catalog (`src/gemini_session.py::TOOL_DECLARATIONS`) and
+  the `do_with_claude` text-agent catalog (`_LOCAL_TOOL_*`):
+  - `spark_status(node)` — **read-only, free.** Identity / GPU + unified memory /
+    toolchain + versions / cluster-link state, for one node or both. No Terminal,
+    no Gemini, no model spend. The fast "how are the sparks?".
+  - `spark_verify(node, role)` — the full capture+Gemini gate set; posts a
+    per-gate report to the text channel and saves PNGs under `data/spark/<node>/`.
+  - `spark_setup(node, role)` — **executable**: runs `setup_node.sh`. Per-command
+    confirmation is OFF system-wide (`CONFIRM_RISKY_TOOLS=false`); approval lives
+    at the approach level, so Aria offers it via `propose_action` (one tap), the
+    same posture as `create_42c_account`.
+- **Reuse, not rebuild:** SSH as the `spark<N>` user (least privilege, not root);
   the Gemini verdict via the `judge.py` pattern; `ANTHROPIC_API_KEY` stays in
-  `.env` and is injected over SSH, never stored in the repo.
-- **Failure posture:** identical to preflight — every gate returns
-  `(ok, detail, fix)`; a red gate refuses "all clear" and surfaces the fix.
+  `.env` and is injected over SSH, never stored in the repo or printed.
+- **Boot health:** a non-blocking advisory `sparks` preflight probe (WARN) checks
+  reachability of both nodes in parallel — a powered-off spark is surfaced in
+  `#ucs-alerts`, never a ready-state blocker.
+- **Failure posture:** identical to preflight — every gate returns `(ok, detail)`
+  with the runbook fix; a red gate refuses "all clear" and a machine/Gemini
+  disagreement is itself a loud FAIL.
 
 ## 9. Sections B and C — defined, deferred (not guessed)
 
 The runbook itself defers these; we do not guess their inputs.
 
-- **Section B — cluster (escape hatch). PHYSICALLY BLOCKED (verified 2026-06-09).**
-  Recon of both nodes: the `mlx5_core` / `mlx5_ib` ConnectX-7 driver stack is
-  loaded, but **no high-speed netdev exists, no `/sys/class/infiniband` device,
-  no RDMA link** — the only wired NIC up is `enP7s7` (Realtek, 1 GbE); the nodes
-  talk only over 1 GbE + Tailscale. So the approved 0.5 m 200G QSFP56 DAC cable
-  is **not connecting the two CX-7 ports**. This cannot be configured remotely.
-  Required physical action: plug the DAC cable port-to-port on the CX-7 ports;
-  the mlx5 interface should then enumerate and link. Only then can we do RoCE on
-  a dedicated subnet, node-to-node SSH on that link, a **measured** ~200 GbE
-  bandwidth check, and an NCCL all-reduce smoke test. Good states otherwise as in
-  the runbook checklist. Run only if a model genuinely exceeds 128 GB.
+- **Section B — cluster (escape hatch). BROUGHT UP + VERIFIED, but BANDWIDTH
+  THROTTLED (2026-06-09).** With the QSFP56 DAC cable connected, both CX-7 cards
+  enumerate: `enp1s0f0np0` and `enP2p1s0f0np0` come up at **200 Gb/s with RoCE
+  ACTIVE** on each node. Brought up via `ops/spark/cluster_up.sh`: a dedicated
+  subnet `192.168.100.0/24` (+ jumbo MTU 9000) on `enp1s0f0np0`, persisted via
+  netplan.   Verified by `scripts/spark_cluster.py` (capture + Gemini), **6/6**:
+  link UP @200G, peer ping 0% loss, RoCE `rocep1s0f0` ACTIVE/LINK_UP,
+  passwordless **node-to-node SSH** over the link (root key, both directions),
+  measured RDMA bandwidth, and the **2-node NCCL all-reduce** (below).
+  Artifacts: `data/spark/cluster/`.
+  - **BANDWIDTH FINDING (the gate caught it):** measured RDMA throughput is only
+    **~12.8 Gb/s** (both `ib_send_bw` and `ib_write_bw`, both CX-7 links, across
+    QP / MTU / message-size tuning) — a fraction of the 200G line rate. This is
+    **not** an OS/RoCE-config issue: no SW rate limit (PFC off, `tc` unlimited,
+    NIC advertises up to 195 Gbps), PCIe is Gen5 x4 (~126 Gb/s capable), Ethernet
+    negotiated 200G, CPU governor `performance`. The cause is in dmesg on both
+    cards: `mlx5_core … Detected insufficient power on the PCIe slot (27W)` — a
+    DGX Spark platform/power condition. A line-rate fix needs NVIDIA's DGX Spark
+    clustering bring-up (power/firmware) per the runbook's "use NVIDIA's official
+    playbooks" note — not an OS patch. Until fixed, distributed inference
+    (Profiles 2/3) is bandwidth-bound; the recommended **independent-worker**
+    mode (Profile 1) does not use this link and is unaffected.
+  - **NCCL all-reduce smoke test: PASSES.** NCCL 2.30.7 + OpenMPI 4.1.6 are
+    installed on both nodes and nccl-tests is built for sm_121 (under
+    `/root/nccl-tests`). `ops/spark/nccl_smoke.sh` runs a 2-node all-reduce
+    (ranks on spark1 + spark2, both GB10) — **correct: `#wrong=0`, "Out of bounds
+    values : 0 OK"** — pinning OpenMPI to the `192.168.100.0/24` subnet and NCCL
+    to the RoCE device. Verified by the `cluster_nccl` gate (capture + Gemini).
+    busbw is ~1.2 GB/s, bound by the same throttle above: the smoke test proves
+    the collective stack is **correct**, not that it is fast.
 - **Section C — serving (Profile 1, independent workers = the operating mode).**
   Good states: one VLM per node at NVFP4 with KV-cache headroom; both nodes
   pulling from a shared queue; every run manifest records mode + model + version

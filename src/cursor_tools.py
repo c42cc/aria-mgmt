@@ -124,6 +124,27 @@ def _fmt_local(mtime: float) -> str:
         return ""
 
 
+def humanize_age(mtime: float) -> str:
+    """Relative age like '8h ago' / 'just now', computed in code so the model
+    never does (and gets wrong) elapsed-time math — the recency-hallucination
+    fix (session 149 read an 8h-old thread as '~50 min ago'). Input is epoch
+    seconds (a transcript file mtime).
+    """
+    try:
+        delta = datetime.now().timestamp() - float(mtime)
+    except (TypeError, ValueError, OSError):
+        return "unknown"
+    if delta < 0:
+        delta = 0.0
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
 # ---------------------------------------------------------------------------
 # cursor_threads — the durable per-thread roster (disk truth + distill cache)
 # ---------------------------------------------------------------------------
@@ -194,6 +215,7 @@ async def _cursor_threads(
                 "open_question": cached.get("open_question") or "",
                 "turns": cached.get("turns") or 0,
                 "last_active": _fmt_local(mtime),
+                "last_active_rel": humanize_age(mtime),
                 "cached": True,
             }
         async with sem:
@@ -216,8 +238,9 @@ async def _cursor_threads(
                     "status": "unknown",
                     "open_question": "",
                     "turns": turns,
-                    "last_active": _fmt_local(mtime),
-                    "error": str(e)[:200],
+                "last_active": _fmt_local(mtime),
+                "last_active_rel": humanize_age(mtime),
+                "error": str(e)[:200],
                 }
         label = str(card.get("label") or "")[:120] or "(unlabeled)"
         purpose = str(card.get("purpose") or "")[:600]
@@ -245,8 +268,9 @@ async def _cursor_threads(
             "status": status,
             "open_question": open_q,
             "turns": turns,
-            "last_active": _fmt_local(mtime),
-            "cached": False,
+                "last_active": _fmt_local(mtime),
+                "last_active_rel": humanize_age(mtime),
+                "cached": False,
         }
 
     rows = await asyncio.gather(*(resolve_one(t) for t in threads))

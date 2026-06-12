@@ -67,6 +67,11 @@ _pending_voice_channel_id: str | None = None
 _voice_reconcile_task: asyncio.Task | None = None
 _VOICE_RECONCILE_INTERVAL_SEC = 30.0
 
+# Background task that durably judges session records the inline fire-and-forget
+# task used to drop on process churn. Started once in on_ready's boot-only init.
+_judge_sweep_task: asyncio.Task | None = None
+_JUDGE_SWEEP_INTERVAL_SEC = 120.0
+
 _wake_listener = None          # WakeWordListener | None (typed loosely to avoid import at module level)
 _local_speaker: SpeakerOutput | None = None
 _local_session_active: bool = False
@@ -1257,6 +1262,28 @@ async def _voice_presence_reconcile_loop() -> None:
             log.exception("Voice presence reconciler iteration failed — continuing")
 
 
+async def _judge_sweep_loop() -> None:
+    """Durable backstop for correctness judging.
+
+    The inline judge was a fire-and-forget `asyncio.create_task` dropped on
+    process churn, so the longest/failed sessions (worst-when-worst) went
+    unjudged — ~45% loss. This sweeps the DB worklist on a slow cadence and
+    judges any session_record that still has no verdict; it is idempotent via
+    the LEFT JOIN in `get_unjudged_records`, so there is exactly one judging
+    path and it survives restarts.
+    """
+    from .judge import sweep_unjudged
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(_JUDGE_SWEEP_INTERVAL_SEC)
+            await sweep_unjudged(hours=24, alert=post_to_alerts)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Judge sweep iteration failed — continuing")
+
+
 # ---------------------------------------------------------------------------
 # Cursor event consumer
 # ---------------------------------------------------------------------------
@@ -1521,7 +1548,12 @@ def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
 def _format_registry_speech(evt: RegistryEvent) -> str:
     """Concise spoken line for the heads-up trigger."""
     agent = evt.agent
-    parts: list[str] = [evt.reason]
+    # Differentiate concurrent threads at the narration seam: lead with the
+    # thread's distilled label (never its UUID) so two threads in one project
+    # don't both narrate the identical "...in live_visuals_4" line.
+    label = _cached_thread_label(agent.current_sid) if agent.current_sid else ""
+    headline = f"{label}: {evt.reason}" if label else evt.reason
+    parts: list[str] = [headline]
     if agent.pending_question:
         parts.append(f"It asked: {agent.pending_question[:240]}")
     elif agent.last_assistant_text and evt.kind in ("finished", "errored", "progress"):
@@ -1806,6 +1838,7 @@ async def on_ready():
     global _on_ready_done
     global cursor_observer
     global _voice_reconcile_task
+    global _judge_sweep_task
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
 
     if not _on_ready_done:
@@ -1997,6 +2030,13 @@ async def on_ready():
         if _voice_reconcile_task is None or _voice_reconcile_task.done():
             _voice_reconcile_task = asyncio.create_task(
                 _voice_presence_reconcile_loop(), name="voice_presence_reconcile"
+            )
+
+        # Durable correctness judging — replaces the dropped inline judge task.
+        # Guarded the same way so a WS resume can't spawn a duplicate.
+        if _judge_sweep_task is None or _judge_sweep_task.done():
+            _judge_sweep_task = asyncio.create_task(
+                _judge_sweep_loop(), name="judge_sweep"
             )
 
         _on_ready_done = True

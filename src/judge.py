@@ -18,10 +18,10 @@ import os
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .config import config
-from .db import get_connection, get_session_record, write_verdict
+from .db import get_connection, get_session_record, get_unjudged_records, write_verdict
 
 log = logging.getLogger(__name__)
 
@@ -377,6 +377,44 @@ async def evaluate_record(record_id: int, product: str) -> Verdict | None:
     except Exception:
         log.warning("Judge evaluation failed for record %d", record_id, exc_info=True)
         return None
+
+
+async def sweep_unjudged(
+    hours: int = 24,
+    alert: Callable[[str], Awaitable[None]] | None = None,
+) -> int:
+    """Judge every session_record from the last `hours` that has no verdict yet.
+
+    The durable replacement for the fire-and-forget inline judge: an orphaned
+    `asyncio.create_task` was dropped on process churn, so ~45% of sessions —
+    worst-when-worst: the longest, failed ones — went unjudged. This drains the
+    DB worklist and is idempotent via the LEFT JOIN in `get_unjudged_records`
+    (a record with a verdict never reappears). One record's failure never
+    aborts the rest. Returns the count newly judged.
+    """
+    records = get_unjudged_records(hours)
+    judged = 0
+    for rec in records:
+        try:
+            verdict = await evaluate_record(int(rec["id"]), str(rec["product"]))
+        except Exception:
+            log.warning("sweep: judge raised for record %s", rec.get("id"), exc_info=True)
+            continue
+        if verdict is None:
+            continue
+        judged += 1
+        if verdict.verdict == "failed" and alert is not None:
+            reasons = "; ".join(verdict.reasons[:3]) if verdict.reasons else "no details"
+            try:
+                await alert(
+                    f"**Correctness FAILED** [{verdict.product}] "
+                    f"score={verdict.score:.2f}\n{reasons}"
+                )
+            except Exception:
+                log.debug("sweep: failure alert failed (non-fatal)", exc_info=True)
+    if judged:
+        log.info("judge sweep: judged %d previously-unjudged record(s)", judged)
+    return judged
 
 
 # ---------------------------------------------------------------------------

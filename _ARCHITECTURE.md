@@ -251,6 +251,27 @@ with the MCP tool catalog wired in. The agent loops, calling tools and
 observing results, until it finishes or hits its iteration/token bound.
 Risk-tier confirmations surface to the user mid-loop when needed.
 
+### Manage the Sparks
+
+Aria has a first-class handle on the two-node DGX Spark rig (the GB10 boxes
+`spark1` and `spark2`), reached over Tailscale SSH. Three tools, backed by the
+shared catalog in `src/spark.py` — the same code the CLI acceptance harness
+runs, so there is one implementation, not two:
+
+- **`spark_status`** (read-only, free): identity, GPU + unified memory, the
+  user-level toolchain and versions, and the high-speed cluster-link state, for
+  one node or both. The fast "how are the sparks?".
+- **`spark_verify`** (capture + Gemini): the full Section-A acceptance, where
+  every good-state gate is proven twice — a machine assertion over the live SSH
+  output AND an independent Gemini reading of a real macOS-Terminal screenshot —
+  and a disagreement is a loud FAIL. Posts a per-gate report to the text channel
+  and saves PNGs under `data/spark/<node>/`.
+- **`spark_setup`** (executable): runs `ops/spark/setup_node.sh` to provision or
+  repair a node; consequential, so Aria offers it via `propose_action`.
+
+Boot health includes a non-blocking advisory `sparks` probe: a node being off is
+surfaced in `#ucs-alerts`, never a ready-state blocker. See `ops/spark/NODES.md`.
+
 ### Quick Read Shortcuts
 
 Common read-only questions ("any new mail?", "what's on my calendar?")
@@ -397,9 +418,13 @@ points; cross-references inside the code are reliable.
 | macOS permissions helper | `ops/grant_permissions.sh` |
 | Swift binary build for Apple MCP | `ops/build_macos_swift.sh` |
 | Google OAuth bootstrap | `ops/google_oauth_bootstrap.py` |
+| DGX Spark control surface (registry + gates + status/verify/setup) | `src/spark.py` |
 | DGX Spark node setup (Section A, user-level, idempotent) | `ops/spark/setup_node.sh` |
-| DGX Spark acceptance harness (capture + Gemini visual verify) | `scripts/spark_acceptance.py` |
-| DGX Spark ops notes + future Aria capability design | `ops/spark/NODES.md` |
+| DGX Spark acceptance harness CLI (thin wrapper over `src/spark.py`) | `scripts/spark_acceptance.py` |
+| DGX Spark cluster bring-up (Section B, CX-7 link + netplan) | `ops/spark/cluster_up.sh` |
+| DGX Spark 2-node NCCL all-reduce smoke test | `ops/spark/nccl_smoke.sh` |
+| DGX Spark cluster acceptance (capture + Gemini visual verify) | `scripts/spark_cluster.py` |
+| DGX Spark ops notes + Aria capability | `ops/spark/NODES.md` |
 
 ### Runtime state (gitignored)
 

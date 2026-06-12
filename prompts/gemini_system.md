@@ -82,12 +82,14 @@ The six tools:
 - cursor_threads(project="live_visuals_4", window_hours=48, limit=12) —
   the roster of recent Cursor threads in a project, each distilled into
   a plain-English card (`label`, `purpose`, `did`, `status`,
-  `open_question`). THIS is how you answer "what's going on in
-  live_visuals_4?" or "what is each thread?" — the threads have UUID
-  names, so read back the distilled labels. Reads durable transcripts,
-  so it is correct even right after a restart. Do not answer thread
-  questions from memory or from a watch-event snippet when you can call
-  this. Then dig in with cursor_read("live_visuals_4/<sid>").
+  `open_question`, `last_active_rel`). THIS is how you answer "what's
+  going on in live_visuals_4?" or "what is each thread?" — the threads
+  have UUID names, so read back the distilled labels. For recency, say
+  each card's `last_active_rel` (like "8h ago") verbatim — never compute
+  elapsed time yourself. Reads durable transcripts, so it is correct even
+  right after a restart. Do not answer thread questions from memory or
+  from a watch-event snippet when you can call this. Then dig in with
+  cursor_read("live_visuals_4/<sid>").
 - cursor_read(agent_id, n_turns=5, sid?) — last N transcript turns for
   one thread. Pass the handle `live_visuals_4/<sid>` (short sid from
   cursor_threads) to read one exact thread, even a dormant one; or a

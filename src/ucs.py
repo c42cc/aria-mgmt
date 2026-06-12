@@ -475,19 +475,15 @@ class IntelligenceLoop:
         # Maps "name:args_json" -> (call_count, cached_result_str).
         from .tools import (  # local import to avoid cycle at module load
             _CREATE_42C_TOOL_SCHEMA,
-            _DECLINE_PER_ACTION_ABORT,
-            _DECLINE_TOTAL_ABORT,
             _GROUND_CHECK_MAX_RETRIES,
             _create_42c_account,
             _dedup_key,
-            _declined_reason,
             _emit_progress,
-            _format_decline_blocker,
             _ground_check,
             _ground_check_user_message,
             _humanize_step,
-            _is_declined_result,
         )
+        from .outcomes import classify_outcome, format_block, TRANSIENT_RETRY_BUDGET
         # Same local deterministic tool injection as the legacy loop.
         tools = tools + [_CREATE_42C_TOOL_SCHEMA]
         called_tools: dict[str, tuple[int, str]] = {}
@@ -495,10 +491,10 @@ class IntelligenceLoop:
         # P1 retry counter — see _do_with_claude_legacy for full notes.
         ground_check_retries = 0
 
-        # Decline accounting — see _do_with_claude_legacy for full notes.
-        decline_total = 0
-        decline_per_action: dict[str, int] = {}
-        decline_blocker: str | None = None
+        # Outcome accounting — one classifier (src/outcomes.py) decides
+        # continue / retry-once / stop. See _do_with_claude_legacy for notes.
+        retry_used: dict[str, int] = {}
+        blocker: str | None = None
 
         while iteration < profile.max_iterations + ground_check_retries:
             if cancel_check and cancel_check():
@@ -624,34 +620,32 @@ class IntelligenceLoop:
                     "deduped": prev_count >= 1,
                 })
 
-                if _is_declined_result(result_str):
-                    decline_total += 1
-                    per_count = decline_per_action.get(dedup_key, 0) + 1
-                    decline_per_action[dedup_key] = per_count
+                outcome = classify_outcome(block["name"], tool_args, result_str)
+                if outcome.is_blocked:
                     log.warning(
-                        "tier-X/I declined (ucs): %s args=%s "
-                        "(per-action=%d, total=%d) session=%s",
+                        "blocked (ucs): %s args=%s reason=%s session=%s",
                         block["name"], str(tool_args)[:200],
-                        per_count, decline_total, session_key,
+                        outcome.reason[:200], session_key,
                     )
-                    if (
-                        per_count >= _DECLINE_PER_ACTION_ABORT
-                        or decline_total >= _DECLINE_TOTAL_ABORT
-                    ):
-                        decline_blocker = _format_decline_blocker(
-                            block["name"], tool_args,
-                            _declined_reason(result_str),
-                            per_count, decline_total,
+                    blocker = format_block(outcome.reason, outcome.need)
+                    break
+                if outcome.is_transient:
+                    used = retry_used.get(outcome.family, 0)
+                    if used >= TRANSIENT_RETRY_BUDGET:
+                        blocker = format_block(
+                            outcome.reason,
+                            outcome.need or "a stable connection, or a different approach",
                         )
                         break
+                    retry_used[outcome.family] = used + 1
 
             messages.append({"role": "user", "content": tool_results})
 
-            if decline_blocker is not None:
+            if blocker is not None:
                 if alert_callback:
-                    asyncio.create_task(alert_callback(decline_blocker))
+                    asyncio.create_task(alert_callback(blocker))
                 return LoopResult(
-                    text=decline_blocker, status="declined_abort",
+                    text=blocker, status="blocked",
                     iterations=iteration,
                     total_tokens_in=total_in, total_tokens_out=total_out,
                     total_cost=total_cost,
@@ -681,13 +675,6 @@ class IntelligenceLoop:
             f"Task reached iteration limit ({profile.max_iterations}). "
             f"Partial progress made."
         )
-        if decline_total > 0:
-            final_text += (
-                f"\n\nNote: {decline_total} tier-X/I command(s) were declined "
-                f"during this task — approval was required but never granted. "
-                f"That likely prevented the work from completing. Reply "
-                f"`!ok <action_id>` to the next confirmation card in #ucs-alerts."
-            )
         if alert_callback:
             asyncio.create_task(alert_callback(final_text))
 

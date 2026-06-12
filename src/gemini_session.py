@@ -457,6 +457,69 @@ TOOL_DECLARATIONS = [
             },
         ),
     ),
+    # ---- DGX Spark control --------------------------------------------------
+    # Aria's voice handle on the two GB10 nodes (spark1, spark2). Backed by the
+    # shared catalog in src/spark.py — the same code the CLI acceptance harness
+    # runs. status is read-only and instant; verify is the heavy "prove it twice"
+    # acceptance; setup is executable (re-provisions a node).
+    types.FunctionDeclaration(
+        name="spark_status",
+        description=(
+            "Read-only health of the DGX Spark nodes (the two GB10 boxes, spark1 and "
+            "spark2): identity, GPU + unified memory, the user-level toolchain and "
+            "versions, and the high-speed cluster-link state. Instant, free, no side "
+            "effects. Leave node empty to check BOTH. Use for 'how are the sparks?', "
+            "'are the sparks up?', 'check spark2'. Speak a short summary; the full "
+            "JSON is the tool result."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1', 'spark2', or empty/'all' for both."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="spark_verify",
+        description=(
+            "Run the full Section-A acceptance on ONE spark node: every good-state gate "
+            "is proven twice — a machine assertion over the live SSH output AND an "
+            "independent Gemini reading of a real macOS-Terminal screenshot — and any "
+            "disagreement is a loud FAIL. This opens Terminal windows + takes "
+            "screenshots on the Mac and takes a few minutes; it posts a per-gate report "
+            "to the text channel. Use only when the user wants the sparks PROVEN good, "
+            "not just pinged — for a quick check use spark_status. Tell the user it'll "
+            "take a few minutes."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2'."),
+                "role": types.Schema(type="STRING", description="Worker role 'A' or 'B'; defaults to the node's role (spark1=A, spark2=B)."),
+                "only": types.Schema(type="STRING", description="Optional comma-separated gate ids (e.g. 'gpu,mcp'); default runs all."),
+            },
+            required=["node"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="spark_setup",
+        description=(
+            "Executable: provision or repair a spark node by running setup_node.sh over "
+            "SSH (idempotent — installs Claude Code + the toolchain, writes settings + "
+            "identity, registers the filesystem MCP, seeds the API key). Use to fix a "
+            "node that spark_verify flagged red or to bring a fresh node to the good "
+            "state. Consequential — for anything beyond an obvious repair, offer it via "
+            "propose_action so Corbin taps to approve."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2'."),
+                "role": types.Schema(type="STRING", description="Worker role 'A' or 'B'; defaults to the node's role."),
+            },
+            required=["node"],
+        ),
+    ),
 ]
 
 TranscriptEntry = collections.namedtuple("TranscriptEntry", ["role", "text", "ts"])
