@@ -126,6 +126,22 @@ CREATE TABLE IF NOT EXISTS thread_summaries (
     model_id        TEXT,
     distilled_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ground (
+    role        TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    path        TEXT,
+    detail      TEXT,
+    source      TEXT,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loop_findings (
+    session_key TEXT PRIMARY KEY,
+    findings    TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -324,6 +340,90 @@ def upsert_thread_summary(
             (sid, workspace_root, project_label, mtime, turns, label, purpose,
              did, status, open_question, model_id, _now()),
         )
+
+
+# ---------------------------------------------------------------------------
+# Ground — the durable working-set. One row per role ("active_plan",
+# "active_project", "last_artifact", …) binding a referent the user speaks in
+# ("the plan", "that project") to a concrete artifact (path / thread / label).
+#
+# This is the primitive whose absence produced the honeycomb grind (forensic
+# 2026-06-12): the agent loop started blind, so "live visuals three" cost ~$3
+# of Opus-priced filesystem archaeology to locate, twice. Writers are the
+# seams that already know the artifact (plan_with_claude, cursor_spawn,
+# build_with_cursor, the set_ground tool); the single reader is
+# tools._build_context, which renders ground into every loop's first message.
+# ---------------------------------------------------------------------------
+
+def set_ground(
+    role: str,
+    label: str,
+    path: str | None = None,
+    detail: str | None = None,
+    source: str | None = None,
+) -> None:
+    """Upsert one ground binding. Raises on bad input — a writer that calls
+    this with no role/label is a bug, not a condition to paper over."""
+    if not role.strip() or not label.strip():
+        raise ValueError("ground binding needs a non-empty role and label")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO ground (role, label, path, detail, source, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(role) DO UPDATE SET "
+            "label=excluded.label, path=excluded.path, detail=excluded.detail, "
+            "source=excluded.source, updated_at=excluded.updated_at",
+            (role.strip(), label.strip(), path, detail, source, _now()),
+        )
+
+
+def get_ground() -> list[dict[str, Any]]:
+    """All ground bindings, most recently updated first."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT role, label, path, detail, source, updated_at "
+            "FROM ground ORDER BY updated_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Loop findings — what an agent loop ESTABLISHED, persisted per session_key.
+#
+# The other half of the honeycomb forensic: run 1 spent $6.00 locating and
+# reading the answer's files, hit the cost wall, and the next run in the same
+# thread re-bought the identical discovery for $5.20 because nothing carried
+# over. One row per thread, replaced on every loop exit; the next loop in
+# that thread injects it ("already established — do not rediscover").
+# ---------------------------------------------------------------------------
+
+def save_findings(session_key: str, findings: str, status: str) -> None:
+    """Replace the findings ledger for one thread. No-op for empty input —
+    an empty ledger row would only add noise to the next run's context."""
+    if not session_key or not findings.strip():
+        return
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO loop_findings (session_key, findings, status, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(session_key) DO UPDATE SET "
+            "findings=excluded.findings, status=excluded.status, "
+            "updated_at=excluded.updated_at",
+            (session_key, findings, status, _now()),
+        )
+
+
+def get_findings(session_key: str) -> dict[str, Any] | None:
+    """The findings ledger for one thread, or None."""
+    if not session_key:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT session_key, findings, status, updated_at "
+            "FROM loop_findings WHERE session_key = ?",
+            (session_key,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------

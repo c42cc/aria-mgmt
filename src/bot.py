@@ -2428,17 +2428,22 @@ async def _run_ask(channel, message: str) -> None:
         await target.send(_CONTROL_PLANE_FRIENDLY)
 
 
-def _augment_with_context(user_text: str, session_key: str = "") -> str:
-    """Prepend this thread's recent turns to a Claude task, if any.
+def _augment_with_context(
+    user_text: str, session_key: str = "", parent_channel: str = "",
+) -> str:
+    """Prepend the request's conversational context to a Claude task, if any.
 
-    Scoped to `session_key` (the request's thread) so request B never
-    inherits request A's preamble — the context-bleed primitive, fixed at
-    the buffer. `exclude_last=1` drops the user turn the caller already
-    recorded so it isn't repeated in the task body. A brand-new thread has
-    no prior turns, so this returns the task unchanged (a clean slate).
+    Scoped to `session_key` (the request's thread) plus the recent user/aria
+    exchange from the same `parent_channel` — the room's own timeline. Thread
+    internals never bleed between requests, but a brand-new thread is no
+    longer amnesiac: "don't do anything with that" can resolve "that" from
+    the message sent in the same room seconds earlier (forensic 2026-06-12).
+    `exclude_last=1` drops the user turn the caller already recorded so it
+    isn't repeated in the task body.
     """
     ctx = conversation.as_claude_context(
-        max_turns=10, exclude_last=1, session_key=session_key
+        max_turns=10, exclude_last=1, session_key=session_key,
+        parent_channel=parent_channel,
     )
     if not ctx:
         return user_text
@@ -2488,8 +2493,17 @@ async def _handle_text_conversation(message: discord.Message) -> None:
         )
         return
 
+    # The room this request lives in: a thread's parent channel, or the
+    # channel itself for a top-level message. This is the continuity scope a
+    # sibling request in the same room may inherit (user/aria turns only).
+    parent_channel = str(
+        getattr(target, "parent_id", None) or getattr(message.channel, "id", "")
+    )
     channel_name = f"#{getattr(target, 'name', getattr(target, 'id', ''))}"
-    conversation.add_user_text(channel=channel_name, text=user_text, session_key=session_key)
+    conversation.add_user_text(
+        channel=channel_name, text=user_text, session_key=session_key,
+        parent_channel=parent_channel,
+    )
 
     if gemini and gemini.connected:
         try:
@@ -2519,7 +2533,7 @@ async def _handle_text_conversation(message: discord.Message) -> None:
     async with target.typing():
         try:
             result = await handle_tool_call("do_with_claude", {
-                "task": _augment_with_context(user_text, session_key),
+                "task": _augment_with_context(user_text, session_key, parent_channel),
                 "session_key": session_key,
             })
         except Exception:
@@ -2535,7 +2549,10 @@ async def _handle_text_conversation(message: discord.Message) -> None:
         await target.send(_CONTROL_PLANE_FRIENDLY)
         return
     await _send_chunked(target, result)
-    conversation.add_aria_text(channel=channel_name, text=result, session_key=session_key)
+    conversation.add_aria_text(
+        channel=channel_name, text=result, session_key=session_key,
+        parent_channel=parent_channel,
+    )
 
     if gemini and gemini.connected:
         try:

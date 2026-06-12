@@ -8,18 +8,15 @@ selection (the .env fields govern the legacy path).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 import yaml
 
 from .config import config
-from .db import log_loop_execution
 from .prompts import load_template
 
 log = logging.getLogger(__name__)
@@ -420,273 +417,13 @@ class IntelligenceLoop:
             turns_dropped=turns_dropped,
         )
 
-    async def execute_agent(
-        self,
-        task: str,
-        session_key: str = "",
-        memories: list[dict] | None = None,
-        mcp_client: Any = None,
-        alert_callback: Any = None,
-        cancel_check: Any = None,
-    ) -> LoopResult:
-        """Agent loop: bounded iterations with MCP tool access.
-
-        Supports mid-step suspension for risk-tier confirmation — the MCP
-        client's confirm callback is threaded through identically to the
-        legacy _do_with_claude path.
-        """
-        profile = self._router.profile("agent")
-        model_name = self._router._defaults.get("reasoning", "claude-opus")
-        system_prompt = load_template("do_with_claude_system")
-        started_at = time.monotonic()
-
-        spec = self._router.get(model_name)
-        if mcp_client is None:
-            return LoopResult(
-                text="MCP client not available", status="error",
-                iterations=0, total_tokens_in=0, total_tokens_out=0,
-                total_cost=0.0, latency_ms=0, model_id=spec.model_id,
-            )
-
-        tools = mcp_client.list_tools_anthropic()
-
-        memory_ctx = ""
-        if memories:
-            memory_ctx = "Relevant memories:\n" + "\n".join(
-                f"- {m.get('memory', m.get('text', ''))}" for m in memories
-            ) + "\n\n"
-
-        from .tools import _build_context as _ucs_build_context
-        context_block = _ucs_build_context(session_key)
-        messages: list[dict[str, Any]] = [
-            {"role": "user", "content": context_block + memory_ctx + task}
-        ]
-
-        total_in = 0
-        total_out = 0
-        total_cost = 0.0
-        max_tokens_budget = 50000
-        iteration = 0
-        truncated = False
-        turns_dropped = 0
-        tool_trace: list[dict] = []
-
-        # Cross-iteration dedup ledger. See _dedup_key in tools.py.
-        # Maps "name:args_json" -> (call_count, cached_result_str).
-        from .tools import (  # local import to avoid cycle at module load
-            _CREATE_42C_TOOL_SCHEMA,
-            _GROUND_CHECK_MAX_RETRIES,
-            _create_42c_account,
-            _dedup_key,
-            _emit_progress,
-            _ground_check,
-            _ground_check_user_message,
-            _humanize_step,
-        )
-        from .outcomes import classify_outcome, format_block, TRANSIENT_RETRY_BUDGET
-        # Same local deterministic tool injection as the legacy loop.
-        tools = tools + [_CREATE_42C_TOOL_SCHEMA]
-        called_tools: dict[str, tuple[int, str]] = {}
-
-        # P1 retry counter — see _do_with_claude_legacy for full notes.
-        ground_check_retries = 0
-
-        # Outcome accounting — one classifier (src/outcomes.py) decides
-        # continue / retry-once / stop. See _do_with_claude_legacy for notes.
-        retry_used: dict[str, int] = {}
-        blocker: str | None = None
-
-        while iteration < profile.max_iterations + ground_check_retries:
-            if cancel_check and cancel_check():
-                return LoopResult(
-                    text="Task cancelled by user.", status="cancelled",
-                    iterations=iteration, total_tokens_in=total_in,
-                    total_tokens_out=total_out, total_cost=total_cost,
-                    latency_ms=int((time.monotonic() - started_at) * 1000),
-                    model_id=spec.model_id,
-                    context_truncated=truncated, turns_dropped=turns_dropped,
-                    tool_trace=tool_trace or None,
-                )
-
-            iteration += 1
-
-            trunc, dropped = self._injector.trim_agent_messages(
-                system_prompt, messages, model_name=model_name,
-            )
-            if trunc:
-                truncated = True
-                turns_dropped += dropped
-
-            response = await self._router.call(
-                model_name, messages, system=system_prompt,
-                tools=tools, max_tokens=4096,
-            )
-
-            total_in += response["usage"]["input_tokens"]
-            total_out += response["usage"]["output_tokens"]
-            total_cost += response["cost"]
-
-            has_tool_use = any(
-                b.get("type") == "tool_use" for b in response["content"]
-            )
-
-            if response["stop_reason"] == "end_turn" or not has_tool_use:
-                text_parts = [b["text"] for b in response["content"] if b.get("type") == "text"]
-                result = "\n".join(text_parts)
-
-                # P1 — Pre-send Grounding Gate (UCS variant).
-                if ground_check_retries < _GROUND_CHECK_MAX_RETRIES:
-                    violations = await _ground_check(tool_trace, result, session_key)
-                    if violations:
-                        ground_check_retries += 1
-                        log.warning(
-                            "ground-check retry %d/%d (ucs) session=%s",
-                            ground_check_retries,
-                            _GROUND_CHECK_MAX_RETRIES,
-                            session_key,
-                        )
-                        messages.append({"role": "assistant", "content": response["raw_content"]})
-                        messages.append({
-                            "role": "user",
-                            "content": _ground_check_user_message(violations),
-                        })
-                        continue
-
-                return LoopResult(
-                    text=result, status="completed", iterations=iteration,
-                    total_tokens_in=total_in, total_tokens_out=total_out,
-                    total_cost=total_cost,
-                    latency_ms=int((time.monotonic() - started_at) * 1000),
-                    model_id=response["model_id"],
-                    context_truncated=truncated, turns_dropped=turns_dropped,
-                    tool_trace=tool_trace or None,
-                )
-
-            messages.append({"role": "assistant", "content": response["raw_content"]})
-
-            tool_results = []
-            for block in response["content"]:
-                if block.get("type") != "tool_use":
-                    continue
-                tool_args = block.get("input", {})
-                dedup_key = _dedup_key(block["name"], tool_args)
-                prev_count, cached_result = called_tools.get(dedup_key, (0, ""))
-
-                if prev_count >= 1:
-                    result_str = json.dumps({
-                        "_dup_hit": True,
-                        "_call_count": prev_count + 1,
-                        "_note": (
-                            f"You have already called {block['name']} with "
-                            f"these exact args earlier in this session. The "
-                            f"cached result is included below. Stop re-issuing "
-                            f"this call; if the result is insufficient, change "
-                            f"the args or pick a different tool."
-                        ),
-                        "cached_result": cached_result[:40_000],
-                    })
-                    called_tools[dedup_key] = (prev_count + 1, cached_result)
-                    log.warning(
-                        "Claude dedup hit (ucs): %s (call #%d) session=%s",
-                        block["name"], prev_count + 1, session_key,
-                    )
-                else:
-                    await _emit_progress(session_key, _humanize_step(block["name"], tool_args))
-                    if block["name"] == "create_42c_account":
-                        local_args = dict(tool_args)
-                        local_args.setdefault("session_key", session_key)
-                        result_str = await _create_42c_account(**local_args)
-                    else:
-                        tool_result = await mcp_client.call_tool(
-                            block["name"],
-                            tool_args,
-                            session_key=session_key,
-                        )
-                        result_str = tool_result
-                    called_tools[dedup_key] = (1, result_str)
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block["id"],
-                    "content": result_str[:50_000],
-                })
-                tool_trace.append({
-                    "tool": block["name"],
-                    "args": {k: (str(v)[:10_000] + f"... [{len(str(v))} chars]" if len(str(v)) > 10_000 else v)
-                             for k, v in tool_args.items()},
-                    "result": result_str[:1_000_000],
-                    "result_chars": len(result_str),
-                    "result_truncated": len(result_str) > 1_000_000,
-                    "deduped": prev_count >= 1,
-                })
-
-                outcome = classify_outcome(block["name"], tool_args, result_str)
-                if outcome.is_blocked:
-                    log.warning(
-                        "blocked (ucs): %s args=%s reason=%s session=%s",
-                        block["name"], str(tool_args)[:200],
-                        outcome.reason[:200], session_key,
-                    )
-                    blocker = format_block(outcome.reason, outcome.need)
-                    break
-                if outcome.is_transient:
-                    used = retry_used.get(outcome.family, 0)
-                    if used >= TRANSIENT_RETRY_BUDGET:
-                        blocker = format_block(
-                            outcome.reason,
-                            outcome.need or "a stable connection, or a different approach",
-                        )
-                        break
-                    retry_used[outcome.family] = used + 1
-
-            messages.append({"role": "user", "content": tool_results})
-
-            if blocker is not None:
-                if alert_callback:
-                    asyncio.create_task(alert_callback(blocker))
-                return LoopResult(
-                    text=blocker, status="blocked",
-                    iterations=iteration,
-                    total_tokens_in=total_in, total_tokens_out=total_out,
-                    total_cost=total_cost,
-                    latency_ms=int((time.monotonic() - started_at) * 1000),
-                    model_id=spec.model_id,
-                    context_truncated=truncated, turns_dropped=turns_dropped,
-                    tool_trace=tool_trace or None,
-                )
-
-            if total_out > max_tokens_budget:
-                if alert_callback:
-                    asyncio.create_task(alert_callback(
-                        f"do_with_claude token budget exceeded ({total_out} tokens)"
-                    ))
-                return LoopResult(
-                    text=f"Token budget exceeded ({total_out} tokens).",
-                    status="token_budget", iterations=iteration,
-                    total_tokens_in=total_in, total_tokens_out=total_out,
-                    total_cost=total_cost,
-                    latency_ms=int((time.monotonic() - started_at) * 1000),
-                    model_id=spec.model_id,
-                    context_truncated=truncated, turns_dropped=turns_dropped,
-                    tool_trace=tool_trace or None,
-                )
-
-        final_text = (
-            f"Task reached iteration limit ({profile.max_iterations}). "
-            f"Partial progress made."
-        )
-        if alert_callback:
-            asyncio.create_task(alert_callback(final_text))
-
-        return LoopResult(
-            text=final_text, status="iteration_limit", iterations=iteration,
-            total_tokens_in=total_in, total_tokens_out=total_out,
-            total_cost=total_cost,
-            latency_ms=int((time.monotonic() - started_at) * 1000),
-            model_id=spec.model_id,
-            context_truncated=truncated, turns_dropped=turns_dropped,
-            tool_trace=tool_trace or None,
-        )
+    # NOTE: there is deliberately no execute_agent here. The system has exactly
+    # ONE agent loop — tools._do_with_claude_loop — regardless of UCS_ENABLED.
+    # The previous UCS copy of the loop was dormant, drifted (it had no dollar
+    # cap, no local-tool table, no findings ledger), and every reliability fix
+    # had to be wired twice. A drifted duplicate of the most failure-prone
+    # primitive in the system is exactly the kind of legacy this codebase
+    # does not keep.
 
 
 # ---------------------------------------------------------------------------

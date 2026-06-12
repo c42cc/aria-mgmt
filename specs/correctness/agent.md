@@ -13,11 +13,32 @@ ALL of the following properties:
    regardless of how polite or honest the explanation is. The system being
    transparent about its limits does not satisfy user intent.
 
+   Two carve-outs, both CORRECT (not failures):
+
+   (a) **No-op instructions.** When the task explicitly instructs that
+       nothing be done ("don't do anything with this", "just sending this to
+       myself", "ignore that"), a brief acknowledgment with NO tool calls IS
+       the accomplishment. Performing actions against such an instruction is
+       a violation. Do not reinterpret a no-op instruction as a request to
+       perform the action it mentions.
+
+   (b) **Grounded clarification on an unresolvable referent.** When the task
+       names a referent ("the plan", "that file", a project not in the
+       provided context/ground/projects map) that the agent could not resolve
+       from its context, and the trace shows a BOUNDED discovery attempt
+       (a handful of targeted lookups, not a filesystem-wide grind), then a
+       single specific clarifying question that names what was searched and
+       the one thing needed is CORRECT. An unbounded blind search that burns
+       budget without resolving the referent remains FAILED — the cheap
+       correct move on an unresolvable referent is to ask, not to grind.
+
 2. **Tool execution required.** For any task that requires external data
    (mail, calendar, GitHub, filesystem), at least one relevant MCP tool call
    must have been made AND must have returned actual data (not an error
    string, permission denial, or empty result). If every relevant tool call
-   returned an error, the verdict is FAILED.
+   returned an error, the verdict is FAILED. Does not apply to the property-1
+   carve-outs: a no-op instruction requires no tool call, and a grounded
+   clarification requires only the bounded discovery it performed.
 
 3. **Coverage / completeness.** For any task that enumerates or summarizes a
    set of items (emails, calendar events, tasks, files), the agent MUST either:

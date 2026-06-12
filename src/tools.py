@@ -21,10 +21,14 @@ from .db import (
     append_planning_history,
     get_active_cursor_sessions,
     get_daily_spend,
+    get_findings,
+    get_ground,
     get_planning_history,
     log_event,
     log_loop_execution,
     record_session,
+    save_findings,
+    set_ground,
     tool_to_product,
     upsert_cursor_session,
 )
@@ -39,7 +43,13 @@ from .cursor_tools import (
     _cursor_threads,
 )
 from .conversation import conversation
-from .outcomes import classify_outcome, format_block, TRANSIENT_RETRY_BUDGET
+from .outcomes import (
+    TRANSIENT_RETRY_BUDGET,
+    _action_family,
+    classify_outcome,
+    format_block,
+    is_discovery_family,
+)
 from .memory import recall as mem_recall, remember as mem_remember, forget as mem_forget
 from .prompts import (
     clear_cache as prompts_clear_cache,
@@ -97,7 +107,34 @@ def _dedup_key(tool_name: str, args: dict) -> str:
 # because cost is dominated by *input* tokens — each iteration resends the
 # growing message history, so a 30-iteration grind reached ~1.3M input tokens
 # / ~$20 (the entire daily cap) in one call. This is the missing dollar floor.
+# The loop projects the NEXT iteration's cost from the last one and stops
+# BEFORE crossing the line (the honeycomb run charged $6.00 against this $5.00
+# cap because the check ran after the spend).
 _LOOP_COST_CAP_USD = float(os.getenv("DO_WITH_CLAUDE_LOOP_COST_CAP_USD", "5.0"))
+
+# Backstop on blind discovery: if a loop has spent this much and EVERY tool
+# call so far is a discovery action (find/grep/ls/search_files/…), the task's
+# referent is unresolved and more searching is a grind — stop and ask the one
+# question instead. With ground + the projects map in context this should
+# almost never fire; it exists so an un-grounded referent costs ~$1.50 and one
+# crisp question, not $5+ and a budget wall (honeycomb forensic 2026-06-12).
+_DISCOVERY_COST_CAP_USD = float(os.getenv("DO_WITH_CLAUDE_DISCOVERY_CAP_USD", "1.5"))
+
+# Carried-forward context discipline: tool results older than the last
+# _COMPACT_KEEP_FULL tool-result messages are clipped to their head. The full
+# text was visible to the model when fresh (it acted on it); re-billing a 30KB
+# directory dump on every later iteration is what drove the honeycomb run from
+# $0.49/step to $1.17/step.
+_COMPACT_KEEP_FULL = 2
+_COMPACT_HEAD_CHARS = 2_000
+
+# Anthropic prompt-caching price multipliers (relative to base input price):
+# a cache write costs 1.25x once; a cache read costs 0.10x. The static prefix
+# (system prompt + tool catalog ≈ 20K tokens) and the growing message history
+# are marked with cache breakpoints, so iteration N re-reads what iteration
+# N-1 paid for instead of re-buying it at full price.
+_CACHE_WRITE_MULT = 1.25
+_CACHE_READ_MULT = 0.10
 
 
 def _truncate_trace_args(args: dict, max_chars: int = _TRACE_ARG_MAX_CHARS) -> dict:
@@ -112,6 +149,22 @@ def _truncate_trace_args(args: dict, max_chars: int = _TRACE_ARG_MAX_CHARS) -> d
     return out
 
 
+def _rel_age(iso_ts: str) -> str:
+    """Render an ISO timestamp as a short relative age ('3m ago', '2h ago')."""
+    try:
+        then = datetime.fromisoformat(iso_ts)
+    except (TypeError, ValueError):
+        return "unknown age"
+    secs = max(0, (datetime.now(timezone.utc) - then).total_seconds())
+    if secs < 90:
+        return "just now"
+    if secs < 5400:
+        return f"{int(secs // 60)}m ago"
+    if secs < 129600:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
 def _build_context(session_key: str = "") -> str:
     """Compose a deterministic `<context>` block for the agent's user message.
 
@@ -120,6 +173,11 @@ def _build_context(session_key: str = "") -> str:
     actually available) so she never has to fetch them via a fallible
     upstream tool. Failures here are non-fatal — we always return at least
     the time line.
+
+    The `projects:` and `ground:` sections are the ground primitive (forensic
+    2026-06-12, the honeycomb thread): the loop must never pay Opus prices to
+    discover a path the system already knows, and referents like "the plan"
+    must resolve from durable state, not filesystem archaeology.
     """
     lines: list[str] = ["<context>"]
 
@@ -132,6 +190,33 @@ def _build_context(session_key: str = "") -> str:
     lines.append(f"  user_primary_email: {_USER_PRIMARY_EMAIL}")
     lines.append("  primary_mail_source: gmail  "
                  "(apple mail is filtered out — do not propose mail_messages)")
+
+    if PROJECT_REGISTRY:
+        lines.append("  projects (name → absolute path; NEVER search the "
+                     "filesystem for a path listed here):")
+        for name in sorted(PROJECT_REGISTRY):
+            path = PROJECT_REGISTRY[name]
+            missing = "" if os.path.isdir(path) else "  [MISSING ON DISK]"
+            lines.append(f"    - {name} → {path}{missing}")
+
+    try:
+        bindings = get_ground()
+        if bindings:
+            lines.append("  ground (durable working set — resolve referents "
+                         "like 'the plan' / 'that project' here first; update "
+                         "via set_ground):")
+            for b in bindings:
+                bits = [b["label"]]
+                if b.get("path"):
+                    bits.append(b["path"])
+                if b.get("detail"):
+                    bits.append(b["detail"])
+                lines.append(
+                    f"    - {b['role']}: {' — '.join(bits)}  "
+                    f"({_rel_age(b['updated_at'])})"
+                )
+    except Exception:
+        log.warning("context: ground omitted", exc_info=True)
 
     try:
         from .mcp import mcp_client
@@ -317,10 +402,45 @@ def _get_model_costs() -> tuple[float, float]:
     )
 
 
-def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
+def _estimate_cost(
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Dollar cost of one model call, cache-aware.
+
+    With prompt caching on, `usage.input_tokens` excludes cached tokens —
+    they arrive as cache_creation (1.25x input price, paid once) and
+    cache_read (0.10x). All four streams must be billed or the spend caps
+    are fed lies.
+    """
     cost_in, cost_out = _get_model_costs()
     return (input_tokens / 1_000_000 * cost_in
+            + cache_creation_tokens / 1_000_000 * cost_in * _CACHE_WRITE_MULT
+            + cache_read_tokens / 1_000_000 * cost_in * _CACHE_READ_MULT
             + output_tokens / 1_000_000 * cost_out)
+
+
+def _usage_cost(usage: Any) -> float:
+    """Bill an Anthropic `usage` object through `_estimate_cost`."""
+    return _estimate_cost(
+        getattr(usage, "input_tokens", 0) or 0,
+        getattr(usage, "output_tokens", 0) or 0,
+        getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        getattr(usage, "cache_read_input_tokens", 0) or 0,
+    )
+
+
+def _usage_context_tokens(usage: Any) -> int:
+    """The TRUE context size of one call: fresh + cache-written + cache-read
+    input tokens. `usage.input_tokens` alone under-reports once caching is on,
+    which would corrupt the loop_executions telemetry the forensics read."""
+    return (
+        (getattr(usage, "input_tokens", 0) or 0)
+        + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+    )
 
 
 _anthropic_client: anthropic.Anthropic | None = None
@@ -722,8 +842,31 @@ async def _plan_with_claude(
     prompt_template: str = "planning",
 ) -> str:
     if config.ucs_enabled:
-        return await _plan_with_claude_ucs(context, session_key, prompt_template)
-    return await _plan_with_claude_legacy(context, session_key, prompt_template)
+        result = await _plan_with_claude_ucs(context, session_key, prompt_template)
+    else:
+        result = await _plan_with_claude_legacy(context, session_key, prompt_template)
+
+    # Ground write at the seam that knows the artifact: this plan is now what
+    # "the plan" refers to. Telemetry-class — never breaks the planning path.
+    try:
+        if result and not result.lstrip().startswith('{"error"'):
+            first_line = next(
+                (ln.strip().lstrip("#* ").strip()
+                 for ln in result.splitlines() if ln.strip()),
+                "",
+            )
+            set_ground(
+                "active_plan",
+                label=first_line[:120] or f"plan for: {context[:100]}",
+                detail=(
+                    f"latest plan from planning thread {session_key}; full "
+                    "text in that Discord thread / planning_history"
+                ),
+                source=session_key,
+            )
+    except Exception:
+        log.warning("ground write (active_plan) failed", exc_info=True)
+    return result
 
 
 async def _plan_with_claude_legacy(
@@ -1047,6 +1190,18 @@ async def _build_with_cursor(
 
     session_id = await _cursor_bridge.create_session(project_path, full_instruction)
     upsert_cursor_session(session_id, project)
+
+    # Ground write: this project is now what "the project" refers to.
+    try:
+        set_ground(
+            "active_project",
+            label=project,
+            path=project_path,
+            detail=f"cursor build session {session_id[:8]}",
+            source=session_key or "build_with_cursor",
+        )
+    except Exception:
+        log.warning("ground write (active_project) failed", exc_info=True)
 
     thread = None
     if _thread_callback:
@@ -1612,6 +1767,60 @@ _SPARK_SETUP_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# The agent's handle on the ground table: when it discovers where something
+# important lives (or the user names it), it binds the referent durably so the
+# NEXT request resolves it from context instead of re-discovering at Opus
+# prices. The read side needs no tool — _build_context renders ground into
+# every loop's first message.
+_SET_GROUND_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "set_ground",
+    "description": (
+        "Bind a role in the durable working set (ground) to a concrete "
+        "artifact so future requests resolve referents like 'the plan' or "
+        "'that project' instantly from context. Call it when you locate "
+        "something the user will refer back to (a plan document, a project "
+        "directory, a deliverable) or when the user declares what they're "
+        "working on. Common roles: active_plan, active_project, "
+        "last_artifact; short custom roles are fine."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "role": {
+                "type": "string",
+                "description": "Binding name, e.g. 'active_plan'.",
+            },
+            "label": {
+                "type": "string",
+                "description": "Short human description of the artifact.",
+            },
+            "path": {
+                "type": "string",
+                "description": "Absolute path when the artifact is a file or directory.",
+            },
+            "detail": {
+                "type": "string",
+                "description": "How to read it (thread id, command, location notes).",
+            },
+        },
+        "required": ["role", "label"],
+    },
+}
+
+
+async def _set_ground_tool(
+    role: str,
+    label: str,
+    path: str = "",
+    detail: str = "",
+    session_key: str = "",
+) -> str:
+    set_ground(role, label, path or None, detail or None,
+               source=session_key or "agent")
+    return json.dumps({"ok": True, "role": role, "label": label,
+                       "path": path or None})
+
+
 # Local (non-MCP) tools the do_with_claude loop can dispatch alongside the MCP
 # catalog. create_42c_account provisions a login deterministically; the cursor_*
 # tools give the text agent the same durable Cursor-thread introspection and
@@ -1629,6 +1838,7 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _SPARK_STATUS_TOOL_SCHEMA,
     _SPARK_VERIFY_TOOL_SCHEMA,
     _SPARK_SETUP_TOOL_SCHEMA,
+    _SET_GROUND_TOOL_SCHEMA,
 ]
 _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "create_42c_account": _create_42c_account,
@@ -1640,7 +1850,143 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "spark_status": _spark_status,
     "spark_verify": _spark_verify,
     "spark_setup": _spark_setup,
+    "set_ground": _set_ground_tool,
 }
+
+# Local tools that receive the loop's session_key automatically.
+_SESSION_KEY_LOCAL_TOOLS = frozenset({
+    "create_42c_account",
+    "spark_status", "spark_verify", "spark_setup",
+    "set_ground",
+})
+
+
+# ---------------------------------------------------------------------------
+# Context economics — prompt-cache breakpoints and tool-result compaction.
+#
+# The honeycomb forensic (2026-06-12): a 7-iteration loop re-billed its
+# ~20K-token static prefix and every carried tool dump at full Opus input
+# price each step ($0.49 → $1.17 per iteration), then a second run re-bought
+# the same discovery. These helpers make iteration N re-READ what iteration
+# N-1 paid for (cache breakpoints) and keep the carried history bounded
+# (compaction), so the $5 loop cap buys work instead of repeat billing.
+# ---------------------------------------------------------------------------
+
+def _cache_marked_system(system_prompt: str) -> list[dict[str, Any]]:
+    """System prompt as a cache-marked block (caches system + tool catalog)."""
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _cache_marked_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark the last tool so the whole catalog prefix is cacheable."""
+    if not tools:
+        return tools
+    marked = list(tools)
+    marked[-1] = dict(marked[-1])
+    marked[-1]["cache_control"] = {"type": "ephemeral"}
+    return marked
+
+
+def _move_message_cache_breakpoint(messages: list[dict[str, Any]]) -> None:
+    """Keep exactly one moving cache breakpoint on the newest user message.
+
+    Strips stale markers from every dict content block (Anthropic allows max
+    4 breakpoints per request; system + tools hold two), then marks the last
+    block of the most recent user message so the entire conversation prefix
+    is a cache hit on the next iteration. Assistant messages carry SDK
+    objects, not dicts — they are left untouched.
+    """
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict):
+                block.pop("cache_control", None)
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            content[-1]["cache_control"] = {"type": "ephemeral"}
+        return
+
+
+def _compact_old_tool_results(messages: list[dict[str, Any]]) -> int:
+    """Clip tool results older than the last `_COMPACT_KEEP_FULL` carriers.
+
+    The model saw the full text when it was fresh and acted on it; what later
+    iterations need is the gist, not a re-billed 30KB dump. Returns how many
+    blocks were compacted. Idempotent: already-clipped blocks are shorter
+    than the threshold and are never re-cut.
+    """
+    carriers = [
+        m for m in messages
+        if m.get("role") == "user"
+        and isinstance(m.get("content"), list)
+        and any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in m["content"]
+        )
+    ]
+    compacted = 0
+    for m in carriers[:-_COMPACT_KEEP_FULL] if _COMPACT_KEEP_FULL else carriers:
+        for b in m["content"]:
+            if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                continue
+            c = b.get("content")
+            if isinstance(c, str) and len(c) > _COMPACT_HEAD_CHARS + 300:
+                b["content"] = (
+                    c[:_COMPACT_HEAD_CHARS]
+                    + f"\n[…compacted: {len(c):,} chars total. You already saw "
+                    "the full result when it was fresh; re-run the tool only "
+                    "if you genuinely need the rest.]"
+                )
+                compacted += 1
+    return compacted
+
+
+def _distill_findings(tool_trace: list[dict], cap_chars: int = 6_000) -> str:
+    """Mechanical findings ledger from a loop's tool trace.
+
+    Deterministic and free (no model call): one line per executed tool —
+    what was asked, the head of what came back. Enough for the next run in
+    this thread to build on located paths and read files instead of
+    re-buying the discovery (the honeycomb $6-then-$5.20 pattern).
+    """
+    if not tool_trace:
+        return ""
+    lines: list[str] = []
+    for t in tool_trace[-24:]:
+        if t.get("deduped") or "_dropped_tool_calls" in t:
+            continue
+        try:
+            args = json.dumps(t.get("args", {}), default=str)
+        except (TypeError, ValueError):
+            args = repr(t.get("args"))
+        res = " ".join(str(t.get("result", "")).split())
+        lines.append(f"- {t.get('tool')} {args[:200]} => {res[:300]}")
+    text = "\n".join(lines)
+    return text[-cap_chars:] if len(text) > cap_chars else text
+
+
+def _blocker_with_findings(reason: str, need: str, tool_trace: list[dict]) -> str:
+    """A spend-stop blocker that hands over what the spend bought.
+
+    The honeycomb run paused at its cost wall having already read the
+    answer's files — and returned none of it. A stop on spend must never
+    withhold paid-for findings: 'keep going' resumes from the ledger, and
+    the user can often answer themselves from the digest alone.
+    """
+    msg = format_block(reason, need)
+    digest = _distill_findings(tool_trace, cap_chars=1_500)
+    if digest:
+        msg += f"\n\nWhat I established before stopping:\n{digest}"
+    return msg
 
 
 async def _do_with_claude(
@@ -1661,12 +2007,10 @@ async def _do_with_claude(
     # this lock, so a stuck loop is still interruptible while queued.
     lock = _agent_lock_for(session_key or "global")
     async with lock:
-        if config.ucs_enabled:
-            return await _do_with_claude_ucs(task, session_key)
-        return await _do_with_claude_legacy(task, session_key)
+        return await _do_with_claude_loop(task, session_key)
 
 
-async def _do_with_claude_legacy(
+async def _do_with_claude_loop(
     task: str,
     session_key: str = "",
 ) -> str:
@@ -1686,7 +2030,12 @@ async def _do_with_claude_legacy(
     except ImportError:
         return json.dumps({"error": "MCP module not available"})
 
+    # Cache-marked static prefix: the tool catalog and system prompt are
+    # identical every iteration (and across loops within the cache TTL), so
+    # they are paid for once and read at 0.10x after that.
+    tools = _cache_marked_tools(tools)
     system_prompt = load_template("do_with_claude_system")
+    system_blocks = _cache_marked_system(system_prompt)
 
     memories = mem_recall(task, limit=3)
     memory_ctx = ""
@@ -1695,16 +2044,36 @@ async def _do_with_claude_legacy(
             f"- {m.get('memory', m.get('text', ''))}" for m in memories
         ) + "\n\n"
 
+    # Findings ledger — what a previous run in THIS thread already
+    # established. A budget-paused run's discovery survives the wall; "keep
+    # going" resumes from here instead of re-buying it (honeycomb forensic).
+    findings_ctx = ""
+    if session_key:
+        prior = get_findings(session_key)
+        if prior:
+            findings_ctx = (
+                "Findings already established by this thread's previous run "
+                f"(status: {prior['status']}, {_rel_age(prior['updated_at'])}) "
+                "— build on these; do NOT re-run discovery for anything "
+                "listed here:\n"
+                f"{prior['findings']}\n\n"
+            )
+
     context_block = _build_context(session_key)
-    messages: list[dict[str, Any]] = [
-        {"role": "user", "content": context_block + memory_ctx + task}
-    ]
+    messages: list[dict[str, Any]] = [{
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": context_block + findings_ctx + memory_ctx + task,
+        }],
+    }]
 
     max_iterations = config.do_with_claude_max_iterations
     iteration = 0
     total_input_tokens = 0
     total_output_tokens = 0
     total_cost = 0.0
+    last_iter_cost = 0.0
     max_tokens_budget = 50000
     started_at = time.monotonic()
     started_at_iso = _now_iso()
@@ -1732,13 +2101,51 @@ async def _do_with_claude_legacy(
     retry_used: dict[str, int] = {}
     blocker: str | None = None
 
+    # True while every executed tool call is a discovery action — the signal
+    # that the task's referent is still unresolved and spend is going to
+    # archaeology, not work.
+    discovery_only = True
+
+    def _save_ledger(status: str) -> None:
+        """Persist this run's findings for the thread's next run. Telemetry-
+        class write: never breaks the hot path, but never silent either."""
+        if not session_key:
+            return
+        try:
+            text = _distill_findings(tool_trace)
+            if text:
+                save_findings(session_key, text, status)
+        except Exception:
+            log.warning("findings ledger write failed session=%s", session_key,
+                        exc_info=True)
+
     while iteration < max_iterations + ground_check_retries and not state.cancel:
         iteration += 1
+
+        # Pre-spend cap: stop BEFORE the call that would cross the line.
+        # The honeycomb run charged $6.00 against a $5.00 cap because the
+        # check ran after the spend; projecting from the last iteration's
+        # cost closes that hole.
+        if iteration > 1 and total_cost + last_iter_cost >= _LOOP_COST_CAP_USD:
+            final_status = "blocked"
+            blocker = _blocker_with_findings(
+                f"this task is about to exceed its ${_LOOP_COST_CAP_USD:.2f} "
+                f"budget (spent ${total_cost:.2f} over {iteration - 1} steps)",
+                "a go-ahead to keep spending on it, or a narrower task",
+                tool_trace,
+            )
+            if _alert_callback:
+                asyncio.create_task(_alert_callback(blocker))
+            break
+
+        # One moving cache breakpoint on the newest user message: the whole
+        # conversation prefix becomes a cache read on the next iteration.
+        _move_message_cache_breakpoint(messages)
 
         response = await asyncio.to_thread(
             _anthropic_client.messages.create,
             model=config.claude_model,
-            system=system_prompt,
+            system=system_blocks,
             messages=messages,
             tools=tools,
             max_tokens=4096,
@@ -1746,10 +2153,11 @@ async def _do_with_claude_legacy(
 
         usage = response.usage
         if usage:
-            total_input_tokens += usage.input_tokens
+            total_input_tokens += _usage_context_tokens(usage)
             total_output_tokens += usage.output_tokens
-            cost = _estimate_cost(usage.input_tokens, usage.output_tokens)
+            cost = _usage_cost(usage)
             total_cost += cost
+            last_iter_cost = cost
             log_event("do_with_claude_iteration", {"iteration": iteration}, "", 0, session_key, cost)
 
         if response.stop_reason == "end_turn" or not any(
@@ -1774,7 +2182,10 @@ async def _do_with_claude_legacy(
                     messages.append({"role": "assistant", "content": response.content})
                     messages.append({
                         "role": "user",
-                        "content": _ground_check_user_message(violations),
+                        "content": [{
+                            "type": "text",
+                            "text": _ground_check_user_message(violations),
+                        }],
                     })
                     continue
 
@@ -1791,6 +2202,7 @@ async def _do_with_claude_legacy(
                 status="completed",
                 started_at=started_at_iso,
             )
+            _save_ledger("completed")
             state.last_tool_trace = _cap_trace_size(tool_trace) or None
             return result
 
@@ -1832,10 +2244,7 @@ async def _do_with_claude_legacy(
                 local_handler = _LOCAL_TOOL_HANDLERS.get(block.name)
                 if local_handler is not None:
                     local_args = dict(tool_args)
-                    if block.name in (
-                        "create_42c_account",
-                        "spark_status", "spark_verify", "spark_setup",
-                    ):
+                    if block.name in _SESSION_KEY_LOCAL_TOOLS:
                         local_args.setdefault("session_key", session_key)
                     result_str = await local_handler(**local_args)
                 else:
@@ -1844,6 +2253,8 @@ async def _do_with_claude_legacy(
                     )
                     result_str = tool_result
                 called_tools[dedup_key] = (1, result_str)
+                if not is_discovery_family(_action_family(block.name, tool_args)):
+                    discovery_only = False
 
             tool_results.append({
                 "type": "tool_result",
@@ -1893,8 +2304,31 @@ async def _do_with_claude_legacy(
 
         messages.append({"role": "user", "content": tool_results})
 
+        # Keep the carried history bounded: results older than the last two
+        # carriers are clipped to their head (the model saw them in full when
+        # they were fresh). This is what keeps per-iteration cost flat.
+        _compact_old_tool_results(messages)
+
         if blocker is not None:
             final_status = "blocked"
+            if _alert_callback:
+                asyncio.create_task(_alert_callback(blocker))
+            break
+
+        # Discovery backstop: meaningful spend with NOTHING but find/grep/list
+        # so far means the task's referent never resolved — more searching is
+        # a grind. Stop and ask the one question. With ground + the projects
+        # map in context this should almost never fire.
+        if discovery_only and total_cost >= _DISCOVERY_COST_CAP_USD:
+            final_status = "blocked"
+            blocker = _blocker_with_findings(
+                f"I've spent ${total_cost:.2f} purely on discovery "
+                f"(find/grep/list) without resolving what the task refers to",
+                "the concrete path or name — or bind it once with set_ground "
+                "/ projects/registry.md and I'll never have to search for it "
+                "again",
+                tool_trace,
+            )
             if _alert_callback:
                 asyncio.create_task(_alert_callback(blocker))
             break
@@ -1907,14 +2341,16 @@ async def _do_with_claude_legacy(
                 ))
             break
 
-        # The per-loop dollar cap is itself a deterministic wall — express it
-        # as a BLOCKED outcome through the same formatter, not a separate path.
+        # Hard stop if a single iteration blew straight past the cap despite
+        # the pre-spend projection — same wall, same formatter, and the
+        # paid-for findings ride along instead of being withheld.
         if total_cost >= _LOOP_COST_CAP_USD:
             final_status = "blocked"
-            blocker = format_block(
+            blocker = _blocker_with_findings(
                 f"this one task hit its ${_LOOP_COST_CAP_USD:.2f} budget "
                 f"(spent ${total_cost:.2f} over {iteration} steps) before finishing",
                 "a go-ahead to keep spending on it, or a narrower task",
+                tool_trace,
             )
             if _alert_callback:
                 asyncio.create_task(_alert_callback(blocker))
@@ -1939,6 +2375,7 @@ async def _do_with_claude_legacy(
         started_at=started_at_iso,
     )
 
+    _save_ledger(final_status)
     state.last_tool_trace = _cap_trace_size(tool_trace) or None
 
     if state.cancel:
@@ -1957,55 +2394,6 @@ async def _do_with_claude_legacy(
     if _alert_callback:
         asyncio.create_task(_alert_callback(partial))
     return partial
-
-
-async def _do_with_claude_ucs(
-    task: str,
-    session_key: str = "",
-) -> str:
-    state = _state_for(session_key)
-    state.cancel = False
-
-    try:
-        from .mcp import mcp_client
-        if not mcp_client:
-            return json.dumps({"error": "MCP client not initialized"})
-    except ImportError:
-        return json.dumps({"error": "MCP module not available"})
-
-    from .ucs import get_loop
-
-    memories = mem_recall(task, limit=3)
-    started_at_iso = _now_iso()
-
-    result = await get_loop().execute_agent(
-        task=task,
-        session_key=session_key,
-        memories=memories if memories else None,
-        mcp_client=mcp_client,
-        alert_callback=_alert_callback,
-        cancel_check=lambda: state.cancel,
-    )
-
-    log_loop_execution(
-        tool_name="do_with_claude",
-        session_key=session_key,
-        prompt_template="do_with_claude_system",
-        model_id=result.model_id,
-        routing_path="ucs",
-        tokens_in=result.total_tokens_in,
-        tokens_out=result.total_tokens_out,
-        cost_usd=result.total_cost,
-        latency_ms=result.latency_ms,
-        iterations=result.iterations,
-        status=result.status,
-        context_truncated=result.context_truncated,
-        turns_dropped=result.turns_dropped,
-        started_at=started_at_iso,
-    )
-
-    state.last_tool_trace = _cap_trace_size(result.tool_trace) if result.tool_trace else None
-    return result.text
 
 
 # ---------------------------------------------------------------------------

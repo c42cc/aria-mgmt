@@ -55,6 +55,12 @@ class Turn:
     # agent loop filters context to one session_key so two request-threads
     # never bleed into each other; voice keeps reading the whole buffer.
     session_key: str = ""
+    # The Discord channel the request-thread hangs off (its parent). This is
+    # the user's conversational room: a NEW thread inherits the recent
+    # user/aria exchange from the same room, so "don't do anything with that"
+    # can resolve "that" (forensic 2026-06-12: every top-level message arrived
+    # with zero context because isolation severed the room's own timeline).
+    parent_channel: str = ""
 
     def short(self) -> str:
         body = self.text.strip()
@@ -76,11 +82,21 @@ class ConversationBuffer:
 
     # -- writers --------------------------------------------------------
 
-    def add_user_text(self, channel: str, text: str, session_key: str = "") -> None:
-        self._append(Turn(role="user", medium="text", channel=channel, text=text, session_key=session_key))
+    def add_user_text(
+        self, channel: str, text: str, session_key: str = "",
+        parent_channel: str = "",
+    ) -> None:
+        self._append(Turn(role="user", medium="text", channel=channel,
+                          text=text, session_key=session_key,
+                          parent_channel=parent_channel))
 
-    def add_aria_text(self, channel: str, text: str, session_key: str = "") -> None:
-        self._append(Turn(role="aria", medium="text", channel=channel, text=text, session_key=session_key))
+    def add_aria_text(
+        self, channel: str, text: str, session_key: str = "",
+        parent_channel: str = "",
+    ) -> None:
+        self._append(Turn(role="aria", medium="text", channel=channel,
+                          text=text, session_key=session_key,
+                          parent_channel=parent_channel))
 
     def add_user_voice(self, channel: str, text: str, session_key: str = "") -> None:
         self._append(Turn(role="user", medium="voice", channel=channel, text=text, session_key=session_key))
@@ -174,6 +190,7 @@ class ConversationBuffer:
         exclude_last: int = 0,
         include_alerts: bool = False,
         session_key: str = "",
+        parent_channel: str = "",
     ) -> str:
         """Format recent turns as a context preamble for `do_with_claude`.
 
@@ -199,23 +216,28 @@ class ConversationBuffer:
         if not include_alerts:
             candidates = [t for t in candidates if t.role != "alert"]
 
-        # Per-thread isolation: when a session_key is supplied, the agent loop
-        # is running a FOCUSED request in its own Discord thread, so it should
-        # see only THIS thread's turns. The ambient Cursor-watch firehose is
-        # deliberately excluded here — on 2026-06-09 a `live_visuals_4` watch
-        # narration bled into the focused `#keys` tailscale thread because the
-        # old carve-out let `cursor_event` flow into every session. Voice and
-        # global callers (no session_key) still receive cursor events below.
-        # Opted-in alerts (already gated by `include_alerts`) remain ambient.
-        # This is the primitive that kills cross-request context bleed: a
-        # brand-new thread sees none of a sibling thread's turns nor the
-        # watcher's noise, so request B never inherits request A's preamble.
+        # Per-thread isolation WITH room continuity. A focused request sees:
+        #   1. its own thread's turns (session_key match), and
+        #   2. the recent user/aria exchange from the same parent channel —
+        #      the conversation a human assistant in that room would remember,
+        #      which is how "that" / "the plan" resolve (forensic 2026-06-12:
+        #      pure isolation severed the room timeline, so every top-level
+        #      message reached the agent with zero context).
+        # What it still NEVER sees: other channels' turns and the ambient
+        # Cursor-watch firehose (the 2026-06-09 `live_visuals_4` bleed) —
+        # voice and global callers (no session_key) keep the whole buffer.
         if session_key:
-            candidates = [
-                t
-                for t in candidates
-                if t.role == "alert" or t.session_key == session_key
-            ]
+            def _keep(t: Turn) -> bool:
+                if t.role == "alert":
+                    return True
+                if t.session_key == session_key:
+                    return True
+                return bool(
+                    parent_channel
+                    and t.parent_channel == parent_channel
+                    and t.role in ("user", "aria")
+                )
+            candidates = [t for t in candidates if _keep(t)]
 
         # Cap cursor_event turns *first* so they don't claim slots that
         # the user's actual messages need. We keep the most recent

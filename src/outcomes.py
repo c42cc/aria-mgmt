@@ -92,8 +92,6 @@ _BLOCKED_PATTERNS: tuple[str, ...] = (
     "access denied",
     "operation not permitted",
     "command not found",
-    "no such file or directory",
-    "no such file",
     "no route to host",
     "could not resolve host",
     "name or service not known",
@@ -103,6 +101,36 @@ _BLOCKED_PATTERNS: tuple[str, ...] = (
     "invalid credentials",
     "login failed",
 )
+
+# A missing path is a WALL for an action that needed the path to exist (ssh -i,
+# cat of the task's target, a deploy script) — but for a *discovery* action it
+# is the search doing its job (the honeycomb forensic's `ls /wrong/guess` →
+# DIR_NOT_FOUND probe must not halt the loop and page the user).
+_PATH_MISS_PATTERNS: tuple[str, ...] = (
+    "no such file or directory",
+    "no such file",
+)
+
+# Action families whose whole purpose is locating things; a path miss from one
+# of these is PROGRESS (information), not a wall.
+DISCOVERY_FAMILIES: frozenset[str] = frozenset({
+    "exec:find",
+    "exec:fd",
+    "exec:grep",
+    "exec:rg",
+    "exec:ls",
+    "exec:mdfind",
+    "exec:locate",
+    "tool:search_files",
+    "tool:list_directory",
+    "tool:list_allowed_directories",
+    "tool:directory_tree",
+    "tool:read_multiple_files",
+})
+
+
+def is_discovery_family(family: str) -> bool:
+    return family in DISCOVERY_FAMILIES
 
 # Momentary — one retry is reasonable, then treat as a wall.
 _TRANSIENT_PATTERNS: tuple[str, ...] = (
@@ -264,6 +292,13 @@ def classify_outcome(tool_name: str, args: dict | None, result_str: str) -> Outc
     # 2. Failure-gated meaning scan (defeats the exitCode:0 masking).
     if _looks_like_failure(obj, low):
         if _match(low, _BLOCKED_PATTERNS) or _EXIT_255.search(low):
+            return Outcome(BLOCKED, _short_reason(s), _WALL_NEED, family)
+        if _match(low, _PATH_MISS_PATTERNS):
+            # An exploratory miss from a discovery action is information the
+            # model adapts to; the same miss from a non-discovery action means
+            # the task's target is absent — a wall.
+            if is_discovery_family(family):
+                return Outcome(PROGRESS)
             return Outcome(BLOCKED, _short_reason(s), _WALL_NEED, family)
         if _match(low, _TRANSIENT_PATTERNS):
             return Outcome(TRANSIENT, _short_reason(s), "", family)

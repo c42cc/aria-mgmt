@@ -20,7 +20,6 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -66,14 +65,13 @@ class TestNoCollision(unittest.IsolatedAsyncioTestCase):
 
         order: list[str] = []
 
-        async def fake_legacy(task, session_key=""):
+        async def fake_loop(task, session_key=""):
             order.append(f"start:{task}")
             await asyncio.sleep(0.05)
             order.append(f"end:{task}")
             return f"done:{task}"
 
-        with patch.object(tools, "config", SimpleNamespace(ucs_enabled=False)), \
-             patch.object(tools, "_do_with_claude_legacy", side_effect=fake_legacy):
+        with patch.object(tools, "_do_with_claude_loop", side_effect=fake_loop):
             r1, r2 = await asyncio.gather(
                 tools._do_with_claude("A", "thread-1"),
                 tools._do_with_claude("B", "thread-1"),
@@ -96,7 +94,7 @@ class TestNoCollision(unittest.IsolatedAsyncioTestCase):
         running = 0
         max_concurrent = 0
 
-        async def fake_legacy(task, session_key=""):
+        async def fake_loop(task, session_key=""):
             nonlocal running, max_concurrent
             running += 1
             max_concurrent = max(max_concurrent, running)
@@ -104,8 +102,7 @@ class TestNoCollision(unittest.IsolatedAsyncioTestCase):
             running -= 1
             return f"done:{task}"
 
-        with patch.object(tools, "config", SimpleNamespace(ucs_enabled=False)), \
-             patch.object(tools, "_do_with_claude_legacy", side_effect=fake_legacy):
+        with patch.object(tools, "_do_with_claude_loop", side_effect=fake_loop):
             await asyncio.gather(
                 tools._do_with_claude("A", "thread-A"),
                 tools._do_with_claude("B", "thread-B"),

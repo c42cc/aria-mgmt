@@ -11,7 +11,8 @@ classifier (`src/outcomes.classify_outcome`) wired into the single result seam:
 a permanent wall is BLOCKED on the FIRST occurrence (no threshold to defeat, no
 exit code to mask), a transient gets one bounded retry per family, and a
 recoverable failure stays PROGRESS so the model can work through it. These tests
-drive the REAL `_do_with_claude_legacy` loop with a scripted fake model + MCP.
+drive the REAL `_do_with_claude_loop` (the system's ONE agent loop) with a
+scripted fake model + MCP.
 
 Run with:
     .venv/bin/python -m unittest tests.test_stuck_loop_governor -v
@@ -132,7 +133,7 @@ _SHELL_OK = json.dumps({"stdout": "ok", "stderr": "", "exitCode": 0})
 
 @contextlib.contextmanager
 def _patched_loop(client, mcp, *, cost_per_call=0.001):
-    """Patch every external dependency of `_do_with_claude_legacy` so the loop
+    """Patch every external dependency of `_do_with_claude_loop` so the loop
     runs purely on the scripted fakes (no Anthropic, no MCP, no DB, no disk)."""
     from src import tools
     tools._session_states.clear()
@@ -146,8 +147,12 @@ def _patched_loop(client, mcp, *, cost_per_call=0.001):
         p(patch.object(tools, "_emit_progress", AsyncMock()))
         p(patch.object(tools, "log_event", lambda *a, **k: None))
         p(patch.object(tools, "log_loop_execution", lambda *a, **k: None))
-        p(patch.object(tools, "_estimate_cost", lambda i, o: cost_per_call))
+        # _usage_cost feeds all four token streams through _estimate_cost.
+        p(patch.object(tools, "_estimate_cost", lambda i, o, cw=0, cr=0: cost_per_call))
         p(patch.object(tools, "_ground_check", AsyncMock(return_value=[])))
+        # The findings ledger is durable state — keep tests off the real DB.
+        p(patch.object(tools, "get_findings", lambda *a, **k: None))
+        p(patch.object(tools, "save_findings", lambda *a, **k: None))
         yield tools
 
 
@@ -160,7 +165,7 @@ class TestWallStopsImmediately(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient([])  # default tail = unique failing ssh forever
         mcp = _FakeMcp(_SSH_FAIL)
         with _patched_loop(client, mcp) as t:
-            result = await t._do_with_claude_legacy("ssh into spark2", "K")
+            result = await t._do_with_claude_loop("ssh into spark2", "K")
 
         self.assertIn("Blocked", result)
         self.assertIn("hit a wall", result.lower())
@@ -174,7 +179,7 @@ class TestWallStopsImmediately(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient([])
         mcp = _FakeMcp(_SSH_MASKED)
         with _patched_loop(client, mcp) as t:
-            result = await t._do_with_claude_legacy("ssh into spark2", "K")
+            result = await t._do_with_claude_loop("ssh into spark2", "K")
 
         self.assertIn("Blocked", result)
         self.assertEqual(client.messages.calls, 1)
@@ -183,7 +188,7 @@ class TestWallStopsImmediately(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient([])
         mcp = _FakeMcp(_SSH_FAIL)
         with _patched_loop(client, mcp) as t:
-            result = await t._do_with_claude_legacy("ssh into spark2", "K")
+            result = await t._do_with_claude_loop("ssh into spark2", "K")
         self.assertIn("Permission denied", result)
         self.assertIn("What I need to proceed", result)
 
@@ -198,7 +203,7 @@ class TestTransientRetry(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient([])  # unique ssh each time, all time out (same family)
         mcp = _FakeMcp(_SSH_TIMEOUT)
         with _patched_loop(client, mcp) as t:
-            result = await t._do_with_claude_legacy("ssh into spark2", "K")
+            result = await t._do_with_claude_loop("ssh into spark2", "K")
 
         self.assertIn("Blocked", result)
         # One budgeted retry (call 1), then BLOCK on the second occurrence.
@@ -223,7 +228,7 @@ class TestNoFalsePositive(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient(script)
         mcp = _FakeMcp(_GIT_RECOVERABLE)  # the two pushes fail recoverably, model recovers
         with _patched_loop(client, mcp) as t:
-            result = await t._do_with_claude_legacy("deploy", "K")
+            result = await t._do_with_claude_loop("deploy", "K")
 
         self.assertIn("DONE: deployed cleanly", result)
         self.assertNotIn("Blocked", result)
@@ -232,24 +237,46 @@ class TestNoFalsePositive(unittest.IsolatedAsyncioTestCase):
 
 # --------------------------------------------------------------------------
 # 4. Cost backstop: a non-stuck but expensive loop stops at the per-task dollar
-#    ceiling before draining the daily cap — now expressed as a BLOCKED outcome.
+#    ceiling before draining the daily cap — and stops BEFORE the call that
+#    would cross the line (the honeycomb run charged $6.00 on a $5.00 cap
+#    because the old check ran after the spend).
 # --------------------------------------------------------------------------
 
 class TestCostBackstop(unittest.IsolatedAsyncioTestCase):
-    async def test_cost_ceiling_pauses_loop(self):
+    async def test_cost_ceiling_pauses_loop_before_overshoot(self):
         from src import tools
-        # Each successful step "costs" $2; the $5 ceiling trips on the 3rd.
+        # Each step "costs" $2 against the $5 ceiling. After 2 calls ($4),
+        # the projection 4+2 >= 5 stops the loop WITHOUT a third call.
         client = _FakeClient([], tail=lambda n: _Resp([_Block(
             "tool_use", name="search_emails",
             input={"q": f"page-{n}"}, id=f"t{n}")]))
         mcp = _FakeMcp(_SHELL_OK)
         with _patched_loop(client, mcp, cost_per_call=2.0) as t:
-            result = await t._do_with_claude_legacy("read everything", "K")
+            result = await t._do_with_claude_loop("read everything", "K")
 
         self.assertIn("budget", result.lower())
         self.assertIn("Blocked", result)
-        expected = int(tools._LOOP_COST_CAP_USD // 2.0) + 1
-        self.assertEqual(client.messages.calls, expected)
+        # cap=$5, $2/call -> 2 calls ($4 spent); the projection stops the 3rd.
+        per_call = 2.0
+        self.assertEqual(client.messages.calls, 2)
+        self.assertLessEqual(
+            client.messages.calls * per_call, tools._LOOP_COST_CAP_USD,
+            "spend must stay at or under the cap — never one call past it",
+        )
+
+    async def test_spend_stop_hands_over_findings(self):
+        """A stop on spend must never withhold what the spend bought: the
+        blocker carries the findings digest (the honeycomb run returned
+        nothing after $6.00 of discovery that had already found the answer)."""
+        client = _FakeClient([], tail=lambda n: _Resp([_Block(
+            "tool_use", name="search_emails",
+            input={"q": f"page-{n}"}, id=f"t{n}")]))
+        mcp = _FakeMcp(_SHELL_OK)
+        with _patched_loop(client, mcp, cost_per_call=2.0) as t:
+            result = await t._do_with_claude_loop("read everything", "K")
+
+        self.assertIn("What I established before stopping", result)
+        self.assertIn("search_emails", result)
 
 
 # --------------------------------------------------------------------------

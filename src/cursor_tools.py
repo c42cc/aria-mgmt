@@ -502,6 +502,20 @@ async def _cursor_spawn(
         log.exception("cursor_spawn create_session failed")
         return json.dumps({"error": f"create_session failed: {e}"})
     agent = cursor_registry.agent_for_session(sid)
+
+    # Ground write: the spawned workspace is now what "the project" refers to.
+    try:
+        from .db import set_ground
+        set_ground(
+            "active_project",
+            label=os.path.basename(workspace_root) or workspace_root,
+            path=workspace_root,
+            detail=f"cursor sdk agent {sid[:8]}",
+            source="cursor_spawn",
+        )
+    except Exception:
+        log.warning("ground write (active_project) failed", exc_info=True)
+
     return json.dumps(
         {
             "ok": True,

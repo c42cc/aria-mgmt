@@ -98,8 +98,11 @@ reconnects. Behavior is data, not code.
 There is no general-purpose data layer. State lives in three concrete places:
 
 - **SQLite** (`data/state.db`) for structured rows: cursor session lifecycle,
-  tool events with cost, planning history per session, thread bindings, and
-  capability-owned tables (e.g., SpicyLit outlines).
+  tool events with cost, planning history per session, thread bindings,
+  the **ground** working set (durable referent → artifact bindings: what
+  "the plan" / "the project" currently mean), the per-thread **findings
+  ledger** (what an agent loop established, so a follow-up resumes instead
+  of rediscovering), and capability-owned tables (e.g., SpicyLit outlines).
 - **mem0 vector store** (`data/mem0/`) for durable user-stated facts.
 - **An append-only audit log** (`data/audit.jsonl`) recording every MCP tool
   call with arguments redacted by type, the tier, and the confirmation
@@ -188,19 +191,30 @@ Three concrete patterns sit behind the tool dispatch:
 
 - **Single-shot Claude** for planning: send a prompt template plus context,
   receive markdown, post to the text channel, log cost. Planning history is
-  retained per session so iterative refinement works.
-- **Iterative Claude with MCP tools** for general tasks: an agent loop bounded
-  by iteration count and token budget, where Claude calls MCP tools and
-  observes their results until done.
+  retained per session so iterative refinement works. A finished plan binds
+  `active_plan` in the ground table, so later requests can say "the plan".
+- **Iterative Claude with MCP tools** for general tasks: ONE agent loop
+  (`tools._do_with_claude_loop`) bounded by iteration count, output tokens,
+  and a per-task dollar cap that stops *before* overshoot. The loop starts
+  grounded — its first message carries the projects map
+  (`projects/registry.md`), the ground working set, and this thread's
+  findings ledger — and stays cheap: the static prefix and conversation
+  carry prompt-cache breakpoints, and old tool results are compacted. On
+  every exit it persists what it established to the findings ledger, so a
+  budget pause hands over its discoveries and "keep going" resumes instead
+  of re-buying them. A loop whose spend is going purely to discovery stops
+  early and asks the one question instead of grinding.
 - **Cursor agent** for builds: hand the approved plan and an implementation
   persona to the Cursor SDK in a project working directory; stream the
-  resulting events back into Discord and into Gemini's context.
+  resulting events back into Discord and into Gemini's context. Spawning
+  binds `active_project` in ground.
 
-When `UCS_ENABLED=true`, the first two patterns are served by the UCS
-Intelligence Loop (`src/ucs.py`) instead of direct Anthropic calls. The
-loop supports model hot-swapping per step, context budget management, and
-a configurable iteration cap. The Cursor agent path is unchanged. Both
-paths write to the `loop_executions` table for observability.
+When `UCS_ENABLED=true`, planning routes through the UCS Intelligence Loop
+(`src/ucs.py`: model registry + router from models.yaml). There is
+deliberately no second agent loop behind the flag — a dormant duplicate of
+the most failure-prone primitive drifted (no dollar cap, no local tools)
+and was removed. All paths write to the `loop_executions` table for
+observability.
 
 ### State
 
@@ -374,7 +388,10 @@ points; cross-references inside the code are reliable.
 | Conversational session (default) | `src/gemini_session.py` |
 | Conversational session (SpicyLit) | `capabilities/spicy_lit/grok_voice.py` |
 | Tool dispatch & tool implementations | `src/tools.py` |
-| UCS intelligence loop + model router | `src/ucs.py` (active when `UCS_ENABLED=true`) |
+| The agent loop (the only one) | `src/tools.py::_do_with_claude_loop` |
+| Ground working set + findings ledger | `src/db.py` (`ground`, `loop_findings`) |
+| Outcome policy (progress/transient/blocked + discovery families) | `src/outcomes.py` |
+| UCS planning router (model registry) | `src/ucs.py` (active when `UCS_ENABLED=true`) |
 | UCS evaluation layer (offline CLI) | `src/eval.py` |
 | Product correctness harness | `src/judge.py` + `specs/correctness/` |
 | MCP client and dispatch | `src/mcp.py` |
@@ -396,7 +413,7 @@ points; cross-references inside the code are reliable.
 | Claude planning personas | `prompts/{planning,architecture,refactor,bug-analysis}.md` |
 | Claude implementation persona | `prompts/implementation.md` |
 | Claude general-agent persona | `prompts/do_with_claude_system.md` |
-| Build target paths | `projects/registry.md` |
+| Project name → path map (rendered into every agent loop's context) | `projects/registry.md` |
 | Saved workflows | `workflows/` |
 | Model registry + loop profiles | `models.yaml` |
 
