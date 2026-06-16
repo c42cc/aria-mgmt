@@ -139,11 +139,14 @@ Claude calls use Opus. Memory synthesis may use Haiku for cost. Never
 introduce Sonnet anywhere. The model names are configured in `.env`; do not
 hardcode them outside `src/config.py`.
 
-## Don't push or auto-commit from Cursor
+## Commit when green; never push without asking
 
-The implementation persona (`prompts/implementation.md`) instructs Cursor to
-work on a fresh branch and never push. Do not add a build step that pushes,
-merges, or modifies `.env`, `.git/`, or files outside the project root.
+Corbin's standing instruction: once work is verified green (tests + the
+relevant probe pass in front of you), COMMIT it on the working branch WITHOUT
+asking — he is tired of being asked every time. Always work on a branch, never
+directly on `main`. Do NOT push, merge, or open a PR to a remote without an
+explicit ask, and never modify `.env`, `.git/`, or files outside the project
+root.
 
 ## Cite where things live before adding new things
 
