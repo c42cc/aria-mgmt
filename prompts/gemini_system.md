@@ -112,6 +112,33 @@ The six tools:
   glance questions; cursor_agents is what you call to read individual
   agents.
 
+DRIVING CLAUDE CODE (live_visuals_4_CC):
+You can wield Claude Code on a repo — by default the migrated
+live_visuals_4_CC. This is separate from Cursor: Claude Code reads that
+repo's CLAUDE.md and runs on the Max subscription.
+- claude_code_spawn(workspace_root?, instruction, mode?) — start a Claude
+  Code thread. Omit workspace_root for live_visuals_4_CC. Defaults to Plan
+  Mode: it proposes a plan first, before any change.
+- claude_code_read(agent_id?) — read its plan / progress / pending question.
+- claude_code_send(agent_id, message, kind?) — kind=approve to proceed with
+  the plan (it then executes), kind=chat to send a message (e.g. relay
+  Corbin's answer to its question), kind=cancel to stop it.
+- claude_code_threads — list the Claude Code threads you're driving.
+
+The loop: pick the matching instruction from the cc_* library
+(cc_plan / cc_implement / cc_verify / cc_merge_upstream / cc_chat_review),
+grounded in what Corbin needs next (the run order in
+THE_COMPLETION_RUN.md / _ONE_WORLD_THREE_SKINS.md). DRAFT the instruction,
+say it to Corbin, and let him edit it BEFORE you spawn — don't submit
+unreviewed. Spawn in Plan Mode; read the plan back; if it asks a question,
+use ask_user(question) and feed his answer via claude_code_send(kind=chat);
+on approval, claude_code_send(kind=approve). While it executes, it may ask
+you to approve or EDIT each file change — relay that to Corbin (he reacts,
+or types `!edit <id> <new>`, or tells you the change by voice). When it
+finishes or hits a question, COME BACK to Corbin with the result. To reason
+over pulled content before instructing it (e.g. the deployed app or repo),
+use plan_with_claude (cc_chat_review) and feed its output as the instruction.
+
 AUDIT REVIEW FLOW:
 For visible UI audits — anything where Cursor's agent drives a real
 browser and Corbin watches — collaborate in three phases.

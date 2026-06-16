@@ -403,6 +403,90 @@ TOOL_DECLARATIONS = [
             required=["workspace_root", "instruction"],
         ),
     ),
+    # ---- Claude Code (Aria drives Claude Code on a repo) --------------------
+    types.FunctionDeclaration(
+        name="claude_code_spawn",
+        description=(
+            "Start a NEW Claude Code thread on a repo and hand it an instruction. "
+            "This is how you wield Claude Code (the migrated live_visuals_4_CC by "
+            "default). Defaults to Plan Mode, so it proposes a plan to review/edit "
+            "before any change. Returns session_id; then claude_code_read to see the "
+            "plan and claude_code_send (kind=approve) to execute. Before spawning, "
+            "say what you'll tell it and let Corbin adjust the instruction."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "workspace_root": types.Schema(type="STRING", description="Project name or absolute path; omit for the managed live_visuals_4_CC repo."),
+                "instruction": types.Schema(type="STRING", description="The task for the Claude Code thread."),
+                "mode": types.Schema(type="STRING", description="plan (default) | acceptEdits | default."),
+            },
+            required=["instruction"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="claude_code_send",
+        description=(
+            "Send a follow-up to a live Claude Code thread, or approve / reject / "
+            "cancel it. kind=approve proceeds with the reviewed plan; kind=chat sends "
+            "a message (e.g. relaying Corbin's answer to its question); kind=cancel "
+            "stops it. Get the agent_id from claude_code_threads / cursor_agents."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(type="STRING", description="Thread handle from claude_code_threads/cursor_agents."),
+                "message": types.Schema(type="STRING", description="Message for kind=chat, or note for approve/reject."),
+                "kind": types.Schema(type="STRING", description="chat | approve | reject | cancel. Default chat."),
+            },
+            required=["agent_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="claude_code_read",
+        description=(
+            "Read a Claude Code thread's latest turns + status — its proposed plan, "
+            "progress, or pending question. Omit agent_id for the managed repo's thread."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(type="STRING", description="Thread handle; omit for the managed repo."),
+                "n_turns": types.Schema(type="INTEGER", description="Recent turns (default 5, max 25)."),
+            },
+            required=[],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="claude_code_threads",
+        description=(
+            "List the Claude Code threads Aria is driving, with status and any "
+            "pending questions. Use to find a handle before claude_code_read / send."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Optional project filter."),
+            },
+            required=[],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="ask_user",
+        description=(
+            "Ask Corbin an OPEN question and wait for his reply, returning the answer. "
+            "Use when you need an open answer a yes/no can't carry — especially to "
+            "relay a Claude Code thread's pending question and feed his answer back "
+            "via claude_code_send. For a simple approve/skip, use propose_action."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "question": types.Schema(type="STRING", description="The question to put to Corbin."),
+            },
+            required=["question"],
+        ),
+    ),
     types.FunctionDeclaration(
         name="cursor_screenshot",
         description=(
@@ -810,6 +894,19 @@ class GeminiSession:
                             self._idle_event.clear()
                             for part in sc.model_turn.parts:
                                 if part.inline_data and part.inline_data.data:
+                                    # AUDIO TELEMETRY (stage A): prove Gemini is
+                                    # actually emitting voice bytes. Silence here
+                                    # means the model produced no audio (preview
+                                    # 503/429/modality), not a transport break.
+                                    _n = len(part.inline_data.data)
+                                    self._audio_out_chunks = getattr(self, "_audio_out_chunks", 0) + 1
+                                    self._audio_out_bytes = getattr(self, "_audio_out_bytes", 0) + _n
+                                    if self._audio_out_chunks == 1 or self._audio_out_chunks % 100 == 0:
+                                        log.info(
+                                            "AUDIO[A gemini-out]: chunk #%d (%d bytes; %d total, ~%.1fs @24k)",
+                                            self._audio_out_chunks, _n, self._audio_out_bytes,
+                                            self._audio_out_bytes / 48000.0,
+                                        )
                                     try:
                                         self._audio_out_queue.put_nowait(part.inline_data.data)
                                     except asyncio.QueueFull:

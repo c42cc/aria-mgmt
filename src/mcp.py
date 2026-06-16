@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import config
+from .capability import capability_for, contracted_env
 
 log = logging.getLogger(__name__)
 
@@ -193,17 +194,91 @@ _SCHEMA_REGEX = re.compile(
 )
 
 
-def _classify_error_text(text: str) -> str | None:
-    """Return an ERR_* class for known error substrings, or None if text isn't a recognised error."""
+# macOS app-scripting hangs are a PERMISSION wall, not a transient blip.
+# When the Apple MCP drives Messages/Contacts/Notes/Calendar via AppleScript and
+# the TCC Automation grant for the controlling process is missing, the AppleEvent
+# never gets a response and the call HANGS, then times out with one of these
+# strings (or returns a -1743 "not allowed to send Apple events"). Classifying
+# that as ERR_TRANSIENT is exactly what made Aria thrash through ~10 doomed send
+# workarounds instead of saying "grant Messages Automation" once and stopping.
+_APPLE_AUTOMATION_HANG_PATTERNS: tuple[str, ...] = (
+    "did not respond in time",
+    "messages did not respond",
+    "contacts did not respond",
+    "notes did not respond",
+    "system events did not respond",
+    "apple event timed out",
+    "appleevent timed out",
+    "isn't running",
+    "isn\u2019t running",
+    "is not running",
+    "not allowed to send apple events",
+    "not authorized to send apple events",
+    "erraeeventnotpermitted",
+    "-1743",
+)
+_APPLE_APP_BY_KEYWORD: tuple[tuple[str, str], ...] = (
+    ("imessage", "Messages"), ("message", "Messages"), ("contact", "Contacts"),
+    ("note", "Notes"), ("reminder", "Reminders"), ("calendar", "Calendar"),
+    ("event", "Calendar"),
+)
+
+
+def _is_apple_app_scripting_tool(server_name: str, tool_name: str) -> bool:
+    """True for the Apple MCP (Messages/Contacts/Notes/Calendar via AppleScript).
+
+    Scoped to the `apple` server so a Gmail/Google timeout that happens to say
+    'did not respond in time' is NOT misread as a macOS Automation wall.
+    """
+    if (server_name or "").lower() == "apple":
+        return True
+    blob = f"{server_name} {tool_name}".lower()
+    return any(k in blob for k in ("imessage", "messages_", "contacts", "notes_", "reminder"))
+
+
+def _apple_app_name(server_name: str, tool_name: str) -> str:
+    blob = f"{server_name} {tool_name}".lower()
+    for kw, app in _APPLE_APP_BY_KEYWORD:
+        if kw in blob:
+            return app
+    return "the Apple app"
+
+
+def _classify_error_text(text: str, tool_name: str = "", server_name: str = "") -> str | None:
+    """Return an ERR_* class for known error substrings, or None if unrecognised.
+
+    Tool-aware: an Apple app-scripting hang/timeout is reclassified PERMISSION
+    (it is a missing TCC Automation grant), pre-empting the transient bucket.
+    """
     if not text:
         return None
     lower = text.lower()[:4000]
+    if _is_apple_app_scripting_tool(server_name, tool_name) and any(
+        p in lower for p in _APPLE_AUTOMATION_HANG_PATTERNS
+    ):
+        return ERR_PERMISSION
     for cls, patterns in _ERROR_PATTERNS:
         if any(p in lower for p in patterns):
             return cls
     if _SCHEMA_REGEX.search(text[:4000]):
         return ERR_SCHEMA
     return None
+
+
+def _permission_message(tool_name: str, server_name: str, err_class: str) -> str:
+    """The exact, actionable message for a recognized error — with the macOS
+    Automation grant-fix when it's an Apple app-scripting permission wall."""
+    if err_class == ERR_PERMISSION and _is_apple_app_scripting_tool(server_name, tool_name):
+        app = _apple_app_name(server_name, tool_name)
+        return (
+            f"macOS is blocking automation of {app}: the AppleScript call hung and "
+            f"timed out because the bot's python lacks the Automation grant. "
+            f"ONE-COMMAND FIX (owner, at the Mac): run "
+            f"`.venv/bin/python scripts/provision_imessage.py` — it flips the stuck "
+            f"grant and verifies green. (Or System Settings > Privacy & Security > "
+            f"Automation > enable {app}.) Do NOT retry or improvise another send path."
+        )
+    return f"Tool '{tool_name}' returned a {err_class} error."
 
 
 def _typed_error(cls: str, message: str, raw: str) -> str:
@@ -435,7 +510,10 @@ class MCPClient:
 
         async def _start_one(name: str, cfg: dict) -> None:
             cmd = cfg["command"]
-            env = {**os.environ, **cfg.get("env", {})}
+            # One contracted environment: PATH always carries /usr/sbin
+            # (screencapture) and Homebrew bins, so an OS action never fails
+            # with "command not found" because of how the bot was launched.
+            env = contracted_env(extra=cfg.get("env", {}))
             params = StdioServerParameters(command=cmd[0], args=cmd[1:], env=env)
 
             log.info("MCP: starting '%s' (%s)...", name, " ".join(cmd[:2]))
@@ -526,6 +604,22 @@ class MCPClient:
         if not session:
             return json.dumps({"error": f"MCP server '{server_name}' not available"})
 
+        # Capability precheck — confirm we CAN do this before we try. An unmet
+        # precondition (e.g. the Messages Automation grant) returns the exact
+        # one-command fix and the action NEVER fires: no hang, no brute-force
+        # thrash, no blaming the user for a wall we could see coming. This is
+        # the mechanical enforcement that replaces the prompt's "don't
+        # improvise another send path" prose.
+        unmet = capability_for(server_name, tool_name, args).unmet()
+        if unmet:
+            typed = _typed_error(ERR_PERMISSION, unmet, "capability precondition unmet")
+            _audit_log(
+                server_name, tool_name, args, typed[:1_000_000],
+                _classify_tier(server_name, tool_name), None, session_key,
+            )
+            log.info("capability precheck blocked %s.%s", server_name, tool_name)
+            return typed
+
         # A2 — per-server rate limit. Aria sees the same typed RateLimitError
         # she would see from an upstream 429, but earlier and without
         # consuming the provider's quota.
@@ -609,16 +703,16 @@ class MCPClient:
             # "Cannot access Mail database…", Gmail's "Quota exceeded…").
             # If the text matches a known error class, wrap it so Aria's
             # prompt rules apply.
-            err_class = _classify_error_text(result_text)
+            err_class = _classify_error_text(result_text, tool_name=tool_name, server_name=server_name)
             if err_class is not None:
-                return _typed_error(err_class, f"Tool '{tool_name}' returned a {err_class} error.", result_text)
+                return _typed_error(err_class, _permission_message(tool_name, server_name, err_class), result_text)
 
             return result_text[:50_000]
         except Exception as e:
             error_msg = f"MCP tool error: {e}"
             _audit_log(server_name, tool_name, args, error_msg, tier, confirmed, session_key)
-            err_class = _classify_error_text(str(e)) or ERR_UNKNOWN
-            return _typed_error(err_class, f"Tool '{tool_name}' raised an exception.", error_msg)
+            err_class = _classify_error_text(str(e), tool_name=tool_name, server_name=server_name) or ERR_UNKNOWN
+            return _typed_error(err_class, _permission_message(tool_name, server_name, err_class), error_msg)
 
     async def health_check(self) -> str:
         """Return per-server health status."""

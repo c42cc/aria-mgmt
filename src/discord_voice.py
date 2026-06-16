@@ -51,8 +51,12 @@ class VoiceBridge:
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
         self._on_audio: AudioCallback | None = None
+        self._on_error: Callable[[str], Awaitable[None]] | None = None
+        self._on_voice_lost: Callable[[], Awaitable[None]] | None = None
         self._ready = asyncio.Event()
         self._joined = asyncio.Event()
+        self._presence_event = asyncio.Event()
+        self._presence_channel_id: str | None = None
 
     @property
     def alive(self) -> bool:
@@ -97,6 +101,39 @@ class VoiceBridge:
         """Frames from Discord arrive here as 16 kHz mono PCM bytes."""
         self._on_audio = fn
 
+    def register_error_callback(self, fn: Callable[[str], Awaitable[None]]) -> None:
+        """Sidecar `error` events (deaf, decode failures, connect failures) are
+        forwarded here so the app can surface them loudly instead of only logging."""
+        self._on_error = fn
+
+    def register_voice_lost_callback(self, fn: Callable[[], Awaitable[None]]) -> None:
+        """Invoked when the sidecar reports its voice connection died
+        unrecoverably, so the controller can reset state rather than keep
+        streaming audio into a dead pipeline."""
+        self._on_voice_lost = fn
+
+    async def query_presence(self, timeout: float = 5.0) -> str | None:
+        """Ask the sidecar which voice channel the authorized user is in.
+
+        Authoritative cross-check for the parent's cached voice state, which a
+        bare Discord gateway RESUME can leave stale — exactly when the reconcile
+        loop must act. The sidecar is a second, independent gateway connection,
+        so its voice-state view is unlikely to be stale at the same instant.
+        Returns the channel id, or None if the user is in no voice channel or
+        the query times out. At most one query is in flight at a time.
+        """
+        if not self.alive:
+            return None
+        self._presence_channel_id = None
+        self._presence_event.clear()
+        await self._send({"action": "query_presence"})
+        try:
+            await asyncio.wait_for(self._presence_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning("sidecar presence query timed out after %.0fs", timeout)
+            return None
+        return self._presence_channel_id
+
     async def join(self, channel_id: str, timeout: float = 70.0) -> None:
         """Send join action; wait for sidecar to confirm or time out.
 
@@ -113,10 +150,41 @@ class VoiceBridge:
     async def leave(self) -> None:
         await self._send({"action": "leave"})
 
+    def set_send_tap(self, fn: Callable[[bytes], None] | None) -> None:
+        """Install a tap that receives every outbound 24k PCM chunk (stage B
+        capture for the voice audibility test). Loud-fail discipline: the tap
+        is best-effort and never blocks the send."""
+        self._send_tap = fn
+
     async def send_audio(self, pcm: bytes) -> None:
         """Send 24 kHz mono PCM to Discord (Node upsamples to 48 kHz stereo)."""
-        if not self.alive or not pcm:
+        if not pcm:
             return
+        if not self.alive:
+            # LOUD-FAIL: outbound audio dropped because the sidecar is dead.
+            # This used to be a silent return — the exact blindness that hid
+            # "voice doesn't work" for months.
+            self._dead_sends = getattr(self, "_dead_sends", 0) + 1
+            if self._dead_sends == 1 or self._dead_sends % 50 == 0:
+                log.warning(
+                    "AUDIO[B send]: DROPPING %d-byte chunk — voice sidecar not alive "
+                    "(dropped=%d)", len(pcm), self._dead_sends,
+                )
+            return
+        # AUDIO TELEMETRY (stage B): the exact bytes leaving Python for Discord.
+        self._sent_chunks = getattr(self, "_sent_chunks", 0) + 1
+        self._sent_bytes = getattr(self, "_sent_bytes", 0) + len(pcm)
+        if self._sent_chunks == 1 or self._sent_chunks % 100 == 0:
+            log.info(
+                "AUDIO[B send]: chunk #%d (%d bytes; %d total, ~%.1fs @24k) -> sidecar",
+                self._sent_chunks, len(pcm), self._sent_bytes, self._sent_bytes / 48000.0,
+            )
+        tap = getattr(self, "_send_tap", None)
+        if tap is not None:
+            try:
+                tap(pcm)
+            except Exception:
+                log.debug("voice send tap raised (non-fatal)", exc_info=True)
         await self._send({"action": "play", "pcm_b64": base64.b64encode(pcm).decode()})
 
     async def close(self) -> None:
@@ -184,9 +252,35 @@ class VoiceBridge:
             except Exception:
                 log.exception("voice audio callback raised")
         elif name == "error":
-            log.error("voice bridge error: %s", evt.get("message"))
+            msg = evt.get("message") or ""
+            log.error("voice bridge error: %s", msg)
+            if self._on_error is not None:
+                asyncio.create_task(self._safe_on_error(msg))
+        elif name == "voice_lost":
+            log.error("voice bridge voice_lost: %s", evt.get("message"))
+            if self._on_voice_lost is not None:
+                asyncio.create_task(self._safe_voice_lost())
+        elif name == "presence":
+            self._presence_channel_id = evt.get("channel_id")
+            self._presence_event.set()
         else:
             log.warning("voice bridge unknown event: %s", evt)
+
+    async def _safe_on_error(self, message: str) -> None:
+        if self._on_error is None:
+            return
+        try:
+            await self._on_error(message)
+        except Exception:
+            log.exception("voice bridge error callback raised")
+
+    async def _safe_voice_lost(self) -> None:
+        if self._on_voice_lost is None:
+            return
+        try:
+            await self._on_voice_lost()
+        except Exception:
+            log.exception("voice bridge voice_lost callback raised")
 
     async def _drain_stderr(self) -> None:
         assert self._proc and self._proc.stderr
@@ -366,6 +460,30 @@ class VoiceController:
         async with self._lock:
             self._cancel_watchdog()
             self._last_activity_at = 0.0
+
+    def note_connection_lost(self) -> None:
+        """Sidecar reported its Discord voice connection died unrecoverably
+        (gateway repoint / failed recovery). Reset to DISCONNECTED so the next
+        utterance or the presence reconciler performs a fresh join instead of
+        routing audio into a dead pipeline.
+
+        Lock-free and synchronous: a few attribute writes on the event-loop
+        thread. If a transition is in flight it owns the state and will resolve
+        it, so we defer to it rather than racing.
+        """
+        if self._lock.locked():
+            log.warning(
+                "Voice connection lost mid-transition — deferring state reset to "
+                "the in-flight transition"
+            )
+            return
+        if self._state is VoiceState.DISCONNECTED:
+            return
+        log.warning("Voice connection lost — resetting controller state to DISCONNECTED")
+        self._cancel_watchdog()
+        self._state = VoiceState.DISCONNECTED
+        self._channel_id = None
+        self._last_activity_at = 0.0
 
     @asynccontextmanager
     async def pipeline_switch(self):

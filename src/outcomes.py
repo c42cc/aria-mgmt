@@ -19,8 +19,8 @@ three outcomes:
                          found / no such file / unreachable) or a user decline;
                          stop now and surface the one thing needed to proceed.
 
-Pure and dependency-free (stdlib only) so the live legacy loop in
-`src/tools.py` and the dormant UCS loop in `src/ucs.py` call the same policy.
+Pure and dependency-free (stdlib only): the agent loop in `src/tools.py` is
+the single caller of this policy.
 """
 
 from __future__ import annotations
@@ -45,6 +45,30 @@ _PERMISSION_NEED = "the missing OS/OAuth permission named above — grant it, th
 _WALL_NEED = (
     "the missing access / credential / permission for that step — or a "
     "different approach"
+)
+_AUTOMATION_NEED = (
+    "Automation permission for Messages/Contacts at the Mac — System Settings > "
+    "Privacy & Security > Automation > enable them for the process running Aria, "
+    "then resend (one-time grant; I can't do it from here, and improvising another "
+    "send path won't help)"
+)
+
+# A macOS app-scripting send (osascript/AppleScript to Messages/Contacts/Notes)
+# that HANGS is an Automation permission wall, not a transient blip — even when
+# it arrives via the raw shell tool (no typed MCP envelope). Two parts: the hang
+# strings, and markers proving the command really was an app-scripting send, so a
+# generic shell timeout is never misread as a permission wall.
+_APPLE_AUTOMATION_HANG: tuple[str, ...] = (
+    "did not respond in time",
+    "apple event timed out",
+    "appleevent timed out",
+    "not allowed to send apple events",
+    "not authorized to send apple events",
+    "-1743",
+)
+_APPLE_AUTOMATION_MARKERS: tuple[str, ...] = (
+    "osascript", "applescript", "tell application", "imessage:", "mobilesms",
+    "addressbook", "jxa", "send_message", "messages_chat",
 )
 
 
@@ -255,6 +279,23 @@ def _match(low: str, patterns: tuple[str, ...]) -> bool:
     return any(p in low for p in patterns)
 
 
+def _is_apple_automation_context(tool_name: str, args: dict | None, low: str) -> bool:
+    """True when the tool call was a macOS app-scripting send (so a hang means a
+    missing Automation grant, not a network blip). Scans the command/args, the
+    tool name, AND the result text for app-scripting markers."""
+    blob = (tool_name or "").lower()
+    if args:
+        try:
+            blob += " " + json.dumps(args, default=str).lower()
+        except Exception:
+            blob += " " + str(args).lower()
+    if any(m in blob for m in _APPLE_AUTOMATION_MARKERS):
+        return True
+    if any(k in (tool_name or "").lower() for k in ("imessage", "messages", "contacts")):
+        return True
+    return any(m in low for m in _APPLE_AUTOMATION_MARKERS)
+
+
 def classify_outcome(tool_name: str, args: dict | None, result_str: str) -> Outcome:
     """Classify one tool result into PROGRESS / TRANSIENT / BLOCKED by meaning.
 
@@ -288,6 +329,18 @@ def classify_outcome(tool_name: str, args: dict | None, result_str: str) -> Outc
             return Outcome(TRANSIENT, message or cls, "", family)
         # schema / unknown: the model can re-read the schema or surface it.
         return Outcome(PROGRESS)
+
+    # 1b. A macOS app-scripting send that hung is an Automation PERMISSION wall,
+    #     not a transient — even via the raw shell (no typed envelope). This is
+    #     the root cause of the send-workaround thrash: stop it here so one fix is
+    #     reported instead of ten doomed osascript/imessage:// retries.
+    if _is_apple_automation_context(tool_name, args, low) and _match(low, _APPLE_AUTOMATION_HANG):
+        return Outcome(
+            BLOCKED,
+            _short_reason(s) or "macOS blocked the Messages/Contacts automation (no Automation permission)",
+            _AUTOMATION_NEED,
+            family,
+        )
 
     # 2. Failure-gated meaning scan (defeats the exitCode:0 masking).
     if _looks_like_failure(obj, low):

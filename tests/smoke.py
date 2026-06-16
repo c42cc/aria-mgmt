@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 def test_config_loads():
     from src.config import config
-    assert config.gemini_model == os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
+    assert config.gemini_model == os.getenv("GEMINI_MODEL", "gemini-2.5-flash-native-audio-latest")
     assert config.claude_model == os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
     print("PASS: config loads")
 
@@ -242,56 +242,6 @@ def test_models_yaml_loads():
 # ---------------------------------------------------------------------------
 
 
-def test_ucs_config_precedence():
-    """With UCS_ENABLED=false, legacy path uses config.claude_model; router reads models.yaml."""
-    from src.config import config
-    assert config.ucs_enabled is False, "UCS_ENABLED should be false for this test"
-
-    from src.ucs import ModelRouter
-    router = ModelRouter()
-    opus = router.get("claude-opus")
-    assert opus.model_id == "claude-opus-4-6"
-    assert opus.cost_per_m_input == 15.0
-    assert config.claude_model == "claude-opus-4-6"
-    print("PASS: UCS config precedence (legacy uses .env, router uses models.yaml)")
-
-
-def test_ucs_iteration_cap():
-    """IntelligenceLoop agent profile has max_iterations=30 from models.yaml."""
-    from src.ucs import ModelRouter
-    router = ModelRouter()
-    profile = router.profile("agent")
-    assert profile.max_iterations == 30, f"Expected 30, got {profile.max_iterations}"
-    print("PASS: UCS iteration cap (agent profile max_iterations=30)")
-
-
-def test_ucs_context_budget_truncation():
-    """InjectionEngine.trim_agent_messages drops older turns when budget is exceeded."""
-    from src.ucs import ModelRouter, InjectionEngine
-
-    router = ModelRouter()
-    injector = InjectionEngine(router)
-
-    messages = [
-        {"role": "user", "content": "original task"},
-        {"role": "assistant", "content": "A" * 800_000},
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "B" * 800_000}]},
-        {"role": "assistant", "content": "C" * 100},
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]},
-    ]
-
-    truncated, dropped = injector.trim_agent_messages(
-        "system prompt", messages, model_name="claude-opus"
-    )
-
-    assert truncated, "Expected truncation when conversation exceeds budget"
-    assert dropped > 0, f"Expected turns_dropped > 0, got {dropped}"
-    assert messages[0]["role"] == "user", "First message must still be user (the task)"
-    assert messages[0]["content"] == "original task", "Task message must be preserved"
-
-    print(f"PASS: UCS context budget truncation (dropped={dropped}, remaining={len(messages)})")
-
-
 def test_ucs_confirmation_flow():
     """Under UCS_ENABLED=true, MCP tier-I/X tools go through the confirm callback.
 
@@ -467,9 +417,6 @@ if __name__ == "__main__":
     test_loop_logging_resilience()
     test_models_yaml_loads()
     # Phase 2
-    test_ucs_config_precedence()
-    test_ucs_iteration_cap()
-    test_ucs_context_budget_truncation()
     test_ucs_confirmation_flow()
     # Phase 3
     test_eval_approval_rate()

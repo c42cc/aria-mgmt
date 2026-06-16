@@ -23,6 +23,21 @@ CREATE TABLE IF NOT EXISTS cursor_sessions (
     last_event_summary TEXT
 );
 
+-- Claude Code (Agent SDK) sessions Aria drives. Mirrors cursor_sessions, plus
+-- `workspace_root` (so a session can be resumed in its own cwd after a restart
+-- via ClaudeAgentOptions.resume) and `cost_usd` (Claude Code reports
+-- total_cost_usd per turn; this is the durable per-session running total).
+CREATE TABLE IF NOT EXISTS claude_sessions (
+    session_id     TEXT PRIMARY KEY,
+    project        TEXT NOT NULL,
+    workspace_root TEXT,
+    status         TEXT NOT NULL DEFAULT 'running',
+    started_at     TEXT NOT NULL,
+    last_event_at  TEXT,
+    last_event_summary TEXT,
+    cost_usd       REAL NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp    TEXT NOT NULL,
@@ -142,6 +157,25 @@ CREATE TABLE IF NOT EXISTS loop_findings (
     status      TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+-- Conversation log of record (Primitive 3). One append-only row per turn —
+-- user, Aria, alert, cursor event — across every transport. This is the
+-- durable source of truth the in-memory ConversationBuffer caches; it exists
+-- because that buffer was memory-only and wiped on restart (forensic
+-- 2026-06-16: a 72h history had to be reconstructed from session_records
+-- because nothing recorded what was actually said).
+CREATE TABLE IF NOT EXISTS conversation_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    role           TEXT NOT NULL,
+    medium         TEXT NOT NULL,
+    channel        TEXT,
+    session_key    TEXT,
+    parent_channel TEXT,
+    text           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_log_session
+    ON conversation_log(session_key, id);
 """
 
 
@@ -230,6 +264,60 @@ def append_planning_history(session_key: str, role: str, content: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversation log of record (Primitive 3). The durable truth of what was said
+# that the in-memory ConversationBuffer caches. Writes are telemetry-class:
+# best-effort so a logging failure never breaks a live conversation, but the
+# failure is logged loudly (log.warning, exc_info) — never swallowed silently.
+# ---------------------------------------------------------------------------
+
+def append_conversation_turn(
+    role: str,
+    medium: str,
+    channel: str,
+    text: str,
+    session_key: str = "",
+    parent_channel: str = "",
+) -> None:
+    """Append one turn to the durable conversation log. No-op for empty text."""
+    if not (text or "").strip():
+        return
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO conversation_log "
+                "(ts, role, medium, channel, session_key, parent_channel, text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_now(), role, medium, channel, session_key, parent_channel, text),
+            )
+    except Exception:
+        log.warning("conversation_log append failed (non-fatal)", exc_info=True)
+
+
+def recent_conversation_turns(
+    limit: int = 60, session_key: str | None = None
+) -> list[dict[str, Any]]:
+    """The most recent turns (oldest-first), optionally scoped to one thread."""
+    try:
+        with get_connection() as conn:
+            if session_key:
+                rows = conn.execute(
+                    "SELECT ts, role, medium, channel, session_key, parent_channel, text "
+                    "FROM conversation_log WHERE session_key = ? ORDER BY id DESC LIMIT ?",
+                    (session_key, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ts, role, medium, channel, session_key, parent_channel, text "
+                    "FROM conversation_log ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+    except Exception:
+        log.warning("conversation_log read failed (non-fatal)", exc_info=True)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Discord work-thread registry — one thread per request.
 #
 # A request's identity is its Discord thread, not the channel it landed in.
@@ -288,6 +376,70 @@ def get_active_cursor_sessions() -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM cursor_sessions WHERE status IN ('running', 'waiting')"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Claude Code (Agent SDK) sessions — the durable record of threads Aria drives
+# through `src/claude_code.py`. `workspace_root` enables resume after a restart
+# (ClaudeAgentOptions.resume + cwd); `cost_usd` accumulates total_cost_usd.
+# ---------------------------------------------------------------------------
+
+def upsert_claude_session(
+    session_id: str,
+    project: str,
+    workspace_root: str = "",
+    status: str = "running",
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO claude_sessions "
+            "(session_id, project, workspace_root, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "status=excluded.status, "
+            "workspace_root=COALESCE(NULLIF(excluded.workspace_root, ''), claude_sessions.workspace_root), "
+            "project=COALESCE(NULLIF(excluded.project, ''), claude_sessions.project)",
+            (session_id, project, workspace_root, status, _now()),
+        )
+
+
+def update_claude_session_event(
+    session_id: str,
+    summary: str,
+    status: str | None = None,
+    add_cost_usd: float | None = None,
+) -> None:
+    """Stamp a session's latest event. Optionally advance status and add cost."""
+    sets = ["last_event_at = ?", "last_event_summary = ?"]
+    params: list[Any] = [_now(), summary]
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+    if add_cost_usd:
+        sets.append("cost_usd = cost_usd + ?")
+        params.append(float(add_cost_usd))
+    params.append(session_id)
+    with get_connection() as conn:
+        conn.execute(
+            f"UPDATE claude_sessions SET {', '.join(sets)} WHERE session_id = ?",
+            params,
+        )
+
+
+def get_claude_session(session_id: str) -> dict[str, Any] | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM claude_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_claude_sessions() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM claude_sessions WHERE status IN ('running', 'waiting')"
         ).fetchall()
     return [dict(r) for r in rows]
 

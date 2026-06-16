@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 
 
 Severity = Literal["high", "low"]
-Source = Literal["sdk", "ide", "unknown"]
+Source = Literal["sdk", "ide", "claude_code", "unknown"]
 Status = Literal["running", "waiting", "finished", "errored", "unknown"]
 EventKind = Literal["finished", "errored", "question", "started", "progress"]
 
@@ -427,6 +427,117 @@ class CursorAgentRegistry:
         )
         return agent
 
+    async def register_from_claude_code(
+        self,
+        *,
+        session_id: str,
+        workspace_root: str,
+        instruction: str | None = None,
+    ) -> CursorAgent:
+        """Record an agent Aria spawned via the Claude Agent SDK (Claude Code).
+
+        Source=`claude_code`, status=`running`. Unlike the Cursor SDK path,
+        the driver in `src/claude_code.py` streams turns directly and folds
+        them via `record_claude_code_event`, so no JSONL tailer is started
+        here (Claude Code writes its transcript under `~/.claude/...`, a
+        different layout than the `~/.cursor/...` tailer expects).
+        """
+        workspace_root = workspace_root.rstrip("/")
+        agent = self._get_or_create(workspace_root, source="claude_code")
+        # A workspace previously seen as a Cursor agent can also host a Claude
+        # Code session; the live source follows the most recent spawn.
+        agent.source = "claude_code"
+        now = time.time()
+        if session_id:
+            sess = agent.sessions.get(session_id)
+            if sess is None:
+                sess = SessionInfo(
+                    sid=session_id,
+                    started_at=now,
+                    last_event_at=now,
+                    transcript_path=_guess_claude_transcript_path(
+                        workspace_root, session_id
+                    ),
+                )
+                agent.sessions[session_id] = sess
+            agent.current_sid = session_id
+        agent.status = "running"
+        agent.last_event_at = now
+        await self._emit_event(
+            RegistryEvent(
+                kind="started",
+                agent=agent,
+                severity="low",
+                reason=(
+                    f"Claude Code session started in {agent.project_label}"
+                    + (f": {instruction[:120]}" if instruction else "")
+                ),
+            )
+        )
+        return agent
+
+    async def record_claude_code_event(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        text: str = "",
+        error: str = "",
+    ) -> None:
+        """Fold one Claude Code stream turn into the registry.
+
+        `kind` is the already-classified turn from the driver:
+        `assistant` (text is the assistant turn), `completion` (the run ended
+        cleanly), or `error` (error is the failure detail). The driver does
+        the SDK-message parsing; the registry owns the agent-state transition
+        and the narrator emit — the same split as `record_sdk_event` for the
+        Cursor SDK.
+        """
+        agent = self.agent_for_session(session_id)
+        if agent is None:
+            return
+        now = time.time()
+        agent.last_event_at = now
+        sess = agent.sessions.get(session_id)
+        if sess is None:
+            sess = SessionInfo(sid=session_id, started_at=now, last_event_at=now)
+            agent.sessions[session_id] = sess
+        sess.last_event_at = now
+        agent.current_sid = session_id
+
+        evt_kind: EventKind | None = None
+        severity: Severity = "low"
+        reason = ""
+        if kind == "assistant" and text:
+            agent.last_assistant_text = text[: self._truncate_chars]
+            sess.last_assistant_text = agent.last_assistant_text
+            q = _question_in_text(text)
+            agent.pending_question = q
+            if q:
+                evt_kind, severity, reason = (
+                    "question", "high", f"{agent.project_label} (Claude Code) asks: {q[:200]}",
+                )
+            else:
+                evt_kind, severity, reason = (
+                    "progress", "low",
+                    f"{agent.project_label} Claude Code thread {sess.sid[:8]} produced a turn.",
+                )
+        elif kind == "completion":
+            agent.status = "finished"
+            evt_kind, severity, reason = (
+                "finished", "high", f"Claude Code run finished in {agent.project_label}.",
+            )
+        elif kind == "error":
+            agent.status = "errored"
+            evt_kind, severity, reason = (
+                "errored", "high",
+                f"Claude Code run errored in {agent.project_label}: {str(error)[:200]}",
+            )
+        if evt_kind:
+            await self._emit_event(
+                RegistryEvent(kind=evt_kind, agent=agent, severity=severity, reason=reason)
+            )
+
     def agent_for_session(self, session_id: str) -> CursorAgent | None:
         """Reverse-lookup by transcript sid. O(N) on workspaces; N is small."""
         if not session_id:
@@ -778,6 +889,33 @@ def _guess_transcript_path(workspace_root: str, session_id: str) -> str | None:
         proj_data = os.path.join(base_dir, name)
         sub = os.path.join(proj_data, "agent-transcripts", session_id)
         jsonl = os.path.join(sub, f"{session_id}.jsonl")
+        if os.path.exists(jsonl):
+            return jsonl
+    return None
+
+
+def _guess_claude_transcript_path(workspace_root: str, session_id: str) -> str | None:
+    """Expected JSONL path for a Claude Code session.
+
+    Claude Code stores transcripts flat at
+    `~/.claude/projects/<munged-cwd>/<session-id>.jsonl`, where the cwd is
+    munged by replacing every `/` with `-`. Returns the path only if it
+    exists on disk (the driver's stream is the primary state source; this is
+    just so `cursor_read` can locate the durable file for a Claude Code thread).
+    """
+    if not session_id:
+        return None
+    base_dir = os.path.join(os.path.expanduser("~/.claude"), "projects")
+
+    def _munge(c: str) -> str:
+        return c.replace("/", "-")
+
+    candidates = [_munge(workspace_root)]
+    real = os.path.realpath(workspace_root) if os.path.exists(workspace_root) else workspace_root
+    if real != workspace_root:
+        candidates.append(_munge(real))
+    for name in candidates:
+        jsonl = os.path.join(base_dir, name, f"{session_id}.jsonl")
         if os.path.exists(jsonl):
             return jsonl
     return None
