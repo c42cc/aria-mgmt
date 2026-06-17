@@ -1,93 +1,147 @@
-# UCS — Unified Conversation System
+# UCS — Aria
 
-Talk to your software development workflow from your phone. One Python process on your Mac connects Discord voice to Gemini 3.1 Live (conversational layer), which dispatches work to Claude Opus 4.6 (planner) and Cursor (builder) via function calls.
+**A voice-first personal operating shell.** You talk to a Discord bot named
+**Aria** from your phone. She speaks back conversationally and, behind the
+scenes, dispatches real work — planning, building software, reading mail,
+managing files, running shell commands, watching your Cursor windows,
+recalling durable facts — through a fleet of specialized intelligences.
 
-The bot appears in Discord as **Aria**. She is the only non-human in the server and manages every channel and thread herself.
+Everything runs as **one Python process on your Mac**, plus a few subprocess
+sidecars for what Python can't own directly. No agent framework, no
+orchestrator. The loop is readable end-to-end in `src/bot.py`.
 
-## Architecture
+---
 
-Three intelligences, strict roles:
+## What Aria is
 
-- **Gemini 3.1 Live** — sole conversational layer (voice + text)
-- **Claude Opus 4.6** — sole reasoner (planning, analysis, architecture)
-- **Cursor SDK** — sole builder (code edits, tests, execution)
+Aria appears in your Discord server as a single bot. She is the only non-human
+in the server and manages every channel and thread herself. Under the hood she
+is **three intelligences with strict, non-overlapping roles**:
 
-One process. No framework. ~600 lines Python + ~80 lines JS.
+| Role | Who | What it does |
+|---|---|---|
+| **Voice** | Gemini Live | The only thing you hear. Listens, speaks, decides which tool to call. Does no reasoning beyond conversation. |
+| **Reasoning** | Claude Opus | Planning, analysis, the multi-step agent loop. Never speaks to you directly; produces text artifacts. |
+| **Building** | Cursor SDK | Code edits, tests, branches. Never narrates; emits build events. |
 
-## Quick Start
+Roles never blur — that is why the system stays small. For the why and where
+this is going, read [`VISION_ARIA.md`](./VISION_ARIA.md).
+
+## How she works
+
+- **One process** owns the conversation, tool dispatch, state, memory, and the
+  supervision of every sidecar. launchd brings it back if it dies.
+- **Sidecars** speak line-delimited JSON over stdio: a Node **discord.js**
+  voice bridge (Discord voice E2EE), a Node **`@cursor/sdk`** wrapper, and a
+  fleet of **MCP servers** (one per integration: Apple, Google Calendar,
+  filesystem, shell, GitHub, …).
+- **Tools** are the action surface. Gemini doesn't touch the world directly; it
+  calls Python tool handlers on a fixed catalog, with cost and risk-tier checks
+  applied mechanically at dispatch.
+- **Prompts are behavior.** Every persona/instruction is a markdown file in
+  `prompts/`, read at runtime. Editing a file changes behavior on the next call.
+- **Failures are loud.** Preflight probes every capability end-to-end and
+  refuses to enter ready state on a critical failure, with the exact fix.
+
+Full technical map: [`ARCHITECTURE.md`](./ARCHITECTURE.md). Process topology,
+IPC, audio formats, and lifecycle wiring: [`wiring.md`](./wiring.md).
+
+## What she can do
+
+- **Talk** — natural voice conversation in the voice channel.
+- **Plan with Claude** — describe a problem; hear a plan; approve/adjust/reject.
+- **Build with Cursor** — on approval, spin up a Cursor agent on a fresh branch
+  and stream the build back.
+- **Do with Claude (MCP)** — email, calendar, files, research, shell, GitHub via
+  one bounded agent loop with the MCP catalog wired in.
+- **Watch your Cursor windows (cursor-watch)** — Aria sees every Cursor IDE
+  thread on the Mac and pings you when one needs a decision or finishes.
+- **Remember & recall** — durable facts persist in mem0 and load into context.
+- **Manage the Sparks** — status/verify/setup for the two-node DGX Spark rig.
+- **SpicyLit** — a capability that swaps the voice layer to a storyteller in its
+  own channel.
+- **Local voice** — same tools with the Mac's mic/speakers, no Discord.
+
+---
+
+## Quick start
 
 ```bash
-# Create virtual environment
+# 1. Python env + editable install (src/ is imported live)
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -e .            # or: pip install -r requirements.txt
 
-# Install Python dependencies
-pip install -r requirements.txt
+# 2. Node sidecars
+(cd cursor_wrapper && npm install)
+(cd discord_voice_bridge && npm install)
 
-# Install Node.js dependencies for Cursor bridge
-cd cursor_wrapper && npm install && cd ..
+# 3. Secrets
+cp .env.example .env        # then fill in keys + Discord/channel IDs
 
-# Copy and fill in secrets
-cp .env.example .env
-# Edit .env with your API keys
+# 4. Install the cursor-watch hooks (lets Aria see your Cursor windows)
+.venv/bin/python hooks/install.py
 
-# Run
-python -m src.bot
+# 5. Run (development)
+make run                    # or: python -m src.bot
 ```
 
-## Project Structure
+A fresh machine can use `ops/bootstrap.sh` (deps + sidecars + permissions).
+`deploy.sh` is the production launch path; `kill.sh` tears down the whole
+process tree (launchd-aware). The launchd unit is `ops/com.you.voicebot.plist`.
+
+## Discord setup
+
+Aria is **one identity, two Discord applications** sharing the name "Aria":
+
+- **Text bot** (py-cord) — text commands, threads, tool dispatch.
+  `DISCORD_APP_BOT_TOKEN`.
+- **Voice sidecar** (discord.js) — only the voice WebSocket.
+  `DISCORD_VOICE_BOT_TOKEN`.
+
+They never talk through Discord; the Python parent is the only glue.
+
+Channels (referenced by **ID**, not name — renaming in Discord never breaks
+anything):
+
+| Channel | Kind | Purpose | `.env` |
+|---|---|---|---|
+| `#general` | voice | Conversation with Aria | `DISCORD_VOICE_CHANNEL_ID` |
+| `#ucs` | text | Plans, build output, results, decisions/buzzes | `DISCORD_TEXT_CHANNEL_ID` |
+| `#ucs-alerts` | text | Silent audit stream (preflight, errors, cursor-watch) | `DISCORD_LOG_CHANNEL_ID` |
+| `#spicy-lit` | voice | SpicyLit storyteller capability | `DISCORD_SPICYLIT_CHANNEL_ID` |
+
+`.env.example` is the canonical list of recognized variables.
+
+## Repo layout
 
 ```
-ucs/
-├── src/                    # Python source
-│   ├── bot.py              # Main entry point
-│   ├── discord_voice.py    # Voice channel I/O, PCM resampling
-│   ├── gemini_session.py   # Gemini Live WebSocket + function calls
-│   ├── tools.py            # Tool implementations + UCS dispatch
-│   ├── ucs.py              # UCS Intelligence Loop, Model Router (UCS_ENABLED=true)
-│   ├── eval.py             # Offline prompt evaluation CLI
-│   ├── cursor_bridge.py    # Python ↔ Node subprocess bridge
-│   ├── memory.py           # mem0 wrapper
-│   ├── db.py               # SQLite schema + queries
-│   ├── prompts.py          # Prompt template loader + versioning
-│   └── config.py           # Env loading, defaults
-├── cursor_wrapper/         # Node.js bridge to @cursor/sdk
-├── prompts/                # Markdown prompt templates (versioned)
-├── models.yaml             # Model registry (costs, capabilities, keys)
-├── projects/               # Project registry
-├── workflows/              # Saved workflow descriptions
-├── data/                   # Local state (gitignored)
-├── ops/                    # launchd config, setup scripts
-└── tests/                  # Smoke tests
+src/            # Python source — the loop lives in src/bot.py
+cursor_wrapper/         # Node bridge to @cursor/sdk
+discord_voice_bridge/   # Node discord.js voice sidecar
+hooks/          # ~/.cursor/hooks.json forwarder for cursor-watch
+capabilities/   # Self-contained capability packages (e.g. spicy_lit)
+prompts/        # Markdown prompt templates (behavior is data)
+projects/       # Project name -> path registry
+specs/          # Correctness specs (judge harness)
+ops/            # launchd unit, bootstrap/install, Spark ops
+scripts/        # E2E + acceptance harnesses
+tests/          # Unit tests + deep integration
+docs/           # Reference docs, forensics, and archived planning briefs
+data/           # Local state — SQLite, mem0, audit log (gitignored)
+models.yaml     # Model registry + loop profiles
 ```
 
-## Discord Setup
+A concept-to-file index lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md)'s
+**Repo Map** — start there when you need to find where something lives.
 
-Aria runs as two Discord applications sharing one identity:
+## Documentation
 
-- **Aria (text bot)** — py-cord, handles text commands, threads, and tool dispatch.
-  Token in `.env` as `DISCORD_APP_BOT_TOKEN`.
-- **Aria (voice sidecar)** — discord.js Node process (`discord_voice_bridge/`),
-  handles only the voice WebSocket. Token in `.env` as `DISCORD_VOICE_BOT_TOKEN`.
-
-Both applications are invited to the same guild and named "Aria" in the
-Discord developer portal, so they appear as one bot to the user.
-
-Channels (three total):
-
-- `#ucs` (text) — plans, build output, tool results, file attachments
-- `#ucs-alerts` (text) — preflight reports, confirmations, errors
-- `#general` (voice) — natural-language conversation with Aria
-- `#spicy-lit` (text) — SpicyLit outline output
-
-Channel IDs live in `.env` as `DISCORD_TEXT_CHANNEL_ID`, `DISCORD_LOG_CHANNEL_ID`,
-and `DISCORD_VOICE_CHANNEL_ID`. Renaming channels in Discord does not break
-anything because the code reads IDs, not names.
-
-## Build Phases
-
-- **Phase 0**: Bot logs in, joins/leaves voice channel
-- **Phase 1**: Fluid voice conversation through Discord via Gemini
-- **Phase 2**: End-to-end plan-and-build via voice
-- **Phase 3**: Error recovery, cost guardrails, authorization
-- **Phase 4**: Prompt iteration and workflow saving (ongoing)
+| Doc | What it is |
+|---|---|
+| [`README.md`](./README.md) | This file — what Aria is and how to run her |
+| [`VISION_ARIA.md`](./VISION_ARIA.md) | What Aria is and where she's going |
+| [`VISION_UCS.md`](./VISION_UCS.md) | The Universal Constructor System vision |
+| [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Primitives, layers, capabilities, repo map |
+| [`wiring.md`](./wiring.md) | Process topology, IPC, audio, lifecycle wiring |
+| [`docs/`](./docs/) | Reference docs, forensics, archived planning briefs |

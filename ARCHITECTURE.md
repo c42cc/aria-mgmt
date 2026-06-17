@@ -209,12 +209,13 @@ Three concrete patterns sit behind the tool dispatch:
   resulting events back into Discord and into Gemini's context. Spawning
   binds `active_project` in ground.
 
-When `UCS_ENABLED=true`, planning routes through the UCS Intelligence Loop
-(`src/ucs.py`: model registry + router from models.yaml). There is
-deliberately no second agent loop behind the flag — a dormant duplicate of
-the most failure-prone primitive drifted (no dollar cap, no local tools)
-and was removed. All paths write to the `loop_executions` table for
-observability.
+There is deliberately **one** agent loop and one planning path — an earlier
+flag-gated duplicate (`UCS_ENABLED` / `src/ucs.py`) of the most failure-prone
+primitive drifted (no dollar cap, no local tools) and was removed. Every loop
+execution is still logged to the `loop_executions` table (model, tokens, cost,
+truncation) for observability; the offline eval CLI (`src/eval.py`) reads that
+table to score prompt versions by approval rate. Model configuration and loop
+profiles live in `models.yaml`.
 
 ### State
 
@@ -328,35 +329,50 @@ directly instead of Discord. Same tool surface, same prompts, same MCP
 fleet — only the transport is different. Useful for debugging and for
 running offline of Discord.
 
-### External Cursor Observer
+### Cursor-Watch (External Cursor Observer)
 
-Aria's eyes on the Cursor IDE windows the user opened manually (not
-spawned by `build_with_cursor`). A small aiohttp server bound to
-127.0.0.1 receives Cursor lifecycle events from a user-level hooks
-forwarder (`hooks/cursor-event.py` registered in `~/.cursor/hooks.json`).
-The observer filters/debounces, reads transcript JSONLs and plan files
-on disk for context, and hands interesting events to a pager.
+Aria watches every Cursor IDE window on the Mac — the threads the user drives
+by hand, not just the agents she spawns via `build_with_cursor` — and pings the
+user when one needs a decision or finishes. Four stages, each with one job:
 
-Pager rungs:
+1. **Hooks forwarder.** A tiny stdlib-only script (`hooks/cursor-event.py`,
+   installed into `~/.cursor/hooks.json` by `hooks/install.py`) runs on every
+   Cursor lifecycle event (`stop`, `subagentStop`, `sessionEnd`, `postToolUse`
+   for plans, `afterAgentResponse`) and POSTs the payload to a local endpoint.
 
-- **Rung A** — Gemini is connected: `inject_text(turn_complete=True)`,
-  Aria narrates the event aloud immediately.
-- **Rung B** — Gemini is not connected: Discord DM with `<@USER_ID>`
-  mention. The event is queued; when the user later joins voice, the
-  join preamble is replaced with a debrief instruction so Aria opens
-  the conversation with a one-sentence summary instead of "stay silent
-  until he speaks."
+2. **HTTP listener.** `src/cursor_external.py` runs an aiohttp server bound to
+   `127.0.0.1` that accepts those POSTs and writes them through to the registry.
+   It owns no policy — it parses and forwards.
 
-The Cursor remote-control tools (`list_cursor_windows`,
-`read_cursor_window`, `focus_cursor_window`, `send_to_cursor_chat`,
-`approve_cursor_plan`, etc.) let Aria be the user's "body" on the
-workstation: she can read what each window is doing and type
-instructions back into specific windows by AppleScript-focusing them
-and pasting into the chat sidebar.
+3. **The registry is the source of truth.** `src/cursor_registry.py`
+   (`CursorAgentRegistry`) keys agents by workspace, tracks each thread's live
+   status, and runs a per-session JSONL **tailer**. The tailer is the real
+   signal source: it surfaces each new assistant turn and — critically —
+   detects an **`AskQuestion` tool call** as a high-severity decision (an agent
+   asks the user by *calling a tool*, not by writing a trailing "?"). The tailer
+   **primes silently**: pre-existing backlog (after a restart, or the first time
+   a thread is seen) seeds state but is never re-emitted, so history is not
+   replayed as fresh pings.
 
-Discord's bot API does not permit DM voice-call ringing; the DM-mention
-push is the loudest legal proxy. Pushover/Twilio escalation can bolt
-onto the same pager interface later if more aggressive ring is needed.
+4. **One narrator owns delivery.** `bot.py::_narrate_registry_event` is the
+   single place that decides how an event reaches the user:
+   - **On voice** — inject the event as context and, for any terminal/actionable
+     transition (finished / errored / question) or high-severity event, narrate
+     it aloud and ask what to do next.
+   - **Off voice** — the event must reach the user's phone. `#ucs-alerts` is a
+     forced-silent audit stream (a record, never a buzz). A completion first
+     tries a "here's the next move — approve?" proposal that buzzes `#ucs`;
+     anything that doesn't fire a proposal — and every error/question — goes
+     through `_notify_user_buzz` (a DM, else a non-silent `@mention` in `#ucs`).
+     Nothing meaningful is ever silently dropped.
+
+The Cursor read/send tools (`cursor_read`, `cursor_send`, `cursor_threads`) let
+Aria act as the user's hands on the workstation: read what any thread is doing
+and send instructions back into a specific thread (`cursor_send` kind =
+chat / new_agent / approve / reject / cancel).
+
+Discord's bot API does not permit DM voice-call ringing, so the non-silent
+`@mention` (or DM) push is the loudest legal proxy.
 
 ---
 
@@ -391,14 +407,19 @@ points; cross-references inside the code are reliable.
 | The agent loop (the only one) | `src/tools.py::_do_with_claude_loop` |
 | Ground working set + findings ledger | `src/db.py` (`ground`, `loop_findings`) |
 | Outcome policy (progress/transient/blocked + discovery families) | `src/outcomes.py` |
-| UCS planning router (model registry) | `src/ucs.py` (active when `UCS_ENABLED=true`) |
-| UCS evaluation layer (offline CLI) | `src/eval.py` |
+| Offline eval CLI (scores prompt versions from `loop_executions`) | `src/eval.py` |
 | Product correctness harness | `src/judge.py` + `specs/correctness/` |
 | MCP client and dispatch | `src/mcp.py` |
 | Cursor bridge (Python side) | `src/cursor_bridge.py` |
 | Cursor bridge (Node sidecar) | `cursor_wrapper/index.js` |
-| External Cursor observer | `src/cursor_external.py` (HTTP server + transcript reader + pager dispatch) |
+| Cursor-watch HTTP listener (hook events in) | `src/cursor_external.py` |
+| Cursor agent registry (source of truth: per-thread status, JSONL tailer, AskQuestion detection) | `src/cursor_registry.py` |
+| Cursor-watch narrator (voice / DM / `#ucs` delivery) | `src/bot.py::_narrate_registry_event` |
+| Cursor read/send tools (`cursor_read`, `cursor_send`, `cursor_threads`) | `src/cursor_tools.py` |
 | Cursor hooks forwarder | `hooks/cursor-event.py` (+ `hooks/install.py`) |
+| Claude Agent SDK (Claude Code) driver | `src/claude_code.py` |
+| Durable conversation buffer (voice + text + cursor events) | `src/conversation.py` |
+| Capability base / registration | `src/capability.py` |
 | Long-term memory | `src/memory.py` |
 | Structured state | `src/db.py` + `data/state.db` |
 | Audit log | `src/mcp.py` (writer) + `data/audit.jsonl` |
@@ -428,7 +449,7 @@ points; cross-references inside the code are reliable.
 
 | What | Where |
 |---|---|
-| Smoke tests (cheap, no API calls) | `tests/smoke.py` |
+| Smoke + unit tests (cheap, no API calls) | `tests/smoke.py`, `tests/test_*.py` |
 | Deep integration (real API round-trips) | `tests/deep_integration.py` |
 | One-shot machine setup | `ops/bootstrap.sh` |
 | Dependency install (venv + npm) | `ops/install.sh` |
