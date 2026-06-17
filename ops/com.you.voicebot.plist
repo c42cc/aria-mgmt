@@ -5,36 +5,51 @@
     <key>Label</key>
     <string>com.you.voicebot</string>
 
+    <!-- Launch the bot DIRECTLY (not `make run`). `make run` shells out to
+         `pkill -f src.bot`, whose own command line contains "src.bot", so under
+         launchd KeepAlive it can kill its own launching shell and crash-loop.
+         The editable install (install.sh / `pip install -e .`) means src/ is
+         imported live, so a restart always runs current source. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/make</string>
-        <string>-C</string>
-        <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2</string>
-        <string>run</string>
+        <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2/.venv/bin/python</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>src.bot</string>
     </array>
 
+    <!-- CWD = repo root so dotenv finds .env (secrets stay in .env, not here). -->
     <key>WorkingDirectory</key>
     <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2</string>
 
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <true/>
-
-    <key>StandardOutPath</key>
-    <string>/Users/corbin/Library/Logs/voicebot/stdout.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/corbin/Library/Logs/voicebot/stderr.log</string>
-
+    <!-- launchd hands a minimal PATH. Aria spawns node (voice sidecar), npx (MCP
+         fleet), ffmpeg, screencapture (/usr/sbin), osascript (/usr/bin). The old
+         PATH here omitted /usr/sbin and the Homebrew sbin dirs, so screencapture
+         was "command not found" under the service. This is the same contracted
+         PATH the in-process capability layer guarantees. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
     </dict>
 
+    <!-- Always-live: start at login, restart on any exit, throttled to >=15s. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
     <key>ThrottleInterval</key>
-    <integer>5</integer>
+    <integer>15</integer>
+
+    <!-- Real-time voice wants responsive scheduling, not background throttling. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/corbin/Library/Logs/voicebot/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/corbin/Library/Logs/voicebot/stderr.log</string>
 </dict>
 </plist>
