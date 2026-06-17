@@ -8,10 +8,13 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/rsync</string>
-        <string>-a</string>
-        <string>--delete</string>
+        <string>-rt</string>
+        <string>--no-perms</string>
+        <string>--no-owner</string>
+        <string>--no-group</string>
+        <string>--modify-window=2</string>
         <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2/data/</string>
-        <string>/Users/corbin/Library/Mobile Documents/com~apple~CloudDocs/ucs-backup/</string>
+        <string>/Users/corbin/Library/CloudStorage/GoogleDrive-c@c42.io/My Drive/ucs-backup/</string>
     </array>
 
     <key>StartCalendarInterval</key>
