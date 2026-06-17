@@ -1939,22 +1939,67 @@ async def _maybe_propose_next_after_completion(agent: "CursorAgent") -> bool:
         return False
 
 
+async def _notify_user_buzz(content: str) -> bool:
+    """Deliver a phone-buzzing notification to the authorized user.
+
+    The off-voice delivery primitive for cursor-watch events. `#ucs-alerts`
+    is a forced-silent stream (it must never buzz — Corbin's rule), so a real
+    notification has to land somewhere that actually pings. Order:
+
+      1. DM the authorized user — the most direct "message me". Buzzes the
+         phone when Corbin's DMs are open.
+      2. Fall back to a NON-silent @mention post in the main `#ucs` channel —
+         the same proven buzz surface `_post_proposal_card` uses — when DMs
+         are closed/unavailable.
+
+    Returns True if either path delivered, False if both failed. `content`
+    is expected to already carry the `<@id>` mention prefix (e.g. from
+    `_format_registry_dm`) so the `#ucs` fallback still pings even though it
+    is a channel, not a DM.
+
+    This exists because the prior off-voice path silently dropped any
+    finished/errored/asking event the `propose_next` model call couldn't turn
+    into a suggestion — the bug behind "a thread finished and Aria never
+    messaged me."
+    """
+    try:
+        if await _dm_authorized_user(content):
+            log.info("cursor-watch: notification delivered via DM")
+            return True
+    except Exception:
+        log.exception("cursor-watch: DM attempt raised — falling back to #ucs")
+
+    try:
+        await post_to_text(content)
+        log.info("cursor-watch: notification delivered via #ucs @mention")
+        return True
+    except Exception:
+        log.exception(
+            "cursor-watch: #ucs notification post failed — event NOT delivered"
+        )
+        return False
+
+
 async def _narrate_registry_event(evt: RegistryEvent) -> None:
     """Single owner of voice / DM / alert routing for cursor registry events.
 
     Replaces the four-rung `_cursor_external_pager`. Order is mechanical:
 
     1. Record the cursor event in the conversation buffer (always).
-    2. Silent audit to `#ucs-alerts` (always).
-    3. On voice + idle gate: structured context inject + speech trigger
-       when severity warrants. The wait_until_idle gate prevents the
+    2. Silent audit to `#ucs-alerts` (always — it's a glanceable, no-buzz
+       stream, never a notification).
+    3. On voice + idle gate: structured context inject + speech trigger for
+       every terminal/actionable transition (finished/errored/question) or
+       any high-severity event. The wait_until_idle gate prevents the
        narration from being batched into Aria's in-flight turn.
-    4. Not on voice + high severity: DM the authorized user.
-    5. Mark `agent.last_delivered_at` on success of step 3 or 4 so the
-       join / resume briefing doesn't re-narrate.
-
-    The legacy "rung B/C/D" semantics collapse: a single high-severity
-    event whose DM fails posts a loud audit. Everything else is silent.
+    4. Not on voice: every terminal/actionable transition gets a guaranteed
+       phone buzz. Completions first try the richer "next move?" proposal
+       (which buzzes the main channel on its own); anything that doesn't fire
+       a proposal — and every error/question — falls through to
+       `_notify_user_buzz` (DM, else a non-silent `#ucs` @mention). Nothing
+       meaningful is ever silently dropped.
+    5. Mark `agent.last_delivered_at` only when Aria SPOKE it aloud (step 3),
+       so a phone-only ping still surfaces on the next voice-join briefing.
     """
     agent = evt.agent
     log.info(
@@ -2002,7 +2047,13 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                     "continuing to the heads-up trigger anyway"
                 )
             spoke_aloud = False
-            if evt.severity == "high":
+            # Speak aloud for every terminal/actionable transition, not just
+            # high-severity ones: a thread finishing with an unknown/aborted
+            # status comes through as severity=low but is still exactly what
+            # Corbin asked to hear about.
+            if evt.severity == "high" or evt.kind in (
+                "finished", "completed", "errored", "question",
+            ):
                 speech = _format_registry_speech(evt)
                 await gemini.inject_text(
                     f"[Cursor watch heads-up — narrate this and ask what to do next] {speech}",
@@ -2025,19 +2076,32 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                 "Failed to inject registry event into Gemini — falling back to DM rung"
             )
 
-    # Not on voice. The ONLY thing allowed to buzz is a real decision. A bare
-    # "thread finished" is useless on its own (Corbin's rule), so on completion
-    # we turn it into a "here's the next move — approve?" proposal (which buzzes
-    # the main channel). Everything else just streams silently to #ucs-alerts.
-    if evt.severity == "high" and evt.kind in ("finished", "completed"):
-        proposed = await _maybe_propose_next_after_completion(agent)
-        if not proposed:
-            await _safe_post(audit_line, silent=True)
-    else:
-        # Errors, questions, progress: context to the silent stream, no buzz.
-        # (A pending question is surfaced here; the proposal path is the buzz.)
-        body = _format_registry_dm(evt) if evt.severity == "high" else audit_line
-        await _safe_post(body, silent=True)
+    # Not on voice. #ucs-alerts is a forced-silent stream, so record the audit
+    # line there (a glanceable trail) but NEVER rely on it to notify. Every
+    # terminal/actionable transition — a thread FINISHED, ERRORED, or is
+    # ASKING a question — must reach Corbin's phone.
+    await _safe_post(audit_line, silent=True)
+
+    if evt.kind not in ("finished", "completed", "errored", "question"):
+        # Progress / started: the silent stream is enough; no buzz.
+        return
+
+    # Completions first try the richer "here's the next move — approve?"
+    # proposal, which buzzes the main channel on its own. If it doesn't fire
+    # (model had no suggestion, rate-limited, disabled, or an empty summary)
+    # we fall through to a deterministic buzz so the finish is NEVER silently
+    # dropped — the exact bug behind "a thread finished and Aria never
+    # messaged me."
+    if evt.kind in ("finished", "completed"):
+        try:
+            if await _maybe_propose_next_after_completion(agent):
+                return
+        except Exception:
+            log.exception(
+                "propose-next path raised — falling back to direct notify"
+            )
+
+    await _notify_user_buzz(_format_registry_dm(evt))
 
 
 def _undelivered_agents() -> list[CursorAgent]:
