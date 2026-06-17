@@ -669,6 +669,13 @@ class GeminiSession:
         # response, and leave the model unaware of what happened. The
         # close path now awaits these with a bounded timeout (L1 fix).
         self._dispatch_tasks: set[asyncio.Task] = set()
+        # Realtime input (audio / audio_stream_end / activity) MUST be suppressed
+        # while a tool call is in flight: Gemini Live closes the socket with 1008
+        # ("Operation is not implemented…") if any send_realtime_input arrives
+        # between a tool_call and its send_tool_response (forensic 2026-06-16,
+        # confirmed on the Google AI dev forum). A counter (not a bool) so
+        # concurrent dispatches each gate and ungate correctly.
+        self._pending_tool_calls: int = 0
 
     @property
     def connected(self) -> bool:
@@ -722,8 +729,12 @@ class GeminiSession:
         self._connected = True
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
-        """Send PCM audio chunk (16kHz mono int16) to Gemini."""
-        if not self._session or not self._connected:
+        """Send PCM audio chunk (16kHz mono int16) to Gemini.
+
+        Dropped while a tool call is pending — Gemini Live rejects realtime
+        input during the tool_call→tool_response window and closes with 1008.
+        """
+        if not self._session or not self._connected or self._pending_tool_calls > 0:
             return
         try:
             await self._session.send_realtime_input(
@@ -743,7 +754,7 @@ class GeminiSession:
         utterance and then need to deterministically end the user turn so
         Aria responds without waiting for VAD timeout.
         """
-        if not self._session or not self._connected:
+        if not self._session or not self._connected or self._pending_tool_calls > 0:
             return
         try:
             await self._session.send_realtime_input(audio_stream_end=True)
@@ -955,27 +966,37 @@ class GeminiSession:
                             log.info("Gemini tool call: %s(%s)", fc.name, fc.id)
 
                             if fc.name == "confirm_action":
-                                args = dict(fc.args) if fc.args else {}
-                                action_id = args.get("action_id", "")
-                                if action_id in self._pending_confirmations:
-                                    self._confirmation_results[action_id] = {
-                                        "approved": args.get("approved", False),
-                                        "modifications": args.get("modifications"),
-                                    }
-                                    self._pending_confirmations[action_id].set()
-                                await self._session.send_tool_response(
-                                    function_responses=types.FunctionResponse(
-                                        name=fc.name,
-                                        response={"result": "confirmation recorded"},
-                                        id=fc.id,
+                                self._pending_tool_calls += 1
+                                try:
+                                    args = dict(fc.args) if fc.args else {}
+                                    action_id = args.get("action_id", "")
+                                    if action_id in self._pending_confirmations:
+                                        self._confirmation_results[action_id] = {
+                                            "approved": args.get("approved", False),
+                                            "modifications": args.get("modifications"),
+                                        }
+                                        self._pending_confirmations[action_id].set()
+                                    await self._session.send_tool_response(
+                                        function_responses=types.FunctionResponse(
+                                            name=fc.name,
+                                            response={"result": "confirmation recorded"},
+                                            id=fc.id,
+                                        )
                                     )
-                                )
+                                finally:
+                                    self._pending_tool_calls = max(0, self._pending_tool_calls - 1)
                                 continue
 
                             if self.tool_handler:
+                                # Gate realtime input until this tool's response
+                                # is sent — the done-callback fires after
+                                # _dispatch_tool_call returns (post
+                                # send_tool_response), which reopens the gate.
+                                self._pending_tool_calls += 1
                                 task = asyncio.create_task(self._dispatch_tool_call(fc))
                                 self._dispatch_tasks.add(task)
                                 task.add_done_callback(self._dispatch_tasks.discard)
+                                task.add_done_callback(self._on_dispatch_done)
 
             except asyncio.CancelledError:
                 log.info("Gemini receive loop cancelled")
@@ -1015,6 +1036,11 @@ class GeminiSession:
                     log.exception("Gemini reconnect failed")
                     self._connected = False
                     return
+
+    def _on_dispatch_done(self, _task: asyncio.Task) -> None:
+        """A dispatched tool call finished (response sent, or orphaned) —
+        reopen the realtime-input gate so audio can resume."""
+        self._pending_tool_calls = max(0, self._pending_tool_calls - 1)
 
     async def _dispatch_tool_call(self, fc: Any) -> None:
         """Run a tool handler and send the response back to Gemini.

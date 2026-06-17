@@ -33,13 +33,17 @@ class Config:
     authorized_voice_user_id: str = os.getenv("AUTHORIZED_VOICE_USER_ID", "")
 
     # Models
-    # Voice model. Pinned to the stable native-audio family: it emits a more
-    # natural, human-sounding voice and is far less demand-throttled than the
-    # bleeding-edge `gemini-3.1-flash-live-preview`, whose 429/503s were killing
-    # turns before any audio was produced (the "voice doesn't work" forensic,
-    # 2026-06-13: 205x 429, 6x 503). Verified to connect + emit audio + accept
-    # the full tool/system config. Override via GEMINI_MODEL in .env.
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-native-audio-latest")
+    # Voice model. gemini-3.1-flash-live-preview. The native-audio family was
+    # pinned here before (more natural voice, less 429-throttled), but the Live
+    # API native-audio path is fundamentally unreliable for the tool loop: it
+    # intermittently 500s on TTS, emits 0 audio bytes under demand, and — the
+    # real blocker — does NOT reliably emit function calls, so spoken requests
+    # never reached do_with_claude (forensic 2026-06-16). 3.1-flash-live
+    # transcribes cleanly and calls tools correctly (verified live: voice ->
+    # transcribe -> tool_call -> audio reply, no throttle). If 3.1 demand
+    # throttling (429/503) recurs that is an ops concern — a model that cannot
+    # call tools is not an acceptable fallback. Override via GEMINI_MODEL in .env.
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     claude_model: str = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
     cursor_model: str = os.getenv("CURSOR_MODEL", "composer-2")
     # Cheap distillation model for high-volume, low-stakes summarization
