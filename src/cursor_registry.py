@@ -829,6 +829,15 @@ class CursorAgentRegistry:
     async def _tail_session(self, agent: CursorAgent, sess: SessionInfo) -> None:
         """Poll the JSONL file for new turns and update the agent in place."""
         last_event_grace_until = 0.0
+        # The pre-existing backlog — everything already in the transcript when
+        # this tailer attaches (after a bot restart, or the first time we ever
+        # see a thread) — is HISTORY: it happened before we were watching. We
+        # read it once to seed state, but must NOT emit events for it. Replaying
+        # it resurfaced stale/answered questions from days-old threads as fresh
+        # pings, and echoed the dev assistant's own AskQuestion back at the user
+        # ("ucs is asking..."). Only turns appended AFTER we catch up are real,
+        # notifiable activity.
+        primed = sess._tail_offset > 0
         try:
             while not self._stopping:
                 try:
@@ -861,21 +870,22 @@ class CursorAgentRegistry:
                                 # heuristic (which only catches a trailing '?').
                                 q = ask_q or _question_in_text(la)
                                 agent.pending_question = q
-                                kind: EventKind = "question" if q else "progress"
-                                severity: Severity = "high" if q else "low"
-                                reason = (
-                                    f"{agent.project_label} is asking: {q[:200]}"
-                                    if q
-                                    else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
-                                )
-                                await self._emit_event(
-                                    RegistryEvent(
-                                        kind=kind,
-                                        agent=agent,
-                                        severity=severity,
-                                        reason=reason,
+                                if primed:
+                                    kind: EventKind = "question" if q else "progress"
+                                    severity: Severity = "high" if q else "low"
+                                    reason = (
+                                        f"{agent.project_label} is asking: {q[:200]}"
+                                        if q
+                                        else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
                                     )
-                                )
+                                    await self._emit_event(
+                                        RegistryEvent(
+                                            kind=kind,
+                                            agent=agent,
+                                            severity=severity,
+                                            reason=reason,
+                                        )
+                                    )
                             if lu:
                                 agent.last_user_text = lu[: self._truncate_chars]
                                 sess.last_user_text = agent.last_user_text
@@ -883,6 +893,9 @@ class CursorAgentRegistry:
                                 agent.recent_plan_files = plans[-5:]
                             sess.last_event_at = time.time()
                             agent.last_event_at = sess.last_event_at
+                            # Caught up to the backlog; subsequent appends are
+                            # live activity and DO notify.
+                            primed = True
                 except FileNotFoundError:
                     pass
                 except Exception:

@@ -132,5 +132,65 @@ class TestRegistryEmitsQuestionEvent(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PAINT REALITY", q_evt.reason)
 
 
+_NEW_ASK_CONTENT = [
+    {"type": "text", "text": "A brand new turn."},
+    {"type": "tool_use", "name": "AskQuestion",
+     "input": {"questions": [{"id": "n1", "prompt": "NEW live question: ship it?",
+                              "options": [{"id": "y", "label": "yes"}]}]}},
+]
+
+
+class TestTailerDoesNotReplayBacklog(unittest.IsolatedAsyncioTestCase):
+    """A tailer attaching to a transcript that already has content must NOT
+    replay that backlog as fresh pings (the 'ucs is asking' stale-question
+    spam). Only turns appended AFTER it attaches should notify."""
+
+    async def test_backlog_suppressed_then_new_appends_emit(self):
+        import asyncio
+        import json
+        import os
+        import shutil
+        import tempfile
+        from src.cursor_registry import CursorAgentRegistry, SessionInfo
+
+        reg = CursorAgentRegistry(tail_interval_sec=0.05)
+        events = []
+
+        async def emit(evt):
+            events.append(evt)
+
+        reg.set_emit_callback(emit)
+
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "sid.jsonl")
+            # Pre-existing backlog containing a (historical) AskQuestion.
+            with open(path, "w") as f:
+                f.write(json.dumps({"role": "assistant", "message": {"content": _ASK_TURN_CONTENT}}) + "\n")
+
+            agent = reg._get_or_create("/tmp/proj_backlog", source="ide")
+            sess = SessionInfo(sid="sid", started_at=0.0, last_event_at=0.0, transcript_path=path)
+            agent.sessions["sid"] = sess
+            reg._ensure_tailer(agent, sess)
+
+            await asyncio.sleep(0.3)  # let it prime over the backlog
+            self.assertEqual(
+                [e for e in events if e.kind == "question"], [],
+                "backlog must NOT be replayed as question events",
+            )
+
+            # Append a genuinely NEW ask -> must emit exactly one question.
+            with open(path, "a") as f:
+                f.write(json.dumps({"role": "assistant", "message": {"content": _NEW_ASK_CONTENT}}) + "\n")
+            await asyncio.sleep(0.3)
+
+            qs = [e for e in events if e.kind == "question"]
+            self.assertEqual(len(qs), 1, f"new ask should emit one question, got {len(qs)}")
+            self.assertIn("ship it", qs[0].reason)
+        finally:
+            await reg.stop()
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
