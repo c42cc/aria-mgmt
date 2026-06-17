@@ -48,6 +48,13 @@ Source = Literal["sdk", "ide", "claude_code", "unknown"]
 Status = Literal["running", "waiting", "finished", "errored", "unknown"]
 EventKind = Literal["finished", "errored", "question", "started", "progress"]
 
+# A thread whose status is "running" but whose last hook landed longer ago than
+# this is no longer treated as *live*-running (the agent likely finished and we
+# missed/never got a stop hook, or it's stuck). We never fabricate a downgrade —
+# the raw status + the age are both surfaced — but "is it processing NOW?" keys
+# off recency so a stale "running" can't masquerade as active work.
+RUNNING_RECENCY_SEC = 180.0
+
 
 @dataclass
 class SessionInfo:
@@ -59,6 +66,10 @@ class SessionInfo:
     transcript_path: str | None = None
     last_assistant_text: str = ""
     last_user_text: str = ""
+    # Per-THREAD live status, driven by THIS session's own hooks (not the
+    # workspace's). The granularity the user actually works in.
+    status: Status = "unknown"
+    last_event_reason: str = ""
     _tail_offset: int = 0
     _tail_task: asyncio.Task | None = field(default=None, repr=False)
     _tail_mtime: float = 0.0
@@ -99,13 +110,19 @@ class CursorAgent:
     last_delivered_reason: str = ""
 
     def to_public_dict(self) -> dict:
-        """JSON-safe projection for tool responses and audits."""
+        """JSON-safe projection for tool responses and audits.
+
+        Status is recomputed at read time so recency is honest: a thread that
+        was "running" but has been quiet beyond the window is reported with its
+        raw status PLUS its age and `live=false`, never masquerading as active.
+        """
+        now = time.time()
         return {
             "agent_id": self.agent_id,
             "workspace_root": self.workspace_root,
             "project_label": self.project_label,
             "source": self.source,
-            "status": self.status,
+            "status": _aggregate_agent_status(self, now),
             "current_sid": self.current_sid,
             "last_assistant_text": self.last_assistant_text,
             "last_user_text": self.last_user_text,
@@ -120,6 +137,10 @@ class CursorAgent:
                     "started_at": s.started_at,
                     "last_event_at": s.last_event_at,
                     "transcript_path": s.transcript_path,
+                    "status": s.status,
+                    "age_sec": round(now - s.last_event_at, 1),
+                    "live": _session_live(s, now),
+                    "last_event_reason": s.last_event_reason,
                 }
                 for s in sorted(
                     self.sessions.values(),
@@ -323,6 +344,32 @@ class CursorAgentRegistry:
     def agents(self) -> list[CursorAgent]:
         return list(self._agents.values())
 
+    def live_status_for_sid(self, sid: str) -> dict | None:
+        """Live per-thread status from the hook stream, matched by transcript
+        sid (full or a prefix). Returns {status, live, age_sec, last_event_at,
+        reason} or None if the registry has never seen this thread. This is the
+        ground-truth "is it processing now?" that overlays the distilled roster.
+        """
+        if not sid:
+            return None
+        now = time.time()
+        for agent in self._agents.values():
+            sess = agent.sessions.get(sid)
+            if sess is None:
+                for s_sid, s in agent.sessions.items():
+                    if s_sid.startswith(sid) or sid.startswith(s_sid):
+                        sess = s
+                        break
+            if sess is not None:
+                return {
+                    "status": sess.status,
+                    "live": _session_live(sess, now),
+                    "age_sec": round(now - sess.last_event_at, 1),
+                    "last_event_at": sess.last_event_at,
+                    "reason": sess.last_event_reason,
+                }
+        return None
+
     def __len__(self) -> int:
         return len(self._agents)
 
@@ -368,7 +415,15 @@ class CursorAgentRegistry:
             agent.current_sid = sid
 
         kind, severity, reason = _classify_hook(hook_type, payload, agent)
-        agent.status = _status_from_hook(hook_type, payload, agent.status)
+        # Per-THREAD status from THIS session's hook (the user works in threads).
+        if sid:
+            tracked = agent.sessions.get(sid)
+            if tracked is not None:
+                tracked.status = _status_from_hook(hook_type, payload, tracked.status)
+                if reason:
+                    tracked.last_event_reason = reason
+        # Workspace status = aggregate across its threads (running if any live).
+        agent.status = _aggregate_agent_status(agent, now)
         agent.last_event_at = now
 
         if sid and sess and sess.transcript_path:
@@ -860,6 +915,25 @@ def _status_from_hook(hook_type: str, payload: dict, prior: Status) -> Status:
             return "errored"
         return prior
     return prior
+
+
+def _session_live(sess: "SessionInfo", now: float) -> bool:
+    """True iff this thread is actively generating RIGHT NOW: its status is
+    running AND its last hook landed within the recency window."""
+    return sess.status == "running" and (now - sess.last_event_at) <= RUNNING_RECENCY_SEC
+
+
+def _aggregate_agent_status(agent: "CursorAgent", now: float) -> Status:
+    """Workspace status as the aggregate of its threads — running if ANY thread
+    is live-running, so one thread finishing/aborting can't flip the whole
+    workspace to "finished" while a sibling is still working."""
+    sessions = list(agent.sessions.values())
+    if not sessions:
+        return agent.status
+    if any(_session_live(s, now) for s in sessions):
+        return "running"
+    latest = max(sessions, key=lambda s: s.last_event_at)
+    return latest.status if latest.status != "unknown" else agent.status
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 def test_config_loads():
     from src.config import config
-    assert config.gemini_model == os.getenv("GEMINI_MODEL", "gemini-2.5-flash-native-audio-latest")
+    assert config.gemini_model == os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     assert config.claude_model == os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
     print("PASS: config loads")
 
