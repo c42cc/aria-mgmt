@@ -360,6 +360,40 @@ onto the same pager interface later if more aggressive ring is needed.
 
 ---
 
+## ModelVault — Cold-Backup Vault (standalone CLI)
+
+Not part of the voice loop and not a capability: a separate command-line tool
+(`modelvault`, `src/modelvault/`) that turns a model URL into a verified,
+client-side-encrypted cold backup in an `rclone` remote (GCS Archive by default)
+and restores it offline. It reuses the repo's primitives (the `.env`/frozen-config
+pattern, `tenacity`, `huggingface_hub`, `transformers`, `safetensors`) but shares
+no runtime with `bot.py`.
+
+Built for terabyte-scale models (e.g. Kimi-K2.6 — ~0.6 TB, 64 shards, custom code):
+
+- **Diskless streaming.** Weights never land on local disk. `rclone copyurl`
+  streams each file source -> crypt-encrypt -> remote; only small config/header
+  bytes touch a temp dir. `rclone` owns the byte path; Python never moves weights.
+- **Verify before upload.** A completeness GATE — manifest-closure proven from
+  KB-sized safetensors header range-reads, plus identity/tokenizer/code-capture —
+  runs before any blob is uploaded, so a failed model stores nothing (exit 2). It
+  never executes repo code.
+- **Loadability is a recorded tier, not the gate.** Standard archs get a skeleton
+  key-match on the `meta` device; custom-code models get an AST structural check
+  (their Python is never run); the authoritative loader oracle is
+  `restore --smoke-test` on hardware that fits the bytes.
+- **One crypt key, client-side.** Two crypt remotes (ARCHIVE blobs, STANDARD
+  catalog+manifests) share one password+salt held only in a local mode-600
+  `rclone.conf`. The provider sees ciphertext and obscured names — nothing else.
+- **Catalog flips last.** `index/index.json` marks a backup `verified` only after
+  upload succeeds, so a crash never leaves a "done" lie; re-runs resume per file.
+
+CLI: `modelvault backup|restore|verify|list|doctor`. Provision the remotes (GCS or
+a local/removable `--local` target) with `ops/modelvault_provision.sh`. Recovery
+runbook + acceptance tests live in `docs/modelvault.md`.
+
+---
+
 ## Repo Map
 
 Use this to find where a concept lives. Treat it as a directory of starting
@@ -377,6 +411,8 @@ points; cross-references inside the code are reliable.
 | Deploy (production — git push, restart, smoke test) | `deploy.sh` |
 | Kill all processes (launchd-aware) | `kill.sh` |
 | launchd unit | `ops/com.you.voicebot.plist` |
+| Cold-backup vault (standalone CLI) | `src/modelvault/` (`modelvault` console script) |
+| Provision the vault remotes (GCS or local) | `ops/modelvault_provision.sh` |
 
 ### Layers
 
