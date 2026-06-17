@@ -4,7 +4,6 @@ __pycache__/
 *.pyc
 *.pyo
 data/
-restored/
 cursor_wrapper/node_modules/
 *.egg-info/
 dist/
