@@ -223,17 +223,73 @@ def _question_in_text(text: str) -> str | None:
     return None
 
 
-def _parse_jsonl_turns(lines: list[str]) -> tuple[str, str, list[str]]:
-    """Return (last_assistant_text, last_user_text, plan_file_paths_seen).
+# Tools whose use means "I am asking the user to make a decision RIGHT NOW."
+# This is the unambiguous decision signal — an agent that calls one of these has
+# stopped to wait for the user, which is exactly when Aria must ping. Real
+# questions are asked by CALLING this tool, not by writing a trailing '?': the
+# AskQuestion that slipped through silently was a tool_use whose prompt had a '?'
+# mid-text followed by declarative sentences, so `_question_in_text` never saw it.
+_ASK_TOOL_NAMES = {"askquestion", "askfollowupquestion", "askfollowup", "askuser"}
+
+
+def _normalize_tool_name(name: str) -> str:
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def _extract_ask_question(content: object) -> str | None:
+    """Return the prompt of an 'ask the user' tool call in an assistant turn.
+
+    Reads the `tool_use` block directly — the prose heuristic in
+    `_question_in_text` never inspects tool calls, which is why a tool-asked
+    decision was invisible and never pinged. The moment the agent emits the
+    ask we have the question text and surface it as a high-severity decision.
+    """
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if _normalize_tool_name(block.get("name", "")) not in _ASK_TOOL_NAMES:
+            continue
+        inp = block.get("input")
+        if not isinstance(inp, dict):
+            return "needs a decision (open Cursor)"
+        # AskQuestion shape: {"questions": [{"prompt": .., "options": [..]}], ..}
+        questions = inp.get("questions")
+        if isinstance(questions, list) and questions:
+            prompts: list[str] = []
+            for q in questions:
+                if isinstance(q, dict):
+                    pr = q.get("prompt") or q.get("question") or q.get("title")
+                    if isinstance(pr, str) and pr.strip():
+                        prompts.append(pr.strip())
+            if prompts:
+                extra = f" (+{len(prompts) - 1} more)" if len(prompts) > 1 else ""
+                return prompts[0][:400] + extra
+        # Simple shapes: {"question"/"prompt"/"title"/"message": ".."}
+        for key in ("question", "prompt", "title", "message"):
+            v = inp.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:400]
+        return "needs a decision (open Cursor)"
+    return None
+
+
+def _parse_jsonl_turns(
+    lines: list[str],
+) -> tuple[str, str, list[str], str | None]:
+    """Return (last_assistant_text, last_user_text, plan_file_paths, ask_question).
 
     `lines` is a list of raw JSONL lines (no trailing newlines). Plan files
-    are surfaced when Cursor's tool_use blocks reference them (best effort —
-    Cursor's plan-mode writes are captured separately by
-    `cursor_external.list_recent_plans`).
+    are surfaced when Cursor's tool_use blocks reference them. `ask_question`
+    is the prompt of the most recent 'ask the user' tool call (e.g.
+    `AskQuestion`) seen in an assistant turn, or None — the reliable decision
+    signal that the prose heuristic misses.
     """
     last_assistant = ""
     last_user = ""
     plans: list[str] = []
+    last_ask: str | None = None
     for line in lines:
         line = line.strip()
         if not line:
@@ -247,6 +303,10 @@ def _parse_jsonl_turns(lines: list[str]) -> tuple[str, str, list[str]]:
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
+        if role == "assistant":
+            aq = _extract_ask_question(content)
+            if aq:
+                last_ask = aq
         text_parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
@@ -269,7 +329,7 @@ def _parse_jsonl_turns(lines: list[str]) -> tuple[str, str, list[str]]:
                 last_assistant = joined
             elif role == "user":
                 last_user = joined
-    return last_assistant, last_user, plans
+    return last_assistant, last_user, plans, last_ask
 
 
 # ---------------------------------------------------------------------------
@@ -651,16 +711,19 @@ class CursorAgentRegistry:
                     if isinstance(b, dict) and b.get("type") == "text"
                 ]
                 joined = "\n".join(t for t in texts if isinstance(t, str)).strip()
-                if joined:
-                    agent.last_assistant_text = joined[: self._truncate_chars]
-                    sess.last_assistant_text = agent.last_assistant_text
-                    q = _question_in_text(joined)
+                ask_q = _extract_ask_question(content)
+                if joined or ask_q:
+                    if joined:
+                        agent.last_assistant_text = joined[: self._truncate_chars]
+                        sess.last_assistant_text = agent.last_assistant_text
+                    # Explicit ask-the-user tool call wins over the prose heuristic.
+                    q = ask_q or _question_in_text(joined)
                     agent.pending_question = q
                     if q:
                         kind, severity, reason = (
                             "question",
                             "high",
-                            f"{agent.project_label} asked: {q[:200]}",
+                            f"{agent.project_label} is asking: {q[:200]}",
                         )
                     else:
                         kind, severity, reason = (
@@ -783,21 +846,25 @@ class CursorAgentRegistry:
                         sess._tail_offset += len(new)
                         if new:
                             text_lines = new.decode("utf-8", errors="replace").splitlines()
-                            la, lu, plans = _parse_jsonl_turns(text_lines)
-                            if la:
+                            la, lu, plans, ask_q = _parse_jsonl_turns(text_lines)
+                            if la or ask_q:
                                 # The session that just produced output IS the
                                 # current one. Without this, concurrent threads
                                 # in one workspace clobber agent-level fields and
                                 # the narration can't say which thread spoke.
                                 agent.current_sid = sess.sid
-                                agent.last_assistant_text = la[: self._truncate_chars]
-                                sess.last_assistant_text = agent.last_assistant_text
-                                q = _question_in_text(la)
+                                if la:
+                                    agent.last_assistant_text = la[: self._truncate_chars]
+                                    sess.last_assistant_text = agent.last_assistant_text
+                                # An explicit ask-the-user tool call is the gold
+                                # decision signal and ALWAYS wins over the prose
+                                # heuristic (which only catches a trailing '?').
+                                q = ask_q or _question_in_text(la)
                                 agent.pending_question = q
                                 kind: EventKind = "question" if q else "progress"
                                 severity: Severity = "high" if q else "low"
                                 reason = (
-                                    f"{agent.project_label} asked: {q[:200]}"
+                                    f"{agent.project_label} is asking: {q[:200]}"
                                     if q
                                     else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
                                 )

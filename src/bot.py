@@ -2082,8 +2082,13 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     # ASKING a question — must reach Corbin's phone.
     await _safe_post(audit_line, silent=True)
 
-    if evt.kind not in ("finished", "completed", "errored", "question"):
-        # Progress / started: the silent stream is enough; no buzz.
+    if (
+        evt.kind not in ("finished", "completed", "errored", "question")
+        and evt.severity != "high"
+    ):
+        # Low-severity progress / subagent churn: the silent stream is enough.
+        # Any HIGH-severity event (incl. a constructed plan awaiting approval)
+        # is a decision and still buzzes below.
         return
 
     # Completions first try the richer "here's the next move — approve?"
