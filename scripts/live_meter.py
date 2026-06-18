@@ -133,7 +133,10 @@ async def run_meter(task: str, *, timeout_sec: float = 240.0) -> tuple[bool, str
     # round-trip, so None is fine; those are only used by other tool paths.
     tools.init_tools(None)
     init_memory()
-    session_key = "live_meter"
+    # A UNIQUE session per run: a reused key carries the prior run's findings
+    # ledger, so the loop answers "from the previous run's findings" without
+    # firing a tool — and the meter must exercise a REAL action every time.
+    session_key = f"live_meter:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
     result = await asyncio.wait_for(
         tools._do_with_claude(task, session_key=session_key), timeout=timeout_sec
     )
