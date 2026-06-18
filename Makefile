@@ -12,6 +12,7 @@ help:
 	@echo "  run          - kill prior bot, reinstall (editable), launch fresh"
 	@echo "  gate         - the one door to main: lints + structural absences + unit suite"
 	@echo "  meter        - the live-outcome meter: a real request on the trunk build (real API \$$)"
+	@echo "  eval-calibrate - calibrate the judge over the labeled corpus (real API \$$); gates Task done"
 	@echo "  preflight    - run capability preflight (same probes the bot runs at boot)"
 	@echo "  bootstrap    - one-command fresh-machine setup (venv, npm, MCP, OAuth, prompts)"
 	@echo "  kill         - kill any running bot processes"
@@ -39,6 +40,9 @@ gate:
 
 meter:
 	@$(PYTHON) scripts/live_meter.py
+
+eval-calibrate:
+	@$(PYTHON) -m src.judge_calibration
 
 preflight:
 	@$(PYTHON) -m src.preflight

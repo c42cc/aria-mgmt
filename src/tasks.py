@@ -42,10 +42,23 @@ _RUNNING: dict[int, asyncio.Task] = {}
 TaskNotifier = Callable[[int], Awaitable[None]]
 _notifier: Optional[TaskNotifier] = None
 
+# Optional done-gate: the CALIBRATED judge's verdict on a Task's result
+# (goal, result, session_key) -> (ok, reasons). Wired by bot.py (Step 6). When it
+# returns not-ok, a 'done' is downgraded to needs_you. None / refuse-to-trust
+# (uncalibrated judge) means the result is not gated — it advises, it never
+# silently fails a finished Task.
+DoneGate = Callable[[str, str, str], Awaitable[tuple[bool, list[str]]]]
+_done_gate: Optional[DoneGate] = None
+
 
 def set_notifier(fn: Optional[TaskNotifier]) -> None:
     global _notifier
     _notifier = fn
+
+
+def set_done_gate(fn: Optional[DoneGate]) -> None:
+    global _done_gate
+    _done_gate = fn
 
 
 def classify_engine_result(result: str) -> tuple[str, str, str]:
@@ -108,6 +121,20 @@ async def advance_task(task_id: int, engine: Engine) -> dict:
         raise
 
     status, transcript, ask = classify_engine_result(result)
+
+    # Gate the done claim with the calibrated judge: "done" is not done until a
+    # calibrated judge agrees. Refuse-to-trust — an uncalibrated/broken judge
+    # never fails a finished Task, it only advises (the gate returns ok).
+    if status == "done" and _done_gate is not None:
+        try:
+            ok, reasons = await _done_gate(task["goal"], result, session_key)
+        except Exception:
+            log.exception("task %d done-gate raised — leaving result unjudged", task_id)
+            ok, reasons = True, ["done-gate errored — left unjudged"]
+        if not ok:
+            status = "needs_you"
+            ask = "my own correctness check says this isn't right yet: " + "; ".join(reasons[:3])
+
     db.update_task(task_id, status=status, transcript=transcript, blocking_ask=ask)
     await _notify(task_id)
     return db.get_task(task_id)  # type: ignore[return-value]

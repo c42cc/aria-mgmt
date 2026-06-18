@@ -2035,6 +2035,39 @@ async def _notify_user_buzz(content: str) -> bool:
 _BUZZ_KINDS: tuple[str, ...] = ("finished", "completed", "errored", "question", "stalled")
 
 
+async def _task_done_gate(goal: str, result: str, session_key: str) -> tuple[bool, list[str]]:
+    """Gate a Task's done claim with the CALIBRATED judge (Step 6). Refuse-to-trust:
+    if the judge isn't calibrated for this build, it does NOT gate (the result is
+    left unjudged, never silently failed). If calibrated, a non-'correct' verdict
+    downgrades the Task to needs_you with the judge's reasons."""
+    from . import judge as _judge
+    from . import judge_calibration as _cal
+    from . import tools as _tools
+
+    if not _cal.is_calibrated():
+        return True, ["judge not calibrated for this build — left unjudged (run `make eval-calibrate`)"]
+
+    state = _tools._state_for(session_key)
+    trace = getattr(state, "last_tool_trace", None) or []
+    record = {
+        "tool_name": "do_with_claude",
+        "product": "agent",
+        "inputs_json": {"task": goal},
+        "outputs_json": {"result": result},
+        "context_json": {"tool_trace": trace},
+    }
+    spec = _judge.load_spec("agent")
+    if not spec:
+        return True, ["no agent correctness spec — left unjudged"]
+    try:
+        verdict = await _judge.evaluate(spec, record, "agent", f"task_gate:{session_key}")
+    except _judge.JudgeError as exc:
+        return True, [f"judge mechanism failure — left unjudged: {exc}"]
+    if verdict.verdict == "correct":
+        return True, verdict.reasons[:2]
+    return False, verdict.reasons[:3] or [f"judged {verdict.verdict}"]
+
+
 async def _notify_task_event(task_id: int) -> None:
     """Attention gate for Tasks (Primitive 1 -> Primitive 4). A Task reaching
     needs_you / done / failed is exactly when a chief of staff interrupts you;
@@ -2297,6 +2330,9 @@ async def on_ready():
             # The attention gate for Tasks: buzz when one reaches needs_you /
             # done / failed (the "walk away and trust the buzz" payoff).
             _tasks.set_notifier(_notify_task_event)
+            # Gate a Task's done claim with the calibrated judge (refuse-to-trust
+            # an uncalibrated judge — it advises, never silently fails).
+            _tasks.set_done_gate(_task_done_gate)
         except Exception:
             log.exception("task orphan reconcile / notifier wiring failed (non-fatal)")
         # Resume the conversation from the durable log of record so a restart
