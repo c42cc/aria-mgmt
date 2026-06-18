@@ -621,6 +621,95 @@ TOOL_DECLARATIONS = [
             required=["url"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="spark_cc_sync",
+        description=(
+            "Stand up or UPDATE the live_visuals_4 Claude Code workspace on a spark node — "
+            "rsync the repo + overlay the SAME .claude/.mcp.json control-plane we use on the "
+            "Mac + rebuild the venvs and node_modules. Idempotent ('just update it'). Takes a "
+            "few minutes; tell the user. Run before the first spark_run. It does NOT log claude "
+            "in — that is a one-time `claude /login` on the node (see spark_cc_auth)."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2' (default spark1)."),
+                "mirror": types.Schema(type="BOOLEAN", description="Pristine re-mirror (rsync --delete). Default false."),
+                "smoke_gate": types.Schema(type="BOOLEAN", description="Run the quality gate after bootstrap to record a baseline."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="spark_cc_auth",
+        description=(
+            "Check whether a spark node's claude is on the Max subscription. If not, tell the "
+            "user to run, once, in their own terminal: `ssh -t <node>` then `claude` and "
+            "`/login`. Use this before launching a run; set probe=true to confirm with a real "
+            "round-trip (spends a tiny bit)."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2' (default spark1)."),
+                "probe": types.Schema(type="BOOLEAN", description="Spend one tiny subscription call to confirm a live round-trip."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="spark_run",
+        description=(
+            "Executable: launch the forensic AUDIT + COLLAPSE run on a spark node as a detached "
+            "job that survives disconnects. It refreshes the collapse ledger, then performs the "
+            "collapses wave-by-wave on a new branch, running the quality gate after each wave. "
+            "Defaults to the audit reasoning policy: Opus 4.8, medium effort, no extended "
+            "thinking. Returns a run id right away and I watch it in the background, reporting "
+            "when it finishes — no need to stay connected. Requires spark_cc_sync done and the "
+            "node logged in. Consequential — offer via propose_action so Corbin taps to approve."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2' (default spark1)."),
+                "branch": types.Schema(type="STRING", description="Branch to create/use; default collapse/<date>."),
+                "mode": types.Schema(type="STRING", description="Claude permission mode: 'bypassPermissions' (default), 'acceptEdits', or 'plan'."),
+                "effort": types.Schema(type="STRING", description="Adaptive reasoning effort low/medium/high/xhigh/max; default medium for the audit."),
+                "extended_thinking": types.Schema(type="BOOLEAN", description="Enable extended thinking; default false for the audit."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="spark_run_status",
+        description=(
+            "Read-only check on a detached spark run (from spark_run): running or finished, exit "
+            "code, branch and commit count, the last thing it said / current tool, and notional "
+            "cost. Safe to call anytime; speak a short summary."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2' (default spark1)."),
+                "run_id": types.Schema(type="STRING", description="The run id from spark_run."),
+            },
+            required=["run_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="spark_run_fetch",
+        description=(
+            "Pull a finished spark run's results back to the Mac: the run log, the refreshed "
+            "ledger, and an importable git bundle of the collapse branch. Use once a run is done "
+            "to bring the work home so it can be pushed."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "node": types.Schema(type="STRING", description="'spark1' or 'spark2' (default spark1)."),
+                "run_id": types.Schema(type="STRING", description="The run id from spark_run."),
+                "branch": types.Schema(type="STRING", description="Branch to bundle; default = the run's current branch."),
+            },
+            required=["run_id"],
+        ),
+    ),
 ]
 
 TranscriptEntry = collections.namedtuple("TranscriptEntry", ["role", "text", "ts"])

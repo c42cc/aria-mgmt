@@ -29,6 +29,7 @@ import json
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -715,3 +716,322 @@ def verify(node: str, role: str | None = None, only: Iterable[str] | None = None
     }
     (out_dir / "acceptance.json").write_text(json.dumps(report, indent=2))
     return report
+
+
+# ===========================================================================
+# live_visuals_4 Claude Code workspace + headless run surface
+# ===========================================================================
+# Aria stands up the SAME Claude Code environment on a spark that the project
+# uses on the Mac (the live_visuals_4_CC control-plane), then dispatches the
+# forensic audit + collapse as a DETACHED tmux run and supervises it by polling
+# files over SSH. A dropped connection, a bot restart, or Aria going idle never
+# kills or loses the run — that is the robustness the live Discord stream lacks.
+#
+# The Mac-side orchestrator is ops/spark/setup_cc_workspace.sh; the run uses the
+# node's `claude` on the Max subscription with ANTHROPIC_API_KEY stripped from
+# the run env so the metered key can never shadow the subscription (mirrors the
+# billing guard in src/claude_code.py).
+
+AGI_ENV = REPO_ROOT.parent
+LV4_LOCAL = AGI_ENV / "live_visuals_4"
+SETUP_CC_SCRIPT = REPO_ROOT / "ops" / "spark" / "setup_cc_workspace.sh"
+REMOTE_WORKSPACE = "live_visuals_4"            # under the node user's $HOME
+REMOTE_RUNS = ".cache/spark_cc_runs"           # under the node user's $HOME
+REMOTE_CREDS = ".claude/.credentials.json"     # subscription OAuth (Linux home)
+LOCAL_RUN_ARTIFACTS = REPO_ROOT / "data" / "spark" / "runs"
+LEDGER_NAME = "TODO_GO_FORWARD_FORENSIC_AUDIT_COLLAPSE_LEDGER.md"
+DEFAULT_AUDIT_INSTRUCTION = REPO_ROOT / "ops" / "spark" / "audit_collapse_instruction.md"
+DEFAULT_RUN_MODE = "bypassPermissions"
+_VALID_MODES = ("plan", "default", "acceptEdits", "bypassPermissions")
+
+# Model + reasoning policy.
+#   - The node's *interactive/default* claude is Opus 4.8 at MAX effort (set in
+#     the committed .claude/settings.json + ~/.bashrc by setup_cc_workspace.sh).
+#   - The forensic-audit RUN intentionally differs: Opus 4.8 at MEDIUM effort
+#     with NO extended thinking (MAX_THINKING_TOKENS=0 disables thinking even on
+#     4.8, where effort otherwise drives reasoning depth).
+AUDIT_MODEL = "claude-opus-4-8"
+AUDIT_EFFORT = "medium"
+AUDIT_EXTENDED_THINKING = False
+_VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _new_run_id() -> str:
+    return time.strftime("cc_%Y%m%dT%H%M%S")
+
+
+def _ssh_put(node: str, rel_path: str, content: str, *, executable: bool = False,
+             timeout: float = 60.0) -> None:
+    """Write `content` to ~/rel_path on the node (creating parent dirs). The path
+    is relative to the node user's $HOME (ssh's default cwd)."""
+    parent = os.path.dirname(rel_path)
+    pre = f"mkdir -p {shlex.quote(parent)} && " if parent else ""
+    p = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", node,
+         f"{pre}cat > {shlex.quote(rel_path)}"],
+        input=content, capture_output=True, text=True, timeout=timeout,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"could not write ~/{rel_path} on {node}: {p.stderr.strip()}")
+    if executable:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", node, f"chmod +x {shlex.quote(rel_path)}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+
+def sync_workspace(node: str, *, mirror: bool = False, skip_bootstrap: bool = False,
+                   smoke_gate: bool = False, timeout: float = 2400.0) -> dict:
+    """Stand up / update the live_visuals_4 CC workspace on the node via
+    ops/spark/setup_cc_workspace.sh (rsync repo + overlay control-plane +
+    bootstrap). Loud on failure; never sets ANTHROPIC_API_KEY."""
+    alias, _ip, _role = resolve_node(node)
+    if not SETUP_CC_SCRIPT.exists():
+        raise RuntimeError(f"missing {SETUP_CC_SCRIPT}")
+    if not (LV4_LOCAL / ".git").is_dir():
+        raise RuntimeError(f"live_visuals_4 checkout not found at {LV4_LOCAL}")
+    env = dict(os.environ)
+    if skip_bootstrap:
+        env["SKIP_BOOTSTRAP"] = "1"
+    if smoke_gate:
+        env["SMOKE_GATE"] = "1"
+    args = ["bash", str(SETUP_CC_SCRIPT), alias]
+    if mirror:
+        args.append("--mirror")
+    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    tail = (p.stdout or "")[-2000:]
+    if p.returncode != 0:
+        return {"ok": False, "node": alias, "error": "setup_cc_workspace.sh failed",
+                "detail": ((p.stderr or "") + tail).strip()[-1500:]}
+    return {"ok": True, "node": alias, "detail": tail.strip()}
+
+
+def cc_auth_status(node: str, *, probe: bool = False, timeout: float = 60.0) -> dict:
+    """Is the node's claude authenticated on the Max subscription? Cheap check =
+    the OAuth creds file exists and no metered key leaks into the login env.
+    `probe=True` spends one tiny subscription call to confirm a live round-trip."""
+    alias, _ip, _role = resolve_node(node)
+    cmd = (f'test -f "$HOME/{REMOTE_CREDS}" && echo HAS_CREDS || echo NO_CREDS; '
+           r'printf "KEYENV=%s\n" "${ANTHROPIC_API_KEY:+set}"')
+    out, _rc = ssh_probe(alias, cmd, timeout=timeout)
+    has_creds = "HAS_CREDS" in out
+    key_in_env = "KEYENV=set" in out
+    result = {"node": alias, "has_oauth_creds": has_creds, "key_in_login_env": key_in_env}
+    if probe:
+        pout, prc = ssh_probe(
+            alias, 'env -u ANTHROPIC_API_KEY claude -p "Reply with exactly: OK"',
+            timeout=max(timeout, 90),
+        )
+        ok = prc == 0 and re.search(r"\bok\b", pout.strip(), re.IGNORECASE) is not None
+        result["subscription_ok"] = bool(ok)
+        result["probe_detail"] = pout.strip()[:200]
+        result["ok"] = bool(ok)
+    else:
+        result["ok"] = has_creds
+    return result
+
+
+_RUNNER_TEMPLATE = """#!/usr/bin/env bash
+# Detached Claude Code run launched by src/spark.py::run_audit. Survives SSH
+# drops (tmux); writes stream-json to run.log; ANTHROPIC_API_KEY stripped so the
+# Max subscription is used (never the metered key).
+set -uo pipefail
+source "$HOME/.config/spark/env.sh" 2>/dev/null || true
+# Pin reasoning HERE: this runner is non-interactive (it does NOT source
+# ~/.bashrc), so the node's interactive 'max effort' default never applies. The
+# CLAUDE_CODE_EFFORT_LEVEL env var beats the --effort flag, so we set it for
+# determinism; {thinking_label} extended thinking.
+export CLAUDE_CODE_EFFORT_LEVEL="{effort}"
+{thinking_export}
+RUNDIR="$HOME/{runs}/{run_id}"
+mkdir -p "$RUNDIR"
+cd "$HOME/{workspace}" || {{ echo "FATAL: no workspace $HOME/{workspace}" > "$RUNDIR/run.log"; echo 127 > "$RUNDIR/rc"; touch "$RUNDIR/DONE"; exit 127; }}
+git switch "{branch}" 2>/dev/null || git switch -c "{branch}" 2>/dev/null || git checkout -b "{branch}" 2>/dev/null || true
+{{ echo "[runner] $(date -Is) model={model} effort={effort} thinking={thinking_label} branch=$(git branch --show-current) head=$(git rev-parse --short HEAD)"; }} >> "$RUNDIR/meta.txt"
+env -u ANTHROPIC_API_KEY claude -p "$(cat "$RUNDIR/instruction.md")" \\
+  --model {model} --permission-mode {mode} --output-format stream-json --verbose \\
+  >> "$RUNDIR/run.log" 2>&1
+echo $? > "$RUNDIR/rc"
+touch "$RUNDIR/DONE"
+"""
+
+
+def run_audit(node: str, instruction: str, *, branch: str | None = None,
+              mode: str = DEFAULT_RUN_MODE, run_id: str | None = None,
+              model: str = AUDIT_MODEL, effort: str = AUDIT_EFFORT,
+              extended_thinking: bool = AUDIT_EXTENDED_THINKING,
+              force_unauthed: bool = False) -> dict:
+    """Launch a detached, disconnection-proof Claude Code run on the node: write
+    the instruction + a runner into ~/REMOTE_RUNS/<run_id>/, ensure a fresh
+    branch, and start `claude -p` in a detached tmux session that streams
+    stream-json to run.log and touches a DONE sentinel. Returns immediately.
+
+    Model/reasoning default to the audit policy (Opus 4.8, medium effort, no
+    extended thinking); override per-run if needed."""
+    alias, _ip, _role = resolve_node(node)
+    run_id = run_id or _new_run_id()
+    branch = branch or f"collapse/{time.strftime('%Y%m%d-%H%M%S')}"
+    if mode not in _VALID_MODES:
+        raise ValueError(f"bad permission mode {mode!r} (one of {_VALID_MODES})")
+    if effort not in _VALID_EFFORTS:
+        raise ValueError(f"bad effort {effort!r} (one of {_VALID_EFFORTS})")
+    if not instruction.strip():
+        raise ValueError("instruction is required")
+
+    # Refuse to launch a run that would immediately fail auth (loud, not silent).
+    auth = cc_auth_status(alias)
+    if not auth.get("has_oauth_creds") and not force_unauthed:
+        return {"ok": False, "node": alias,
+                "error": f"node claude is not subscription-authed (~/{REMOTE_CREDS} "
+                         f"missing). Run `ssh -t {alias}` then `claude` -> `/login`, "
+                         "then retry. (force_unauthed=True launches anyway.)"}
+
+    thinking_export = ("export MAX_THINKING_TOKENS=0" if not extended_thinking
+                       else "# extended thinking enabled (effort drives depth on Opus 4.8)")
+    thinking_label = "NO" if not extended_thinking else "WITH"
+
+    rundir_rel = f"{REMOTE_RUNS}/{run_id}"
+    _ssh_put(alias, f"{rundir_rel}/instruction.md", instruction)
+    runner = _RUNNER_TEMPLATE.format(
+        runs=REMOTE_RUNS, run_id=run_id, workspace=REMOTE_WORKSPACE, branch=branch,
+        mode=mode, model=model, effort=effort,
+        thinking_export=thinking_export, thinking_label=thinking_label,
+    )
+    _ssh_put(alias, f"{rundir_rel}/run.sh", runner, executable=True)
+
+    launch = (f"tmux new-session -d -s {shlex.quote(run_id)} "
+              f'"bash $HOME/{rundir_rel}/run.sh"')
+    out, rc = ssh_probe(alias, launch, timeout=30)
+    if rc != 0:
+        return {"ok": False, "node": alias, "run_id": run_id,
+                "error": f"tmux launch failed (rc={rc})", "detail": out.strip()[:400]}
+    return {"ok": True, "node": alias, "run_id": run_id, "branch": branch, "mode": mode,
+            "model": model, "effort": effort, "extended_thinking": extended_thinking,
+            "tmux_session": run_id, "rundir": f"~/{rundir_rel}",
+            "log": f"~/{rundir_rel}/run.log",
+            "note": "detached tmux run started; poll with run_status(node, run_id)."}
+
+
+def _parse_stream_json(log_text: str) -> dict:
+    """Pull the human-relevant signal out of a claude stream-json log tail."""
+    last_assistant = ""
+    last_tool = ""
+    result: dict = {}
+    n_assistant = 0
+    for raw in log_text.splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        t = ev.get("type")
+        if t == "assistant":
+            for blk in (ev.get("message", {}) or {}).get("content", []) or []:
+                if blk.get("type") == "text" and blk.get("text", "").strip():
+                    last_assistant = blk["text"].strip()
+                    n_assistant += 1
+                elif blk.get("type") == "tool_use":
+                    name = blk.get("name", "")
+                    inp = blk.get("input", {})
+                    last_tool = (f"Bash: {str(inp.get('command', ''))[:160]}"
+                                 if name == "Bash" else f"{name}: {str(inp)[:120]}")
+        elif t == "result":
+            result = {
+                "subtype": ev.get("subtype", ""),
+                "is_error": bool(ev.get("is_error", False)),
+                "cost_usd": ev.get("total_cost_usd"),
+                "num_turns": ev.get("num_turns"),
+            }
+    return {"last_assistant": last_assistant[:1200], "last_tool": last_tool,
+            "n_assistant_turns": n_assistant, "result": result}
+
+
+def run_status(node: str, run_id: str, *, timeout: float = 45.0) -> dict:
+    """Poll a detached run over SSH (decoupled from any live stream): tmux
+    liveness, the DONE sentinel + exit code, branch/commit progress, the parsed
+    last assistant turn / current tool, and notional cost."""
+    alias, _ip, _role = resolve_node(node)
+    rundir = f"{REMOTE_RUNS}/{run_id}"
+    cmd = (
+        f"echo '##alive'; tmux has-session -t {shlex.quote(run_id)} 2>/dev/null && echo yes || echo no; "
+        f"echo '##done'; test -f \"$HOME/{rundir}/DONE\" && echo yes || echo no; "
+        f"echo '##rc'; cat \"$HOME/{rundir}/rc\" 2>/dev/null; "
+        f"echo '##git'; (cd \"$HOME/{REMOTE_WORKSPACE}\" 2>/dev/null && "
+        f"git branch --show-current 2>/dev/null && git rev-parse --short HEAD 2>/dev/null && "
+        f"git rev-list --count main..HEAD 2>/dev/null); "
+        f"echo '##logtail'; tail -c 200000 \"$HOME/{rundir}/run.log\" 2>/dev/null"
+    )
+    out, rc = ssh_probe(alias, cmd, timeout=timeout)
+    sec = _split_sections(out)
+    alive = (sec.get("alive", ["no"])[0].strip() == "yes") if sec.get("alive") else False
+    done = (sec.get("done", ["no"])[0].strip() == "yes") if sec.get("done") else False
+    rc_lines = [l for l in sec.get("rc", []) if l.strip()]
+    exit_code = int(rc_lines[0]) if rc_lines and rc_lines[0].strip().lstrip("-").isdigit() else None
+    git_lines = [l for l in sec.get("git", []) if l.strip()]
+    branch = git_lines[0].strip() if len(git_lines) > 0 else ""
+    head = git_lines[1].strip() if len(git_lines) > 1 else ""
+    commits = git_lines[2].strip() if len(git_lines) > 2 else ""
+    parsed = _parse_stream_json("\n".join(sec.get("logtail", [])))
+    state = "running" if (alive and not done) else ("finished" if done else "unknown")
+    return {
+        "node": alias, "run_id": run_id, "state": state,
+        "running": alive, "done": done, "exit_code": exit_code,
+        "branch": branch, "head_commit": head, "commits_on_branch": commits,
+        "last_assistant": parsed["last_assistant"], "last_tool": parsed["last_tool"],
+        "assistant_turns": parsed["n_assistant_turns"], "result": parsed["result"],
+        "ssh_rc": rc,
+    }
+
+
+def fetch_results(node: str, run_id: str, *, branch: str | None = None,
+                  timeout: float = 600.0) -> dict:
+    """Pull a finished run's artifacts back to the Mac: the run log, the refreshed
+    ledger, and an incremental git bundle of the collapse branch (importable into
+    the local live_visuals_4 with `git fetch <bundle> <branch>:<branch>`)."""
+    alias, _ip, _role = resolve_node(node)
+    rundir = f"{REMOTE_RUNS}/{run_id}"
+    local_dir = LOCAL_RUN_ARTIFACTS / alias / run_id
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    if not branch:
+        bout, _ = ssh_probe(alias, f'cd "$HOME/{REMOTE_WORKSPACE}" && git branch --show-current', timeout=30)
+        lines = [l for l in bout.strip().splitlines() if l.strip()]
+        branch = lines[-1].strip() if lines else ""
+
+    artifacts: dict = {"node": alias, "run_id": run_id, "branch": branch,
+                       "local_dir": str(local_dir), "fetched": []}
+
+    bundle_ok = False
+    if branch and branch != "main":
+        bcmd = (f'cd "$HOME/{REMOTE_WORKSPACE}" && '
+                f'git bundle create "$HOME/{rundir}/collapse.bundle" {shlex.quote(branch)} --not main 2>&1 '
+                f'|| git bundle create "$HOME/{rundir}/collapse.bundle" {shlex.quote(branch)} 2>&1')
+        bout, brc = ssh_probe(alias, bcmd, timeout=180)
+        bundle_ok = brc == 0
+        artifacts["bundle_detail"] = bout.strip()[-300:]
+
+    def _pull(remote_rel: str, dest_name: str | None = None) -> bool:
+        dest = str(local_dir / (dest_name or os.path.basename(remote_rel)))
+        p = subprocess.run(
+            ["rsync", "-az", "-e", "ssh -o BatchMode=yes", f"{alias}:{remote_rel}", dest],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return p.returncode == 0
+
+    if _pull(f"{rundir}/run.log"):
+        artifacts["fetched"].append("run.log")
+    if _pull(f"{rundir}/rc"):
+        artifacts["fetched"].append("rc")
+    if bundle_ok and _pull(f"{rundir}/collapse.bundle"):
+        artifacts["fetched"].append("collapse.bundle")
+        artifacts["bundle_path"] = str(local_dir / "collapse.bundle")
+    if _pull(f"{REMOTE_WORKSPACE}/{LEDGER_NAME}", LEDGER_NAME):
+        artifacts["fetched"].append(LEDGER_NAME)
+
+    if artifacts.get("bundle_path"):
+        artifacts["import_hint"] = (
+            f"git -C {LV4_LOCAL} fetch {artifacts['bundle_path']} {branch}:{branch} "
+            f"&& git -C {LV4_LOCAL} push origin {branch}")
+    return artifacts
