@@ -783,6 +783,10 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "query_cursor": _query_cursor,
         "cursor_status": _cursor_status_new,
         "do_with_claude": _do_with_claude,
+        # Durable, backgroundable Tasks (Primitive 1): start one and walk away;
+        # read it back later from the Task object, not the chat.
+        "start_task": _start_task,
+        "task_status": _task_status,
         "create_42c_account": _create_42c_account,
         "propose_action": _propose_action,
         "ask_user": _ask_user_tool,
@@ -856,6 +860,10 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "propose_action",
         # Posts a question + blocks for a reply; spends nothing itself.
         "ask_user",
+        # Starting a Task just persists a row + spawns a background runner (which
+        # pays its own spend when it runs); reading a Task is free. Must stay
+        # usable at the cap so "start this and walk away" / "how's X?" always work.
+        "start_task", "task_status",
         # Spark ops/diagnostics must stay usable even at the daily cap: status
         # is read-only, setup spends nothing on our API, and verify only spends
         # a few cents on Gemini visual checks. Operability beats the gate here.
@@ -2562,6 +2570,51 @@ async def _do_with_claude(
     lock = _agent_lock_for(session_key or "global")
     async with lock:
         return await _do_with_claude_loop(task, session_key)
+
+
+async def _start_task(goal: str = "", session_key: str = "") -> str:
+    """Start a durable, backgroundable Task (Primitive 1). The agent loop advances
+    it out-of-band, so the user can walk away. Returns immediately with the id;
+    the Task outlives this voice session and is checked via task_status."""
+    from . import tasks
+
+    goal = (goal or "").strip()
+    if not goal:
+        return json.dumps({"error": "start_task needs a goal"})
+
+    async def _engine(g: str, sk: str) -> str:
+        return await _do_with_claude(g, session_key=sk)
+
+    task_id = tasks.start_task(goal, _engine, session_key=session_key)
+    return (
+        f"Started task #{task_id}: {goal[:120]}. I'll work on it in the background "
+        f"and ping you when it's done or if I hit a wall. "
+        f'Ask "how\'s task {task_id}?" anytime.'
+    )
+
+
+async def _task_status(task_id: str = "", session_key: str = "") -> str:
+    """Read a durable Task — how "how's X going?" is answered, from the Task
+    object, not the chat. With no id, reports active tasks (or the most recent)."""
+    from . import tasks
+    from .db import get_task, latest_task, list_tasks
+
+    if task_id:
+        try:
+            t = get_task(int(str(task_id).lstrip("#").strip()))
+        except (TypeError, ValueError):
+            t = None
+        if not t:
+            return json.dumps({"error": f"no task {task_id}"})
+        summary = tasks.task_summary(t)
+        body = (t.get("transcript") or "").strip()
+        return f"{summary}\n\n{body}" if body else summary
+
+    active = list_tasks(statuses=("queued", "running", "needs_you"), limit=10)
+    if active:
+        return "Active tasks:\n" + "\n".join(tasks.task_summary(t) for t in active)
+    t = latest_task()
+    return tasks.task_summary(t) if t else "No tasks yet."
 
 
 async def _do_with_claude_loop(

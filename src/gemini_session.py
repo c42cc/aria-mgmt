@@ -131,6 +131,41 @@ TOOL_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="start_task",
+        description=(
+            "Start a DURABLE BACKGROUND task and let Corbin walk away. Use when he "
+            "says 'do X in the background', 'work on this while I'm gone', 'kick off "
+            "X', or for any longer job he doesn't want to wait on the line for. It "
+            "returns immediately with a task number; the work continues out-of-band "
+            "and outlives this call. I ping him when it finishes or hits a wall. For "
+            "a quick thing he's waiting on right now, use do_with_claude instead."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "goal": types.Schema(type="STRING", description="What the task should accomplish, in natural language."),
+                "session_key": types.Schema(type="STRING", description="Discord thread ID."),
+            },
+            required=["goal"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="task_status",
+        description=(
+            "Check on a durable task — answers 'how's X going?', 'is that done "
+            "yet?', 'what's the status of task 4?'. Reads the task object directly "
+            "(not the chat), so it works even if the task was started in another "
+            "session. With no id, reports the active tasks (or the most recent)."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "task_id": types.Schema(type="STRING", description="The task number to check; omit for active/most-recent."),
+                "session_key": types.Schema(type="STRING", description="Discord thread ID."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
         name="create_42c_account",
         description="Create a login account on the 42c.pw website (shared HTTP Basic Auth) so someone can see what Corbin is working on. Adds the credential and redeploys so it goes live (~1-2 min), then returns the login URL plus the username and password to share. Use only for a standalone 'make an account for X' request; for 'make an account AND text them', route to do_with_claude instead so it does both.",
         parameters=types.Schema(

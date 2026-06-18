@@ -158,6 +158,27 @@ CREATE TABLE IF NOT EXISTS loop_findings (
     updated_at  TEXT NOT NULL
 );
 
+-- The Task (Primitive 1): a durable, backgroundable unit of work that OUTLIVES
+-- the voice session and the agent loop. Aria held a conversation; when you left,
+-- the work left with it. A Task persists {goal, status, transcript, artifacts,
+-- blocking_ask, build_hash}; "how's X going?" reads this row, not the chat. The
+-- agent loop is the ENGINE that advances a Task: status moves
+-- queued -> running -> {done | needs_you | failed}. build_hash keys the work to
+-- the build it ran on. A playbook is, definitionally, an ordered list of Tasks.
+CREATE TABLE IF NOT EXISTS tasks (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'queued',
+    transcript   TEXT NOT NULL DEFAULT '',
+    artifacts    TEXT NOT NULL DEFAULT '',
+    blocking_ask TEXT NOT NULL DEFAULT '',
+    build_hash   TEXT,
+    session_key  TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, id);
+
 -- Conversation log of record (Primitive 3). One append-only row per turn —
 -- user, Aria, alert, cursor event — across every transport. This is the
 -- durable source of truth the in-memory ConversationBuffer caches; it exists
@@ -788,6 +809,104 @@ def get_correctness_summary(hours: int = 24) -> dict[str, dict[str, Any]]:
         total = summary[p]["total"]
         summary[p]["correctness_rate"] = summary[p]["correct"] / total if total else 0.0
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Tasks (Primitive 1) — the durable, backgroundable unit of work.
+# ---------------------------------------------------------------------------
+
+TASK_STATUSES = ("queued", "running", "needs_you", "done", "failed")
+_TASK_TERMINAL = ("done", "failed")
+_TASK_ACTIVE = ("queued", "running")
+
+
+def create_task(goal: str, *, session_key: str = "", build_hash: str = "") -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO tasks (goal, status, build_hash, session_key, created_at, updated_at) "
+            "VALUES (?, 'queued', ?, ?, ?, ?)",
+            (goal, build_hash or None, session_key or None, _now(), _now()),
+        )
+        return int(cur.lastrowid)
+
+
+def update_task(
+    task_id: int,
+    *,
+    status: str | None = None,
+    transcript: str | None = None,
+    artifacts: str | None = None,
+    blocking_ask: str | None = None,
+) -> None:
+    sets: list[str] = []
+    vals: list[Any] = []
+    if status is not None:
+        if status not in TASK_STATUSES:
+            raise ValueError(f"invalid task status {status!r} (one of {TASK_STATUSES})")
+        sets.append("status = ?")
+        vals.append(status)
+    if transcript is not None:
+        sets.append("transcript = ?")
+        vals.append(transcript)
+    if artifacts is not None:
+        sets.append("artifacts = ?")
+        vals.append(artifacts)
+    if blocking_ask is not None:
+        sets.append("blocking_ask = ?")
+        vals.append(blocking_ask)
+    if not sets:
+        return
+    sets.append("updated_at = ?")
+    vals.append(_now())
+    vals.append(task_id)
+    with get_connection() as conn:
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
+
+
+def get_task(task_id: int) -> dict[str, Any] | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_tasks(*, statuses: tuple[str, ...] | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    q = "SELECT * FROM tasks"
+    vals: list[Any] = []
+    if statuses:
+        q += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
+        vals.extend(statuses)
+    q += " ORDER BY id DESC LIMIT ?"
+    vals.append(limit)
+    with get_connection() as conn:
+        rows = conn.execute(q, vals).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_task() -> dict[str, Any] | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def reconcile_orphaned_tasks() -> int:
+    """A Task left 'running'/'queued' by a process that died (restart) can never
+    advance itself again — its in-process runner is gone. Mark each as needs_you
+    (interrupted), never silently leave it 'running' forever. Returns the count.
+    The work itself is not auto-resumed (that could double side effects); the
+    user says 'resume' and a fresh Task is started. Honest, not silent."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('running','queued')"
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        for tid in ids:
+            conn.execute(
+                "UPDATE tasks SET status='needs_you', "
+                "blocking_ask=?, updated_at=? WHERE id=?",
+                ("I was interrupted by a restart — say 'resume <id>' and I'll start it again",
+                 _now(), tid),
+            )
+    return len(ids)
 
 
 # ---------------------------------------------------------------------------

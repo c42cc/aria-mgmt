@@ -2221,6 +2221,14 @@ async def on_ready():
 
     if not _on_ready_done:
         init_db()
+        # A Task left mid-flight by the process this restart replaced can never
+        # advance itself again — mark it needs_you (interrupted), never silently
+        # stuck 'running' (Primitive 1).
+        try:
+            from . import tasks as _tasks
+            _tasks.reconcile_orphaned_on_boot()
+        except Exception:
+            log.exception("task orphan reconcile failed (non-fatal)")
         # Resume the conversation from the durable log of record so a restart
         # no longer starts blank (Primitive 3). Idempotent: only fills an empty
         # buffer, never duplicates live turns; best-effort so it can't block boot.
