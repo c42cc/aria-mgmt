@@ -131,7 +131,13 @@ async def calibrate() -> dict:
 
     results: list[dict] = []
     for e in entries:
-        verdict = await judge.evaluate(spec, e["record"], corpus["product"], f"cal:{e['id']}")
+        # use_anchors=False: the corpus is synthetic; anchors query LIVE sources
+        # and would floor a fabricated fixture against unrelated live reality.
+        # Calibration earns trust in the LLM verdict; the anchor floor is
+        # deterministic ground-truth for real sessions and needs no calibration.
+        verdict = await judge.evaluate(
+            spec, e["record"], corpus["product"], f"cal:{e['id']}", use_anchors=False
+        )
         results.append({
             "id": e["id"],
             "label": e["label"],

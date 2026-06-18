@@ -124,9 +124,15 @@ async def run_meter(task: str, *, timeout_sec: float = 240.0) -> tuple[bool, str
     """Run one real request through the live build. Returns (ok, result, tool_fired).
     Loud: an exception in the fleet or the loop propagates."""
     from src.mcp import init_mcp
+    from src.memory import init_memory
     from src import tools
 
     await init_mcp()
+    # Initialize the same tool deps the bot does (the Anthropic client + mem0).
+    # The meter has no cursor bridge or callbacks — its task is a read-only MCP
+    # round-trip, so None is fine; those are only used by other tool paths.
+    tools.init_tools(None)
+    init_memory()
     session_key = "live_meter"
     result = await asyncio.wait_for(
         tools._do_with_claude(task, session_key=session_key), timeout=timeout_sec
@@ -180,7 +186,12 @@ async def _amain(task: str, allow_nontrunk: bool) -> int:
     print(f"live_meter: verdict={receipt['verdict']} — {reason}")
     print(f"live_meter: receipt -> {path}")
     print(f"\n--- result ---\n{(result or '').strip()[:800]}\n--------------")
-    return 0 if ok else 1
+    # The MCP fleet's stdio teardown raises a benign cross-task cancel-scope
+    # error on loop close AFTER the verdict + receipt are done; hard-exit so that
+    # teardown noise can't mask the real exit code. The receipt is the truth.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0 if ok else 1)
 
 
 def main() -> int:

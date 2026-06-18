@@ -310,7 +310,8 @@ def _save_snapshot(session_id: str, reports: list[dict]) -> None:
 
 
 async def evaluate(
-    spec: str, record: dict[str, Any], product: str, session_id: str
+    spec: str, record: dict[str, Any], product: str, session_id: str,
+    *, use_anchors: bool = True,
 ) -> Verdict:
     """Correctness judge with deterministic anchor floor.
 
@@ -318,26 +319,35 @@ async def evaluate(
     2. Compute anchor floor = worst(all anchor binaries).
     3. Run LLM judge with anchor facts injected into the prompt.
     4. Apply floor rule: final = min(anchor_floor, llm_verdict).
+
+    `use_anchors=False` calibrates the LLM judge ALONE over a synthetic corpus:
+    anchors re-query LIVE sources (real Gmail/Calendar), so flooring a fabricated
+    fixture against live reality is meaningless. The anchor floor is deterministic
+    ground-truth for REAL sessions and needs no calibration; what calibration
+    earns is trust in the LLM verdict.
     """
     from google import genai
     from .anchors.base import verdict_min
 
-    anchor_reports = await _run_anchors(record)
-    _save_snapshot(session_id, anchor_reports)
-
-    # Anchor floor: worst-binary verdict across all verified anchor reports.
-    # `None` means we have no verified anchors (every one was unreachable),
-    # in which case `evaluate()` falls through to the LLM verdict only.
-    verified = [r for r in anchor_reports if not r.get("unverified")]
-    if verified:
-        from .anchors.base import VERDICT_RANK
-        worst = "correct"
-        for r in verified:
-            b = r.get("binary", "correct")
-            if VERDICT_RANK.get(b, 0) < VERDICT_RANK.get(worst, 0):
-                worst = b
-        anchor_floor = worst
+    if use_anchors:
+        anchor_reports = await _run_anchors(record)
+        _save_snapshot(session_id, anchor_reports)
+        # Anchor floor: worst-binary verdict across all verified anchor reports.
+        # `None` means we have no verified anchors (every one was unreachable),
+        # in which case `evaluate()` falls through to the LLM verdict only.
+        verified = [r for r in anchor_reports if not r.get("unverified")]
+        if verified:
+            from .anchors.base import VERDICT_RANK
+            worst = "correct"
+            for r in verified:
+                b = r.get("binary", "correct")
+                if VERDICT_RANK.get(b, 0) < VERDICT_RANK.get(worst, 0):
+                    worst = b
+            anchor_floor = worst
+        else:
+            anchor_floor = None
     else:
+        anchor_reports = []
         anchor_floor = None
 
     record_text = _serialize_record(record)
