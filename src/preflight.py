@@ -497,6 +497,18 @@ async def probe_anchor_smoke() -> tuple[bool, str, str, str]:
     summary = ", ".join(f"{k}={v}" for k, v in results.items())
     if not healthy:
         return False, "no anchor deps reachable", "", summary
+    if len(healthy) < len(anchors):
+        # Honest: partial anchor health is a DEGRADED warning, not a green pass.
+        # The old code returned ok=True at >=1/N, so "2/4 anchors" showed as
+        # PASSED and the judge's deterministic floor was silently weakened.
+        down = ", ".join(f"{k}={v}" for k, v in results.items() if v != "ok")
+        return (
+            False,
+            f"{len(anchors) - len(healthy)}/{len(anchors)} anchor deps degraded ({down}) — "
+            "judge floor partially disabled",
+            "",
+            f"{len(healthy)}/{len(anchors)} anchors: {summary}",
+        )
     return True, "", "", f"{len(healthy)}/{len(anchors)} anchors: {summary}"
 
 
@@ -1345,9 +1357,11 @@ def format_summary(report: PreflightReport, *, markdown: bool = True) -> str:
     if not warns:
         return f"{bold}Preflight OK{bold} \u2014 {passed}/{total} checks passed."
     names = ", ".join((f"`{w.name}`" if markdown else w.name) for w in warns)
+    # Never claim "OK" when something is degraded — a green that hides dead
+    # capabilities is exactly the lie this fixes. Lead with the degradation.
     return (
-        f"{bold}Preflight OK{bold} \u2014 {passed}/{total} passed, "
-        f"{len(warns)} warning(s): {names}. (full detail in logs)"
+        f"{bold}Preflight READY, {len(warns)} DEGRADED{bold} \u2014 {passed}/{total} passed; "
+        f"degraded: {names}. Not all-clear (full detail in logs)."
     )
 
 

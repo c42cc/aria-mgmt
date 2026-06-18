@@ -781,7 +781,7 @@ def get_correctness_summary(hours: int = 24) -> dict[str, dict[str, Any]]:
     for r in rows:
         p = r["product"]
         if p not in summary:
-            summary[p] = {"total": 0, "correct": 0, "degraded": 0, "failed": 0}
+            summary[p] = {"total": 0, "correct": 0, "degraded": 0, "failed": 0, "unverified": 0}
         summary[p][r["verdict"]] = r["cnt"]
         summary[p]["total"] += r["cnt"]
     for p in summary:
