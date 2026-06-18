@@ -800,6 +800,12 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "spark_status": _spark_status,
         "spark_verify": _spark_verify,
         "spark_setup": _spark_setup,
+        # DGX Spark Claude Code workspace + headless audit/collapse runs.
+        "spark_cc_sync": _spark_cc_sync,
+        "spark_cc_auth": _spark_cc_auth,
+        "spark_run": _spark_run,
+        "spark_run_status": _spark_run_status,
+        "spark_run_fetch": _spark_run_fetch,
     }
     handler = handlers.get(name)
     if not handler:
@@ -828,6 +834,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # is read-only, setup spends nothing on our API, and verify only spends
         # a few cents on Gemini visual checks. Operability beats the gate here.
         "spark_status", "spark_verify", "spark_setup",
+        # Spark Claude Code runs bill the Max subscription (not our real-API
+        # daily $ cap), and sync/auth/status/fetch spend nothing on our API.
+        "spark_cc_sync", "spark_cc_auth", "spark_run", "spark_run_status", "spark_run_fetch",
     )
     if spend >= config.daily_spend_cap_usd and name not in _free_tools:
         return json.dumps({"error": f"Daily spend cap (${config.daily_spend_cap_usd}) reached. Current: ${spend:.2f}"})
@@ -1854,6 +1863,296 @@ _SPARK_SETUP_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# DGX Spark — Claude Code workspace + headless audit/collapse runs.
+#
+# Aria stands up the SAME Claude Code environment on a spark that the project
+# uses on the Mac (the live_visuals_4_CC control-plane), proves its Max-
+# subscription auth, launches the forensic audit+collapse as a DETACHED tmux
+# run, polls it (decoupled from any live stream — survives disconnects/restarts),
+# and pulls results back. One implementation in src/spark.py; scripts/spark_cc.py
+# and these tools both call it. A background watcher proactively reports when a
+# run ends — the "manage it for me, better than Discord" posture: durable on the
+# node, surfaced when done, never dependent on a live connection staying up.
+# ---------------------------------------------------------------------------
+
+async def _spark_cc_sync(node: str = "spark1", mirror: bool = False,
+                         skip_bootstrap: bool = False, smoke_gate: bool = False,
+                         session_key: str = "") -> str:
+    """Stand up / update the live_visuals_4 Claude Code workspace on a node."""
+    target = (node or "spark1").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    await _emit_progress(
+        session_key,
+        f"syncing the live_visuals_4 Claude Code workspace to {target} "
+        "(rsync + overlay + bootstrap; can take several minutes)",
+    )
+    try:
+        res = await asyncio.to_thread(
+            spark.sync_workspace, target, mirror=bool(mirror),
+            skip_bootstrap=bool(skip_bootstrap), smoke_gate=bool(smoke_gate),
+        )
+    except Exception as e:
+        log.exception("spark_cc_sync failed")
+        return json.dumps({"error": f"spark_cc_sync failed: {e}"})
+    return json.dumps(res)
+
+
+async def _spark_cc_auth(node: str = "spark1", probe: bool = False, session_key: str = "") -> str:
+    """Report whether a node's claude is authenticated on the Max subscription."""
+    target = (node or "spark1").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    try:
+        return json.dumps(await asyncio.to_thread(spark.cc_auth_status, target, probe=bool(probe)))
+    except Exception as e:
+        log.exception("spark_cc_auth failed")
+        return json.dumps({"error": f"spark_cc_auth failed: {e}"})
+
+
+async def _spark_run(node: str = "spark1", branch: str = "", mode: str = "",
+                     instruction: str = "", session_key: str = "") -> str:
+    """EXECUTABLE: launch the detached forensic audit+collapse run on a node.
+
+    Defaults to the packaged audit+collapse instruction and the standard branch.
+    Returns immediately with a run_id; a background watcher reports completion.
+    Consequential — Aria offers it via propose_action (tap to approve)."""
+    target = (node or "spark1").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    instr = (instruction or "").strip()
+    if not instr:
+        try:
+            instr = spark.DEFAULT_AUDIT_INSTRUCTION.read_text()
+        except Exception as e:
+            return json.dumps({"error": f"no instruction given and default unreadable: {e}"})
+    await _emit_progress(session_key, f"launching the audit+collapse run on {target} (detached tmux)")
+    try:
+        res = await asyncio.to_thread(
+            spark.run_audit, target, instr, branch=(branch or None), mode=(mode or spark.DEFAULT_RUN_MODE),
+        )
+    except Exception as e:
+        log.exception("spark_run failed")
+        return json.dumps({"error": f"spark_run failed: {e}"})
+    if res.get("ok"):
+        if _post_callback:
+            try:
+                await _post_callback(
+                    f"**Spark run launched — {res['node']}** (`{res['run_id']}`, branch "
+                    f"`{res['branch']}`, mode `{res['mode']}`). Detached in tmux; I'll watch it "
+                    "and report when it finishes. Poll anytime with spark_run_status."
+                )
+            except Exception:
+                log.debug("spark_run launch post failed", exc_info=True)
+        # Decoupled, proactive supervision: outlives this call; if the bot
+        # restarts the run keeps going on the node and the user re-attaches.
+        asyncio.create_task(
+            _watch_spark_run(res["node"], res["run_id"], res.get("branch", "")),
+            name=f"spark_watch:{res['run_id']}",
+        )
+    return json.dumps(res)
+
+
+async def _spark_run_status(node: str = "spark1", run_id: str = "", session_key: str = "") -> str:
+    """Read-only poll of a detached spark run (liveness, exit, branch/commits, last turn, cost)."""
+    target = (node or "spark1").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    if not (run_id or "").strip():
+        return json.dumps({"error": "run_id is required (returned by spark_run)."})
+    try:
+        return json.dumps(await asyncio.to_thread(spark.run_status, target, run_id.strip()))
+    except Exception as e:
+        log.exception("spark_run_status failed")
+        return json.dumps({"error": f"spark_run_status failed: {e}"})
+
+
+async def _spark_run_fetch(node: str = "spark1", run_id: str = "", branch: str = "",
+                           session_key: str = "") -> str:
+    """Pull a finished run's artifacts back to the Mac (run log, refreshed ledger, branch bundle)."""
+    target = (node or "spark1").strip().lower()
+    if target not in spark.NODES:
+        return json.dumps({"error": f"node is required; known: {_spark_known_nodes()}"})
+    if not (run_id or "").strip():
+        return json.dumps({"error": "run_id is required (returned by spark_run)."})
+    await _emit_progress(session_key, f"pulling {target} run {run_id} artifacts back (ledger + branch bundle)")
+    try:
+        res = await asyncio.to_thread(spark.fetch_results, target, run_id.strip(), branch=(branch or None))
+    except Exception as e:
+        log.exception("spark_run_fetch failed")
+        return json.dumps({"error": f"spark_run_fetch failed: {e}"})
+    if _post_callback and res.get("fetched"):
+        try:
+            extra = f"\nImport the branch: `{res['import_hint']}`" if res.get("import_hint") else ""
+            await _post_callback(
+                f"**Spark run {run_id} fetched** to `{res.get('local_dir')}` — "
+                f"{', '.join(res['fetched'])}.{extra}"
+            )
+        except Exception:
+            log.debug("spark_run_fetch post failed", exc_info=True)
+    return json.dumps(res)
+
+
+async def _watch_spark_run(node: str, run_id: str, branch: str, *,
+                           interval: float = 60.0, max_seconds: float = 6 * 3600) -> None:
+    """Decoupled supervisor: poll a detached spark run and post once it ends.
+
+    This is independent of any live stream — if the bot restarts mid-run, the
+    tmux job keeps going on the node and the user re-attaches with
+    spark_run_status. Strictly non-fatal: a poll error never crashes anything."""
+    waited = 0.0
+    last_heartbeat_turns = -1
+    try:
+        while waited < max_seconds:
+            await asyncio.sleep(interval)
+            waited += interval
+            try:
+                st = await asyncio.to_thread(spark.run_status, node, run_id)
+            except Exception:
+                log.debug("spark watch poll failed (will retry)", exc_info=True)
+                continue
+            if st.get("done"):
+                rc = st.get("exit_code")
+                res = st.get("result") or {}
+                clean = (rc == 0) and not res.get("is_error")
+                cost = res.get("cost_usd")
+                summary = (
+                    f"**Spark run {run_id} on {node} "
+                    f"{'finished GREEN-path' if clean else 'ended — needs a look'}** — "
+                    f"branch `{branch}` (+{st.get('commits_on_branch')} commits, head "
+                    f"`{st.get('head_commit')}`), exit {rc}"
+                    + (f", ~${cost} notional" if cost is not None else "")
+                    + f".\nLast: {(st.get('last_assistant') or '')[:400]}"
+                    + f"\nFetch with spark_run_fetch(node={node}, run_id={run_id})."
+                )
+                if _post_callback:
+                    try:
+                        await _post_callback(summary)
+                    except Exception:
+                        log.debug("spark watch completion post failed", exc_info=True)
+                if not clean and _alert_callback:
+                    try:
+                        await _alert_callback(
+                            f"Spark run {run_id} on {node} ended non-clean (exit {rc}). "
+                            "Inspect with spark_run_status / spark_run_fetch."
+                        )
+                    except Exception:
+                        log.debug("spark watch alert failed", exc_info=True)
+                return
+            # Sparse heartbeat: only when a fresh batch of turns has landed.
+            turns = int(st.get("assistant_turns") or 0)
+            if _post_callback and turns and turns >= last_heartbeat_turns + 25:
+                last_heartbeat_turns = turns
+                try:
+                    await _post_callback(
+                        f"_spark {node} {run_id}: {turns} turns, on `{st.get('branch')}` "
+                        f"(+{st.get('commits_on_branch')} commits)…_"
+                    )
+                except Exception:
+                    log.debug("spark watch heartbeat post failed", exc_info=True)
+        log.warning("spark watch for %s exceeded %ss; stopping watcher (run may still be live)",
+                    run_id, max_seconds)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("spark watch task crashed")
+
+
+_SPARK_CC_SYNC_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_cc_sync",
+    "description": (
+        "Stand up or UPDATE the live_visuals_4 Claude Code workspace on a spark node "
+        "(rsync the repo + overlay the same .claude/.mcp.json control-plane the Mac uses "
+        "+ rebuild venvs/node_modules). Idempotent — this is the 'just update it' path. "
+        "Takes a few minutes. Does NOT authenticate claude (that is a one-time `claude /login` "
+        "on the node) and never sets ANTHROPIC_API_KEY. Run before the first spark_run."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (default spark1)."},
+            "mirror": {"type": "boolean", "description": "rsync --delete for a pristine re-mirror (drops node-only branch state). Default false."},
+            "skip_bootstrap": {"type": "boolean", "description": "Sync+overlay only; skip the venv/node_modules rebuild."},
+            "smoke_gate": {"type": "boolean", "description": "Run scripts/quality_gate.sh after bootstrap to record a baseline."},
+        },
+    },
+}
+
+_SPARK_CC_AUTH_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_cc_auth",
+    "description": (
+        "Check whether a spark node's claude is logged into the Max subscription (the "
+        "cheap check is the OAuth creds file; probe=true spends one tiny call to confirm a "
+        "live round-trip). If not authed, the user must run `ssh -t <node>` then `claude` "
+        "-> `/login` once. Use before launching a run."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (default spark1)."},
+            "probe": {"type": "boolean", "description": "Spend one tiny subscription call to confirm a real round-trip. Default false."},
+        },
+    },
+}
+
+_SPARK_RUN_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_run",
+    "description": (
+        "EXECUTABLE: launch the forensic AUDIT + COLLAPSE run on a spark node as a detached "
+        "tmux job (survives disconnects). It refreshes the collapse ledger against HEAD, then "
+        "performs the collapses wave-by-wave on a new branch, running the quality gate after "
+        "each wave and halting loudly on RED. Returns a run_id immediately; Aria watches it "
+        "and reports when it finishes. Requires spark_cc_sync done + the node on the Max "
+        "subscription. Consequential — offer via propose_action (tap to approve)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (default spark1)."},
+            "branch": {"type": "string", "description": "Branch to create/use; default collapse/<date>."},
+            "mode": {"type": "string", "description": "Claude permission mode: bypassPermissions (default, autonomous), acceptEdits, plan, or default."},
+            "instruction": {"type": "string", "description": "Override the run instruction; default is the packaged audit+collapse brief."},
+        },
+    },
+}
+
+_SPARK_RUN_STATUS_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_run_status",
+    "description": (
+        "Read-only poll of a detached spark run (from spark_run): is it still running, did it "
+        "finish + exit code, current branch and commit count, the last assistant turn / current "
+        "tool, and notional cost. Decoupled from any live stream — safe to call anytime."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (default spark1)."},
+            "run_id": {"type": "string", "description": "The run id returned by spark_run (required)."},
+        },
+        "required": ["run_id"],
+    },
+}
+
+_SPARK_RUN_FETCH_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "spark_run_fetch",
+    "description": (
+        "Pull a finished spark run's artifacts back to the Mac: the run log, the refreshed "
+        "collapse ledger, and an importable git bundle of the collapse branch (with the exact "
+        "git command to import it into the local live_visuals_4 and push)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "node": {"type": "string", "description": "spark1 or spark2 (default spark1)."},
+            "run_id": {"type": "string", "description": "The run id returned by spark_run (required)."},
+            "branch": {"type": "string", "description": "Branch to bundle; default = the run's current branch."},
+        },
+        "required": ["run_id"],
+    },
+}
+
+
 # The agent's handle on the ground table: when it discovers where something
 # important lives (or the user names it), it binds the referent durably so the
 # NEXT request resolves it from context instead of re-discovering at Opus
@@ -1961,6 +2260,11 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _SPARK_STATUS_TOOL_SCHEMA,
     _SPARK_VERIFY_TOOL_SCHEMA,
     _SPARK_SETUP_TOOL_SCHEMA,
+    _SPARK_CC_SYNC_TOOL_SCHEMA,
+    _SPARK_CC_AUTH_TOOL_SCHEMA,
+    _SPARK_RUN_TOOL_SCHEMA,
+    _SPARK_RUN_STATUS_TOOL_SCHEMA,
+    _SPARK_RUN_FETCH_TOOL_SCHEMA,
     _SET_GROUND_TOOL_SCHEMA,
 ]
 _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
@@ -1978,6 +2282,11 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "spark_status": _spark_status,
     "spark_verify": _spark_verify,
     "spark_setup": _spark_setup,
+    "spark_cc_sync": _spark_cc_sync,
+    "spark_cc_auth": _spark_cc_auth,
+    "spark_run": _spark_run,
+    "spark_run_status": _spark_run_status,
+    "spark_run_fetch": _spark_run_fetch,
     "set_ground": _set_ground_tool,
 }
 
@@ -1985,6 +2294,7 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
 _SESSION_KEY_LOCAL_TOOLS = frozenset({
     "create_42c_account",
     "spark_status", "spark_verify", "spark_setup",
+    "spark_cc_sync", "spark_cc_auth", "spark_run", "spark_run_status", "spark_run_fetch",
     "set_ground",
     "ask_user",
 })
