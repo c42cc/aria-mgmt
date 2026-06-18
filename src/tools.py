@@ -1974,32 +1974,49 @@ _BACKUP_MODEL_TOOL_SCHEMA: dict[str, Any] = {
 
 
 async def _backup_model(url: str = "", session_key: str = "") -> str:
-    """Launch a diskless modelvault cloud backup of a model URL. Returns fast."""
+    """Launch a diskless modelvault cloud backup of a model URL. Returns fast.
+
+    Path is config-determined (not a fallback): if MODELVAULT_LAUNCHER_SSH is set we
+    trigger on the always-on launcher VM over plain SSH — no local gcloud, so it
+    survives the org reauth policy ("DM a link and walk away"). Otherwise we run the
+    cloud runner locally (needs gcloud authed on this machine).
+    """
+    import shlex
+
     target = (url or "").strip()
     if not target:
         return json.dumps({"error": "url is required (e.g. huggingface.co/org/model)"})
-    if not os.path.exists(_MODELVAULT_CLOUD_BACKUP_SH):
-        return json.dumps({"error": f"modelvault cloud_backup.sh not found at {_MODELVAULT_CLOUD_BACKUP_SH}"})
     await _emit_progress(session_key, f"launching cloud backup of {target}")
+
+    launcher = os.getenv("MODELVAULT_LAUNCHER_SSH", "").strip()
+    if launcher:
+        key = os.path.expanduser(os.getenv("MODELVAULT_LAUNCHER_KEY", "~/.ssh/modelvault_launcher"))
+        argv = ["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", launcher,
+                f"bash ~/modelvault/ops/cloud_backup.sh {shlex.quote(target)}"]
+    else:
+        if not os.path.exists(_MODELVAULT_CLOUD_BACKUP_SH):
+            return json.dumps({"error": f"modelvault cloud_backup.sh not found at {_MODELVAULT_CLOUD_BACKUP_SH}"})
+        argv = ["bash", _MODELVAULT_CLOUD_BACKUP_SH, target]
+
     proc = await asyncio.create_subprocess_exec(
-        "bash", _MODELVAULT_CLOUD_BACKUP_SH, target,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return json.dumps({"ok": False, "url": target,
-                           "error": "cloud_backup.sh did not return within 180s"})
+        return json.dumps({"ok": False, "url": target, "error": "backup launch did not return within 180s"})
     out = stdout.decode(errors="replace").strip()
     err = stderr.decode(errors="replace").strip()
     if proc.returncode != 0:
         # Loud, with the fix (e.g. gcloud auth). Never a silent failure.
         return json.dumps({"ok": False, "url": target,
-                           "error": f"cloud_backup.sh failed (rc={proc.returncode})",
+                           "error": f"backup launch failed (rc={proc.returncode})",
                            "detail": (err or out)[-800:]})
-    return json.dumps({"ok": True, "url": target, "launched": True, "status": out[-800:]})
+    return json.dumps({"ok": True, "url": target, "launched": True,
+                       "via": "launcher" if launcher else "local", "status": out[-800:]})
 
 
 # Local (non-MCP) tools the do_with_claude loop can dispatch alongside the MCP
