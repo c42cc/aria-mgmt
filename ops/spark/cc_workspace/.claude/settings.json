@@ -3,6 +3,9 @@
   "alwaysThinkingEnabled": true,
   "effortLevel": "xhigh",
   "enableAllProjectMcpServers": false,
+  "env": {
+    "USE_BUILTIN_RIPGREP": "1"
+  },
   "permissions": {
     "defaultMode": "plan",
     "allow": [
