@@ -14,6 +14,7 @@ from typing import Coroutine
 import discord
 from discord.ext import commands
 
+from .claude_code import claude_code_bridge, set_review_callback
 from .config import config
 from .conversation import conversation
 from .cursor_bridge import CursorBridge
@@ -66,6 +67,12 @@ _pending_voice_channel_id: str | None = None
 # skipped). Started once in on_ready's boot-only init.
 _voice_reconcile_task: asyncio.Task | None = None
 _VOICE_RECONCILE_INTERVAL_SEC = 30.0
+
+# Throttle for loud voice-failure alerts, keyed by failure kind. A persistent
+# failure (e.g. a dead bridge that the reconcile loop retries every 30s) must
+# post once per window, not on every retry. Aria failing in silence is the
+# regression this guards against (repo rule: failures must be loud).
+_last_voice_alert_at: dict[str, float] = {}
 
 # Background task that durably judges session records the inline fire-and-forget
 # task used to drop on process churn. Started once in on_ready's boot-only init.
@@ -151,17 +158,171 @@ def _unregister_pending_confirmation(action_id: str) -> None:
 
 
 def _resolve_pending_confirmation(
-    action_id: str, approved: bool, source: str
+    action_id: str, approved: bool, source: str, edited_content: str | None = None
 ) -> bool:
-    """Set the pending confirmation result. Returns False if no such id."""
+    """Set the pending confirmation result. Returns False if no such id.
+
+    `edited_content` carries the edit-before-submit text (from `!edit` or a
+    voice `modifications`): the action is approved with the user's revised
+    content rather than aborted.
+    """
     pending = _pending_text_confirmations.get(action_id)
     if not pending:
         return False
     if pending.event.is_set():
         return True
     pending.result = {"approved": approved, "source": source}
+    if edited_content:
+        pending.result["edited_content"] = edited_content
     pending.event.set()
     return True
+
+
+# ---------------------------------------------------------------------------
+# ask_user — a blocking free-text question (the missing notify primitive).
+#
+# wait_for_confirmation handles yes/no; this handles an open question. Aria (or
+# a Claude Code thread, surfaced through it) posts a question to #ucs and blocks
+# until the authorized user's next plain-text reply, which `on_message` routes
+# here instead of starting a new conversation turn.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _PendingAsk:
+    question: str
+    event: asyncio.Event
+    answer: str = ""
+
+
+_pending_asks: dict[str, _PendingAsk] = {}
+
+
+def _resolve_pending_ask(answer: str) -> bool:
+    """Resolve the oldest open ask with `answer`. Returns True if one was waiting."""
+    for ask_id, pending in list(_pending_asks.items()):
+        if not pending.event.is_set():
+            pending.answer = answer
+            pending.event.set()
+            return True
+    return False
+
+
+async def _ask_user(question: str, session_key: str = "") -> str:
+    """Post `question` to #ucs (@mention) and block for the user's typed reply.
+
+    Returns the reply text, or "" on timeout. Reuses the proposal timeout so an
+    unanswered question expires instead of pinning a thread forever.
+    """
+    import uuid
+    ask_id = str(uuid.uuid4())[:8]
+    pending = _PendingAsk(question=question, event=asyncio.Event())
+    _pending_asks[ask_id] = pending
+    mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
+    mention = f"<@{mention_id}> " if mention_id else ""
+    try:
+        ch = bot.get_channel(int(config.discord_text_channel_id))
+        if ch:
+            await ch.send(f"{mention}{_clip(question, 1500)}")
+        if gemini and gemini.connected:
+            try:
+                await gemini.inject_text(question, turn_complete=True)
+            except Exception:
+                log.debug("ask_user voice inject failed", exc_info=True)
+        try:
+            await asyncio.wait_for(
+                pending.event.wait(), timeout=config.proposal_timeout_sec
+            )
+            return pending.answer
+        except asyncio.TimeoutError:
+            return ""
+    finally:
+        _pending_asks.pop(ask_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code edit-before-submit — the can_use_tool review gate's bot side.
+#
+# When a Claude Code thread (running in `default` mode) proposes a consequential
+# action (Write / Edit / Bash), `claude_code._review_tool` calls this. The user
+# can approve (react / yes), deny (react / no), or EDIT it — `!edit <id> <new>`
+# in text or a spoken `modifications` in `confirm_action`. An edit returns
+# `updated_input` to the SDK, which runs the revised action; nothing is aborted
+# on an edit (unlike the legacy MCP path that declined-with-feedback).
+# ---------------------------------------------------------------------------
+
+def _summarize_tool_input(tool_name: str, tool_input: dict) -> str:
+    if tool_name == "Bash":
+        return f"run a command: {_clip(str(tool_input.get('command', '')), 600)}"
+    if tool_name == "Write":
+        return f"write {tool_input.get('file_path', '?')} ({len(str(tool_input.get('content', '')))} chars)"
+    if tool_name in ("Edit", "MultiEdit", "NotebookEdit"):
+        return f"edit {tool_input.get('file_path', '?')}"
+    return f"{tool_name}: {_clip(json.dumps(tool_input, default=str), 400)}"
+
+
+def _apply_claude_edit(tool_name: str, orig_input: dict, edited_text: str) -> dict | None:
+    """Map a free-text edit onto the tool's primary field. Returns None when the
+    tool has no single editable field (caller then approves as-is)."""
+    upd = dict(orig_input)
+    if tool_name == "Bash":
+        upd["command"] = edited_text
+    elif tool_name == "Write":
+        upd["content"] = edited_text
+    elif tool_name == "Edit":
+        upd["new_string"] = edited_text
+    else:
+        return None
+    return upd
+
+
+async def _claude_review_callback(
+    *, tool_name: str, tool_input: dict, session_id: str = "", workspace_root: str = ""
+) -> dict:
+    """Human review gate for a Claude Code tool call. Returns
+    {approved, updated_input, message}."""
+    import uuid
+    action_id = str(uuid.uuid4())[:8]
+    summary = _summarize_tool_input(tool_name, tool_input)
+    _register_pending_confirmation(action_id, f"claude_code:{tool_name}", summary)
+    timeout = config.proposal_timeout_sec
+    try:
+        card = await _post_confirmation_card(
+            action_id, f"Claude Code · {tool_name}",
+            f"{summary}\nReact \u2705 approve / \u274c deny, or change it: `!edit {action_id} <new>`.",
+        )
+        if card is not None:
+            pending = _pending_text_confirmations.get(action_id)
+            if pending is not None:
+                pending.message_id = card.id
+                _confirmation_message_index[card.id] = action_id
+        if gemini and gemini.connected:
+            try:
+                await gemini.inject_text(
+                    f"Claude Code wants to {summary}. Approve? Say yes, no, or tell me the "
+                    f"change. Call confirm_action with action_id=\"{action_id}\".",
+                    turn_complete=True,
+                )
+            except Exception:
+                log.debug("claude review voice inject failed", exc_info=True)
+        waiters = [_discord_wait_for_confirmation(action_id, timeout=timeout)]
+        if gemini and gemini.connected:
+            waiters.insert(0, gemini.wait_for_confirmation(action_id, timeout=timeout))
+        result = (
+            await _race_confirmations(*waiters) if len(waiters) > 1 else await waiters[0]
+        )
+    finally:
+        _unregister_pending_confirmation(action_id)
+
+    approved = bool(result.get("approved"))
+    edit = result.get("edited_content") or result.get("modifications")
+    updated_input = (
+        _apply_claude_edit(tool_name, tool_input, edit) if (approved and edit) else None
+    )
+    return {
+        "approved": approved,
+        "updated_input": updated_input,
+        "message": "" if approved else "Declined by the user.",
+    }
 
 
 async def _discord_wait_for_confirmation(
@@ -975,7 +1136,15 @@ async def _drain_gemini_to_voice(session: GeminiSession) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.debug("Gemini -> voice drain transient error; continuing", exc_info=True)
+                # Was log.debug (silent). Count + WARN so a chronically failing
+                # drain is visible instead of hiding "voice doesn't work".
+                _drain_errs = getattr(_drain_gemini_to_voice, "_errs", 0) + 1
+                _drain_gemini_to_voice._errs = _drain_errs
+                if _drain_errs == 1 or _drain_errs % 25 == 0:
+                    log.warning(
+                        "AUDIO drain (Gemini->voice) error #%d; continuing", _drain_errs,
+                        exc_info=True,
+                    )
                 await asyncio.sleep(0.1)
     except asyncio.CancelledError:
         pass
@@ -1077,6 +1246,127 @@ async def _on_voice_exit_timeout() -> None:
         log.exception("Failed to post voice exit alert")
 
 
+async def _alert_voice_problem(
+    key: str, message: str, *, min_interval: float = 300.0
+) -> None:
+    """Post a throttled loud alert for a voice-path failure.
+
+    Aria sitting silently when she cannot hear or cannot join is a regression
+    (repo rule: failures must be loud). Throttle per `key` so a burst of the
+    same failure posts once per `min_interval` rather than hundreds of times.
+    """
+    now = time.monotonic()
+    last = _last_voice_alert_at.get(key, 0.0)
+    if last and now - last < min_interval:
+        return
+    _last_voice_alert_at[key] = now
+    try:
+        await post_to_alerts(message)
+    except Exception:
+        log.exception("Failed to post voice problem alert (%s)", key)
+
+
+async def _on_voice_bridge_error(message: str) -> None:
+    """Loud surface for sidecar `error` events.
+
+    Most errors only need the log line the bridge already writes; the two that
+    mean "the user is trying to talk to Aria and it isn't working" — she can't
+    hear (deaf), or she couldn't join — are escalated to the alerts channel.
+    """
+    if message.startswith("deaf:"):
+        await _alert_voice_problem(
+            "deaf",
+            f"**Aria can't hear you in voice.** {message} "
+            f"(Joined fine, but no audio is decoding — likely the DAVE/Opus "
+            f"receive path. She'll keep trying; a restart may be needed.)",
+            min_interval=180,
+        )
+    elif "voice connect failed" in message:
+        await _alert_voice_problem(
+            "connect_failed",
+            f"**Aria failed to join voice:** {message}",
+            min_interval=180,
+        )
+
+
+async def _on_voice_connection_lost() -> None:
+    """Sidecar lost its Discord voice connection unrecoverably.
+
+    Tear down the audio pipeline and reset presence state so the reconcile loop
+    (or the next utterance) performs a fresh join instead of streaming into a
+    dead pipeline. Surfaced loudly and throttled.
+    """
+    global _spicylit_active, _grok_session
+    global _session_paused, _grok_paused, _pause_transcript
+    log.warning("Sidecar voice connection lost — tearing down audio pipeline")
+    _cancel_audio_tasks()
+    _session_paused = False
+    _grok_paused = False
+    _pause_transcript = ""
+
+    if _spicylit_active and _grok_session:
+        try:
+            if _grok_session.connected:
+                await _grok_session.close()
+        except Exception:
+            log.exception("Error closing Grok after voice loss")
+        _grok_session = None
+        _spicylit_active = False
+
+    if gemini and gemini.connected:
+        try:
+            await gemini.close()
+        except Exception:
+            log.exception("Error closing Gemini after voice loss")
+
+    voice_controller.note_connection_lost()
+
+    await _alert_voice_problem(
+        "voice_lost",
+        "**Aria's voice connection dropped** and could not auto-recover. "
+        "She'll rejoin automatically when you speak or via the presence "
+        "reconciler.",
+        min_interval=120,
+    )
+
+
+async def _resolve_authorized_voice_channel() -> discord.VoiceChannel | None:
+    """Authoritative answer to 'is the authorized user in a voice channel?'.
+
+    py-cord's cached voice states (`vc.members`) go stale after a bare gateway
+    RESUME — which is exactly when the reconcile loop must act. So when the
+    local cache shows no one, cross-check the discord.js sidecar: a SEPARATE
+    Discord gateway connection (Bot #2) whose voice-state view is independent of
+    the parent's and is unlikely to be stale at the same instant.
+    """
+    cached = _find_authorized_user_voice_channel()
+    if cached is not None:
+        return cached
+    if not voice_bridge.alive:
+        return None
+    try:
+        channel_id = await voice_bridge.query_presence()
+    except Exception:
+        log.exception("Sidecar presence query failed")
+        return None
+    if not channel_id:
+        return None
+    ch = bot.get_channel(int(channel_id))
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(int(channel_id))
+        except Exception:
+            log.exception("Failed to fetch channel %s reported by sidecar", channel_id)
+            return None
+    if isinstance(ch, discord.VoiceChannel):
+        log.info(
+            "Sidecar reports authorized user in %s — py-cord voice cache was stale",
+            ch.name,
+        )
+        return ch
+    return None
+
+
 async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> bool:
     """Reconcile voice to `channel` and bring up the right AI session for it.
 
@@ -1115,6 +1405,12 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> bool:
 
     if not voice_bridge.alive:
         log.warning("Asked to auto-join %s but voice bridge not alive", channel.name)
+        await _alert_voice_problem(
+            "bridge_down",
+            f"**Aria can't join {channel.name}** — the voice sidecar is not "
+            f"running. A restart is needed (`make run`).",
+            min_interval=300,
+        )
         return False
 
     if _local_session_active:
@@ -1146,6 +1442,12 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> bool:
     if is_spicylit:
         if not config.grok_api_key:
             log.error("Joined #spicy-lit but GROK_API_KEY not set — no audio pipeline")
+            await _alert_voice_problem(
+                "grok_key",
+                "**Aria joined #spicy-lit but GROK_API_KEY is not set** — no "
+                "audio pipeline, she can't speak there.",
+                min_interval=600,
+            )
             return False
 
         if _grok_session and _grok_session.connected:
@@ -1186,6 +1488,13 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> bool:
                 await gemini.connect()
             except Exception:
                 log.exception("Failed to connect Gemini on auto-join")
+                await _alert_voice_problem(
+                    "gemini_connect",
+                    f"**Aria joined {channel.name} but her voice (Gemini) failed "
+                    f"to connect** — you won't hear a response. Check the logs / "
+                    f"API key.",
+                    min_interval=180,
+                )
                 return False
 
         _audio_tasks.append(asyncio.create_task(_drain_gemini_to_voice(gemini)))
@@ -1239,7 +1548,7 @@ async def _voice_presence_reconcile_loop() -> None:
             await asyncio.sleep(_VOICE_RECONCILE_INTERVAL_SEC)
             if not _preflight_passed or not voice_bridge.alive:
                 continue
-            target = _find_authorized_user_voice_channel()
+            target = await _resolve_authorized_voice_channel()
             if target is None:
                 continue
             already_following = (
@@ -1630,22 +1939,67 @@ async def _maybe_propose_next_after_completion(agent: "CursorAgent") -> bool:
         return False
 
 
+async def _notify_user_buzz(content: str) -> bool:
+    """Deliver a phone-buzzing notification to the authorized user.
+
+    The off-voice delivery primitive for cursor-watch events. `#ucs-alerts`
+    is a forced-silent stream (it must never buzz — Corbin's rule), so a real
+    notification has to land somewhere that actually pings. Order:
+
+      1. DM the authorized user — the most direct "message me". Buzzes the
+         phone when Corbin's DMs are open.
+      2. Fall back to a NON-silent @mention post in the main `#ucs` channel —
+         the same proven buzz surface `_post_proposal_card` uses — when DMs
+         are closed/unavailable.
+
+    Returns True if either path delivered, False if both failed. `content`
+    is expected to already carry the `<@id>` mention prefix (e.g. from
+    `_format_registry_dm`) so the `#ucs` fallback still pings even though it
+    is a channel, not a DM.
+
+    This exists because the prior off-voice path silently dropped any
+    finished/errored/asking event the `propose_next` model call couldn't turn
+    into a suggestion — the bug behind "a thread finished and Aria never
+    messaged me."
+    """
+    try:
+        if await _dm_authorized_user(content):
+            log.info("cursor-watch: notification delivered via DM")
+            return True
+    except Exception:
+        log.exception("cursor-watch: DM attempt raised — falling back to #ucs")
+
+    try:
+        await post_to_text(content)
+        log.info("cursor-watch: notification delivered via #ucs @mention")
+        return True
+    except Exception:
+        log.exception(
+            "cursor-watch: #ucs notification post failed — event NOT delivered"
+        )
+        return False
+
+
 async def _narrate_registry_event(evt: RegistryEvent) -> None:
     """Single owner of voice / DM / alert routing for cursor registry events.
 
     Replaces the four-rung `_cursor_external_pager`. Order is mechanical:
 
     1. Record the cursor event in the conversation buffer (always).
-    2. Silent audit to `#ucs-alerts` (always).
-    3. On voice + idle gate: structured context inject + speech trigger
-       when severity warrants. The wait_until_idle gate prevents the
+    2. Silent audit to `#ucs-alerts` (always — it's a glanceable, no-buzz
+       stream, never a notification).
+    3. On voice + idle gate: structured context inject + speech trigger for
+       every terminal/actionable transition (finished/errored/question) or
+       any high-severity event. The wait_until_idle gate prevents the
        narration from being batched into Aria's in-flight turn.
-    4. Not on voice + high severity: DM the authorized user.
-    5. Mark `agent.last_delivered_at` on success of step 3 or 4 so the
-       join / resume briefing doesn't re-narrate.
-
-    The legacy "rung B/C/D" semantics collapse: a single high-severity
-    event whose DM fails posts a loud audit. Everything else is silent.
+    4. Not on voice: every terminal/actionable transition gets a guaranteed
+       phone buzz. Completions first try the richer "next move?" proposal
+       (which buzzes the main channel on its own); anything that doesn't fire
+       a proposal — and every error/question — falls through to
+       `_notify_user_buzz` (DM, else a non-silent `#ucs` @mention). Nothing
+       meaningful is ever silently dropped.
+    5. Mark `agent.last_delivered_at` only when Aria SPOKE it aloud (step 3),
+       so a phone-only ping still surfaces on the next voice-join briefing.
     """
     agent = evt.agent
     log.info(
@@ -1693,7 +2047,13 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                     "continuing to the heads-up trigger anyway"
                 )
             spoke_aloud = False
-            if evt.severity == "high":
+            # Speak aloud for every terminal/actionable transition, not just
+            # high-severity ones: a thread finishing with an unknown/aborted
+            # status comes through as severity=low but is still exactly what
+            # Corbin asked to hear about.
+            if evt.severity == "high" or evt.kind in (
+                "finished", "completed", "errored", "question",
+            ):
                 speech = _format_registry_speech(evt)
                 await gemini.inject_text(
                     f"[Cursor watch heads-up — narrate this and ask what to do next] {speech}",
@@ -1716,19 +2076,37 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                 "Failed to inject registry event into Gemini — falling back to DM rung"
             )
 
-    # Not on voice. The ONLY thing allowed to buzz is a real decision. A bare
-    # "thread finished" is useless on its own (Corbin's rule), so on completion
-    # we turn it into a "here's the next move — approve?" proposal (which buzzes
-    # the main channel). Everything else just streams silently to #ucs-alerts.
-    if evt.severity == "high" and evt.kind in ("finished", "completed"):
-        proposed = await _maybe_propose_next_after_completion(agent)
-        if not proposed:
-            await _safe_post(audit_line, silent=True)
-    else:
-        # Errors, questions, progress: context to the silent stream, no buzz.
-        # (A pending question is surfaced here; the proposal path is the buzz.)
-        body = _format_registry_dm(evt) if evt.severity == "high" else audit_line
-        await _safe_post(body, silent=True)
+    # Not on voice. #ucs-alerts is a forced-silent stream, so record the audit
+    # line there (a glanceable trail) but NEVER rely on it to notify. Every
+    # terminal/actionable transition — a thread FINISHED, ERRORED, or is
+    # ASKING a question — must reach Corbin's phone.
+    await _safe_post(audit_line, silent=True)
+
+    if (
+        evt.kind not in ("finished", "completed", "errored", "question")
+        and evt.severity != "high"
+    ):
+        # Low-severity progress / subagent churn: the silent stream is enough.
+        # Any HIGH-severity event (incl. a constructed plan awaiting approval)
+        # is a decision and still buzzes below.
+        return
+
+    # Completions first try the richer "here's the next move — approve?"
+    # proposal, which buzzes the main channel on its own. If it doesn't fire
+    # (model had no suggestion, rate-limited, disabled, or an empty summary)
+    # we fall through to a deterministic buzz so the finish is NEVER silently
+    # dropped — the exact bug behind "a thread finished and Aria never
+    # messaged me."
+    if evt.kind in ("finished", "completed"):
+        try:
+            if await _maybe_propose_next_after_completion(agent):
+                return
+        except Exception:
+            log.exception(
+                "propose-next path raised — falling back to direct notify"
+            )
+
+    await _notify_user_buzz(_format_registry_dm(evt))
 
 
 def _undelivered_agents() -> list[CursorAgent]:
@@ -1843,6 +2221,15 @@ async def on_ready():
 
     if not _on_ready_done:
         init_db()
+        # Resume the conversation from the durable log of record so a restart
+        # no longer starts blank (Primitive 3). Idempotent: only fills an empty
+        # buffer, never duplicates live turns; best-effort so it can't block boot.
+        try:
+            hydrated = conversation.hydrate()
+            if hydrated:
+                log.info("conversation hydrated %d turns from durable log", hydrated)
+        except Exception:
+            log.warning("conversation hydrate failed (non-fatal)", exc_info=True)
         init_memory()
 
         async def _gemini_reconnect() -> None:
@@ -1861,7 +2248,12 @@ async def on_ready():
             discord_threads_callback=_fetch_discord_threads,
             progress_callback=_emit_progress_to_user,
             propose_callback=_propose_action,
+            ask_callback=_ask_user,
         )
+        # Wire the Claude Code edit-before-submit review gate to the Discord/
+        # voice confirmation surfaces. Claude Code narration rides the same
+        # registry emit callback as Cursor (set below), so no second consumer.
+        set_review_callback(_claude_review_callback)
 
         await cursor_bridge.start()
 
@@ -1869,6 +2261,11 @@ async def on_ready():
             await voice_bridge.start()
         except Exception:
             log.exception("voice bridge failed to start — !join will not work")
+        # Wire loud-failure + state-reconciliation callbacks. These are attribute
+        # setters (no live connection required), so register them regardless of
+        # whether start() raised — they must be live if the bridge later recovers.
+        voice_bridge.register_error_callback(_on_voice_bridge_error)
+        voice_bridge.register_voice_lost_callback(_on_voice_connection_lost)
 
         async def _on_orphan_tool_result(tool_name: str, fc_id: str, result: str) -> None:
             """Loud failure for L1: tool ran but session closed before response sent."""
@@ -2179,6 +2576,30 @@ async def _handle_text_confirmation(
         await ctx.send("Got it \u2014 on it now. I'll show each step as I go.")
     else:
         await ctx.send("Okay \u2014 skipping that one.")
+
+
+@bot.command(name="edit")
+async def edit_cmd(ctx: commands.Context, action_id: str = "", *, new_content: str = ""):
+    """Approve a pending Claude Code action WITH an edit: `!edit <id> <new>`.
+
+    The edit replaces the action's primary field (a Bash command, a Write's
+    content, an Edit's new_string) before it runs — edit-before-submit."""
+    if not _is_authorized(ctx.author.id):
+        await ctx.send("Not authorized.")
+        return
+    if not action_id:
+        ids = ", ".join(f"`{i}`" for i in _pending_text_confirmations) or "(none)"
+        await ctx.send(f"Usage: `!edit <id> <new content>`. Waiting: {ids}")
+        return
+    if not new_content.strip():
+        await ctx.send("Give me the replacement content after the id.")
+        return
+    if _resolve_pending_confirmation(
+        action_id, approved=True, source="text", edited_content=new_content
+    ):
+        await ctx.send("Got it \u2014 approving with your change.")
+    else:
+        await ctx.send("I couldn't find that one waiting for approval.")
 
 
 @bot.event
@@ -2626,6 +3047,10 @@ async def on_message(message):
         and message.content.strip()
         and not _is_stream_or_capability_channel(message.channel)
     ):
+        # A typed reply while Aria (or a Claude Code thread) is blocked on an
+        # open question answers it, rather than starting a fresh turn.
+        if _pending_asks and _resolve_pending_ask(message.content.strip()):
+            return
         await _handle_text_conversation(message)
         return
 

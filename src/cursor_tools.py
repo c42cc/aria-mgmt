@@ -274,11 +274,36 @@ async def _cursor_threads(
         }
 
     rows = await asyncio.gather(*(resolve_one(t) for t in threads))
+
+    # Overlay LIVE per-thread status from the hook-fed registry — the ground
+    # truth for "is it processing now?". The distilled `status` is a model's
+    # guess over a STATIC transcript tail (stale the moment the agent takes
+    # another step); when the registry has a live signal for this sid it wins,
+    # and the distilled value is kept as `distilled_status`. This is the fix for
+    # reporting a finished-looking summary while the thread is actively running.
+    live_running = 0
+    for t, row in zip(threads, rows):
+        live = cursor_registry.live_status_for_sid(t["sid"])
+        if live is not None:
+            row["distilled_status"] = row.get("status")
+            row["status"] = live["status"]
+            row["live"] = live["live"]
+            row["last_activity_age_sec"] = live["age_sec"]
+            if live.get("reason"):
+                row["live_reason"] = live["reason"]
+            if live["live"]:
+                live_running += 1
+        else:
+            row["live"] = False
+            row["live_note"] = "no live hook signal — status is distilled from the transcript, not confirmed live"
+
     out: dict = {
         "project": project_label,
         "workspace_root": workspace_root,
         "window_hours": window_hours,
         "count": len(rows),
+        # The direct answer to "what's underway / still working RIGHT NOW".
+        "live_running_count": live_running,
         "threads": rows,
     }
     if errors:

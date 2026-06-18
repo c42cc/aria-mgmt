@@ -22,6 +22,7 @@ them out loud.
 
 - ucs → /Users/corbin/PycharmProjects/agi_env_v1/ucs2
 - live_visuals_4 → /Users/corbin/PycharmProjects/agi_env_v1/live_visuals_4
+- live_visuals_4_cc → /Users/corbin/PycharmProjects/agi_env_v1/live_visuals_4_CC
 - live_visuals_3 → /Users/corbin/PycharmProjects/agi_env_v1/live_visuals_3
 - alive_river → /Users/corbin/PycharmProjects/agi_env_v1/alive_river
 - spicylit → /Users/corbin/PycharmProjects/spicylit

@@ -3,7 +3,7 @@
 Run via CLI:  python -m src.eval [command]
 
 Governance: this module ADVISES. It never calls save_template or
-rollback_template. User voice edits always win. See _ARCHITECTURE.md
+rollback_template. User voice edits always win. See ARCHITECTURE.md
 Fundamental 13.
 """
 

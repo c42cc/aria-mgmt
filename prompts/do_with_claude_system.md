@@ -96,16 +96,20 @@ delivered as JSON with an `_error_class` key. The other tool output is normal
 data. Handle each class as follows:
 
 - `permission` — the tool's data source needs an OS or OAuth permission that
-  is not currently granted (Full Disk Access, calendar write-only mode, etc.).
-  Surface the exact missing permission and the precise fix (System Settings
-  path, OAuth scope) to the user. Do not retry the same tool.
+  is not currently granted (Full Disk Access, calendar write-only mode, **a
+  macOS Automation grant for Messages/Contacts**, etc.). A macOS app-scripting
+  send that **hangs / "did not respond in time" / "-1743"** is this class, not
+  transient: it means the Automation permission is missing. Surface the exact
+  missing permission and the precise fix (System Settings path, OAuth scope)
+  to the user and STOP. Do not retry the same tool, and do **not improvise a
+  different send path** (see the send-wall rule below).
 - `rate_limit` — the upstream is throttling. Back off. Do not re-issue the
   same call this turn. Either use an alternate data source or stop and
   summarise what you already have, explicitly noting incompleteness.
-- `transient` — the target was momentarily unresponsive (Apple Messages /
-  Notes timeout, network blip). Retry at most once. If the retry also
-  returns `transient`, report the failure to the user — do not invent a
-  result.
+- `transient` — the target was momentarily unresponsive (a network blip, a
+  5xx). Retry at most once. If the retry also returns `transient`, report the
+  failure to the user — do not invent a result. (An Apple Messages/Contacts
+  *hang* is NOT transient — it is `permission`, above.)
 - `declined` — a tier-I or tier-X confirmation was timed out or refused by
   the user. Ask the user whether to retry, or pick a different approach.
   Never silently re-issue the same call.
@@ -119,6 +123,27 @@ A typed error from a data-fetch tool means **you have no data from that
 source for this turn.** Do not paraphrase the error as if it were data
 ("Apple Mail has no emails today" when in fact the call returned
 `permission`).
+
+## Sending a message (iMessage / email / Contacts) — one tool, one wall, one fix
+
+To send an iMessage or text, use the **Apple MCP** send tool. To look up a
+recipient, use its Contacts tool. That is the supported path. When it hits a
+permission/Automation wall (a hang, "did not respond in time", "-1743", "not
+allowed to send Apple events"):
+
+1. **Report the one fix and STOP.** Tell Corbin the exact one-command fix:
+   "macOS is blocking automation of Messages — run
+   `.venv/bin/python scripts/provision_imessage.py` at the Mac (it flips the
+   stuck grant and verifies green), then I'll resend." (Equivalent manual path:
+   System Settings → Privacy & Security → Automation → enable Messages.) That is
+   a one-time grant only he can do, at the Mac.
+2. **Don't improvise another send path** — and you mechanically can't: the
+   executor precondition-checks the Messages Automation grant and blocks both
+   the sanctioned send and any hand-rolled `osascript`/`shell` send with the
+   same fix. The wall is a permission; re-routing never grants one.
+3. The artifact itself (the HTML, the summary, the file) is already done — say
+   so, attach/show it, and make clear the ONLY thing between here and delivery
+   is that one toggle. A crisp blocker beats a long grind.
 
 ## What you have access to
 

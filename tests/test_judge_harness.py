@@ -62,7 +62,7 @@ CASES: list[dict] = [
                     "### Step 4: Add unit tests\n"
                     "Create tests/test_agent_loop.py with mock MCP client to verify "
                     "iteration limits, token budgets, and cancellation.\n\n"
-                    "### Step 5: Update _ARCHITECTURE.md repo map\n"
+                    "### Step 5: Update ARCHITECTURE.md repo map\n"
                     "Add `src/agent_loop.py` to the Layers table."
                 )
             }),

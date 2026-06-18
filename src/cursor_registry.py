@@ -44,9 +44,16 @@ log = logging.getLogger(__name__)
 
 
 Severity = Literal["high", "low"]
-Source = Literal["sdk", "ide", "unknown"]
+Source = Literal["sdk", "ide", "claude_code", "unknown"]
 Status = Literal["running", "waiting", "finished", "errored", "unknown"]
 EventKind = Literal["finished", "errored", "question", "started", "progress"]
+
+# A thread whose status is "running" but whose last hook landed longer ago than
+# this is no longer treated as *live*-running (the agent likely finished and we
+# missed/never got a stop hook, or it's stuck). We never fabricate a downgrade —
+# the raw status + the age are both surfaced — but "is it processing NOW?" keys
+# off recency so a stale "running" can't masquerade as active work.
+RUNNING_RECENCY_SEC = 180.0
 
 
 @dataclass
@@ -59,6 +66,10 @@ class SessionInfo:
     transcript_path: str | None = None
     last_assistant_text: str = ""
     last_user_text: str = ""
+    # Per-THREAD live status, driven by THIS session's own hooks (not the
+    # workspace's). The granularity the user actually works in.
+    status: Status = "unknown"
+    last_event_reason: str = ""
     _tail_offset: int = 0
     _tail_task: asyncio.Task | None = field(default=None, repr=False)
     _tail_mtime: float = 0.0
@@ -99,13 +110,19 @@ class CursorAgent:
     last_delivered_reason: str = ""
 
     def to_public_dict(self) -> dict:
-        """JSON-safe projection for tool responses and audits."""
+        """JSON-safe projection for tool responses and audits.
+
+        Status is recomputed at read time so recency is honest: a thread that
+        was "running" but has been quiet beyond the window is reported with its
+        raw status PLUS its age and `live=false`, never masquerading as active.
+        """
+        now = time.time()
         return {
             "agent_id": self.agent_id,
             "workspace_root": self.workspace_root,
             "project_label": self.project_label,
             "source": self.source,
-            "status": self.status,
+            "status": _aggregate_agent_status(self, now),
             "current_sid": self.current_sid,
             "last_assistant_text": self.last_assistant_text,
             "last_user_text": self.last_user_text,
@@ -120,6 +137,10 @@ class CursorAgent:
                     "started_at": s.started_at,
                     "last_event_at": s.last_event_at,
                     "transcript_path": s.transcript_path,
+                    "status": s.status,
+                    "age_sec": round(now - s.last_event_at, 1),
+                    "live": _session_live(s, now),
+                    "last_event_reason": s.last_event_reason,
                 }
                 for s in sorted(
                     self.sessions.values(),
@@ -202,17 +223,73 @@ def _question_in_text(text: str) -> str | None:
     return None
 
 
-def _parse_jsonl_turns(lines: list[str]) -> tuple[str, str, list[str]]:
-    """Return (last_assistant_text, last_user_text, plan_file_paths_seen).
+# Tools whose use means "I am asking the user to make a decision RIGHT NOW."
+# This is the unambiguous decision signal — an agent that calls one of these has
+# stopped to wait for the user, which is exactly when Aria must ping. Real
+# questions are asked by CALLING this tool, not by writing a trailing '?': the
+# AskQuestion that slipped through silently was a tool_use whose prompt had a '?'
+# mid-text followed by declarative sentences, so `_question_in_text` never saw it.
+_ASK_TOOL_NAMES = {"askquestion", "askfollowupquestion", "askfollowup", "askuser"}
+
+
+def _normalize_tool_name(name: str) -> str:
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def _extract_ask_question(content: object) -> str | None:
+    """Return the prompt of an 'ask the user' tool call in an assistant turn.
+
+    Reads the `tool_use` block directly — the prose heuristic in
+    `_question_in_text` never inspects tool calls, which is why a tool-asked
+    decision was invisible and never pinged. The moment the agent emits the
+    ask we have the question text and surface it as a high-severity decision.
+    """
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if _normalize_tool_name(block.get("name", "")) not in _ASK_TOOL_NAMES:
+            continue
+        inp = block.get("input")
+        if not isinstance(inp, dict):
+            return "needs a decision (open Cursor)"
+        # AskQuestion shape: {"questions": [{"prompt": .., "options": [..]}], ..}
+        questions = inp.get("questions")
+        if isinstance(questions, list) and questions:
+            prompts: list[str] = []
+            for q in questions:
+                if isinstance(q, dict):
+                    pr = q.get("prompt") or q.get("question") or q.get("title")
+                    if isinstance(pr, str) and pr.strip():
+                        prompts.append(pr.strip())
+            if prompts:
+                extra = f" (+{len(prompts) - 1} more)" if len(prompts) > 1 else ""
+                return prompts[0][:400] + extra
+        # Simple shapes: {"question"/"prompt"/"title"/"message": ".."}
+        for key in ("question", "prompt", "title", "message"):
+            v = inp.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:400]
+        return "needs a decision (open Cursor)"
+    return None
+
+
+def _parse_jsonl_turns(
+    lines: list[str],
+) -> tuple[str, str, list[str], str | None]:
+    """Return (last_assistant_text, last_user_text, plan_file_paths, ask_question).
 
     `lines` is a list of raw JSONL lines (no trailing newlines). Plan files
-    are surfaced when Cursor's tool_use blocks reference them (best effort —
-    Cursor's plan-mode writes are captured separately by
-    `cursor_external.list_recent_plans`).
+    are surfaced when Cursor's tool_use blocks reference them. `ask_question`
+    is the prompt of the most recent 'ask the user' tool call (e.g.
+    `AskQuestion`) seen in an assistant turn, or None — the reliable decision
+    signal that the prose heuristic misses.
     """
     last_assistant = ""
     last_user = ""
     plans: list[str] = []
+    last_ask: str | None = None
     for line in lines:
         line = line.strip()
         if not line:
@@ -226,6 +303,10 @@ def _parse_jsonl_turns(lines: list[str]) -> tuple[str, str, list[str]]:
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
+        if role == "assistant":
+            aq = _extract_ask_question(content)
+            if aq:
+                last_ask = aq
         text_parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
@@ -248,7 +329,7 @@ def _parse_jsonl_turns(lines: list[str]) -> tuple[str, str, list[str]]:
                 last_assistant = joined
             elif role == "user":
                 last_user = joined
-    return last_assistant, last_user, plans
+    return last_assistant, last_user, plans, last_ask
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +404,32 @@ class CursorAgentRegistry:
     def agents(self) -> list[CursorAgent]:
         return list(self._agents.values())
 
+    def live_status_for_sid(self, sid: str) -> dict | None:
+        """Live per-thread status from the hook stream, matched by transcript
+        sid (full or a prefix). Returns {status, live, age_sec, last_event_at,
+        reason} or None if the registry has never seen this thread. This is the
+        ground-truth "is it processing now?" that overlays the distilled roster.
+        """
+        if not sid:
+            return None
+        now = time.time()
+        for agent in self._agents.values():
+            sess = agent.sessions.get(sid)
+            if sess is None:
+                for s_sid, s in agent.sessions.items():
+                    if s_sid.startswith(sid) or sid.startswith(s_sid):
+                        sess = s
+                        break
+            if sess is not None:
+                return {
+                    "status": sess.status,
+                    "live": _session_live(sess, now),
+                    "age_sec": round(now - sess.last_event_at, 1),
+                    "last_event_at": sess.last_event_at,
+                    "reason": sess.last_event_reason,
+                }
+        return None
+
     def __len__(self) -> int:
         return len(self._agents)
 
@@ -368,7 +475,15 @@ class CursorAgentRegistry:
             agent.current_sid = sid
 
         kind, severity, reason = _classify_hook(hook_type, payload, agent)
-        agent.status = _status_from_hook(hook_type, payload, agent.status)
+        # Per-THREAD status from THIS session's hook (the user works in threads).
+        if sid:
+            tracked = agent.sessions.get(sid)
+            if tracked is not None:
+                tracked.status = _status_from_hook(hook_type, payload, tracked.status)
+                if reason:
+                    tracked.last_event_reason = reason
+        # Workspace status = aggregate across its threads (running if any live).
+        agent.status = _aggregate_agent_status(agent, now)
         agent.last_event_at = now
 
         if sid and sess and sess.transcript_path:
@@ -426,6 +541,117 @@ class CursorAgentRegistry:
             )
         )
         return agent
+
+    async def register_from_claude_code(
+        self,
+        *,
+        session_id: str,
+        workspace_root: str,
+        instruction: str | None = None,
+    ) -> CursorAgent:
+        """Record an agent Aria spawned via the Claude Agent SDK (Claude Code).
+
+        Source=`claude_code`, status=`running`. Unlike the Cursor SDK path,
+        the driver in `src/claude_code.py` streams turns directly and folds
+        them via `record_claude_code_event`, so no JSONL tailer is started
+        here (Claude Code writes its transcript under `~/.claude/...`, a
+        different layout than the `~/.cursor/...` tailer expects).
+        """
+        workspace_root = workspace_root.rstrip("/")
+        agent = self._get_or_create(workspace_root, source="claude_code")
+        # A workspace previously seen as a Cursor agent can also host a Claude
+        # Code session; the live source follows the most recent spawn.
+        agent.source = "claude_code"
+        now = time.time()
+        if session_id:
+            sess = agent.sessions.get(session_id)
+            if sess is None:
+                sess = SessionInfo(
+                    sid=session_id,
+                    started_at=now,
+                    last_event_at=now,
+                    transcript_path=_guess_claude_transcript_path(
+                        workspace_root, session_id
+                    ),
+                )
+                agent.sessions[session_id] = sess
+            agent.current_sid = session_id
+        agent.status = "running"
+        agent.last_event_at = now
+        await self._emit_event(
+            RegistryEvent(
+                kind="started",
+                agent=agent,
+                severity="low",
+                reason=(
+                    f"Claude Code session started in {agent.project_label}"
+                    + (f": {instruction[:120]}" if instruction else "")
+                ),
+            )
+        )
+        return agent
+
+    async def record_claude_code_event(
+        self,
+        *,
+        session_id: str,
+        kind: str,
+        text: str = "",
+        error: str = "",
+    ) -> None:
+        """Fold one Claude Code stream turn into the registry.
+
+        `kind` is the already-classified turn from the driver:
+        `assistant` (text is the assistant turn), `completion` (the run ended
+        cleanly), or `error` (error is the failure detail). The driver does
+        the SDK-message parsing; the registry owns the agent-state transition
+        and the narrator emit — the same split as `record_sdk_event` for the
+        Cursor SDK.
+        """
+        agent = self.agent_for_session(session_id)
+        if agent is None:
+            return
+        now = time.time()
+        agent.last_event_at = now
+        sess = agent.sessions.get(session_id)
+        if sess is None:
+            sess = SessionInfo(sid=session_id, started_at=now, last_event_at=now)
+            agent.sessions[session_id] = sess
+        sess.last_event_at = now
+        agent.current_sid = session_id
+
+        evt_kind: EventKind | None = None
+        severity: Severity = "low"
+        reason = ""
+        if kind == "assistant" and text:
+            agent.last_assistant_text = text[: self._truncate_chars]
+            sess.last_assistant_text = agent.last_assistant_text
+            q = _question_in_text(text)
+            agent.pending_question = q
+            if q:
+                evt_kind, severity, reason = (
+                    "question", "high", f"{agent.project_label} (Claude Code) asks: {q[:200]}",
+                )
+            else:
+                evt_kind, severity, reason = (
+                    "progress", "low",
+                    f"{agent.project_label} Claude Code thread {sess.sid[:8]} produced a turn.",
+                )
+        elif kind == "completion":
+            agent.status = "finished"
+            evt_kind, severity, reason = (
+                "finished", "high", f"Claude Code run finished in {agent.project_label}.",
+            )
+        elif kind == "error":
+            agent.status = "errored"
+            evt_kind, severity, reason = (
+                "errored", "high",
+                f"Claude Code run errored in {agent.project_label}: {str(error)[:200]}",
+            )
+        if evt_kind:
+            await self._emit_event(
+                RegistryEvent(kind=evt_kind, agent=agent, severity=severity, reason=reason)
+            )
 
     def agent_for_session(self, session_id: str) -> CursorAgent | None:
         """Reverse-lookup by transcript sid. O(N) on workspaces; N is small."""
@@ -485,16 +711,19 @@ class CursorAgentRegistry:
                     if isinstance(b, dict) and b.get("type") == "text"
                 ]
                 joined = "\n".join(t for t in texts if isinstance(t, str)).strip()
-                if joined:
-                    agent.last_assistant_text = joined[: self._truncate_chars]
-                    sess.last_assistant_text = agent.last_assistant_text
-                    q = _question_in_text(joined)
+                ask_q = _extract_ask_question(content)
+                if joined or ask_q:
+                    if joined:
+                        agent.last_assistant_text = joined[: self._truncate_chars]
+                        sess.last_assistant_text = agent.last_assistant_text
+                    # Explicit ask-the-user tool call wins over the prose heuristic.
+                    q = ask_q or _question_in_text(joined)
                     agent.pending_question = q
                     if q:
                         kind, severity, reason = (
                             "question",
                             "high",
-                            f"{agent.project_label} asked: {q[:200]}",
+                            f"{agent.project_label} is asking: {q[:200]}",
                         )
                     else:
                         kind, severity, reason = (
@@ -600,6 +829,15 @@ class CursorAgentRegistry:
     async def _tail_session(self, agent: CursorAgent, sess: SessionInfo) -> None:
         """Poll the JSONL file for new turns and update the agent in place."""
         last_event_grace_until = 0.0
+        # The pre-existing backlog — everything already in the transcript when
+        # this tailer attaches (after a bot restart, or the first time we ever
+        # see a thread) — is HISTORY: it happened before we were watching. We
+        # read it once to seed state, but must NOT emit events for it. Replaying
+        # it resurfaced stale/answered questions from days-old threads as fresh
+        # pings, and echoed the dev assistant's own AskQuestion back at the user
+        # ("ucs is asking..."). Only turns appended AFTER we catch up are real,
+        # notifiable activity.
+        primed = sess._tail_offset > 0
         try:
             while not self._stopping:
                 try:
@@ -617,32 +855,37 @@ class CursorAgentRegistry:
                         sess._tail_offset += len(new)
                         if new:
                             text_lines = new.decode("utf-8", errors="replace").splitlines()
-                            la, lu, plans = _parse_jsonl_turns(text_lines)
-                            if la:
+                            la, lu, plans, ask_q = _parse_jsonl_turns(text_lines)
+                            if la or ask_q:
                                 # The session that just produced output IS the
                                 # current one. Without this, concurrent threads
                                 # in one workspace clobber agent-level fields and
                                 # the narration can't say which thread spoke.
                                 agent.current_sid = sess.sid
-                                agent.last_assistant_text = la[: self._truncate_chars]
-                                sess.last_assistant_text = agent.last_assistant_text
-                                q = _question_in_text(la)
+                                if la:
+                                    agent.last_assistant_text = la[: self._truncate_chars]
+                                    sess.last_assistant_text = agent.last_assistant_text
+                                # An explicit ask-the-user tool call is the gold
+                                # decision signal and ALWAYS wins over the prose
+                                # heuristic (which only catches a trailing '?').
+                                q = ask_q or _question_in_text(la)
                                 agent.pending_question = q
-                                kind: EventKind = "question" if q else "progress"
-                                severity: Severity = "high" if q else "low"
-                                reason = (
-                                    f"{agent.project_label} asked: {q[:200]}"
-                                    if q
-                                    else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
-                                )
-                                await self._emit_event(
-                                    RegistryEvent(
-                                        kind=kind,
-                                        agent=agent,
-                                        severity=severity,
-                                        reason=reason,
+                                if primed:
+                                    kind: EventKind = "question" if q else "progress"
+                                    severity: Severity = "high" if q else "low"
+                                    reason = (
+                                        f"{agent.project_label} is asking: {q[:200]}"
+                                        if q
+                                        else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
                                     )
-                                )
+                                    await self._emit_event(
+                                        RegistryEvent(
+                                            kind=kind,
+                                            agent=agent,
+                                            severity=severity,
+                                            reason=reason,
+                                        )
+                                    )
                             if lu:
                                 agent.last_user_text = lu[: self._truncate_chars]
                                 sess.last_user_text = agent.last_user_text
@@ -650,6 +893,9 @@ class CursorAgentRegistry:
                                 agent.recent_plan_files = plans[-5:]
                             sess.last_event_at = time.time()
                             agent.last_event_at = sess.last_event_at
+                            # Caught up to the backlog; subsequent appends are
+                            # live activity and DO notify.
+                            primed = True
                 except FileNotFoundError:
                     pass
                 except Exception:
@@ -751,6 +997,25 @@ def _status_from_hook(hook_type: str, payload: dict, prior: Status) -> Status:
     return prior
 
 
+def _session_live(sess: "SessionInfo", now: float) -> bool:
+    """True iff this thread is actively generating RIGHT NOW: its status is
+    running AND its last hook landed within the recency window."""
+    return sess.status == "running" and (now - sess.last_event_at) <= RUNNING_RECENCY_SEC
+
+
+def _aggregate_agent_status(agent: "CursorAgent", now: float) -> Status:
+    """Workspace status as the aggregate of its threads — running if ANY thread
+    is live-running, so one thread finishing/aborting can't flip the whole
+    workspace to "finished" while a sibling is still working."""
+    sessions = list(agent.sessions.values())
+    if not sessions:
+        return agent.status
+    if any(_session_live(s, now) for s in sessions):
+        return "running"
+    latest = max(sessions, key=lambda s: s.last_event_at)
+    return latest.status if latest.status != "unknown" else agent.status
+
+
 # ---------------------------------------------------------------------------
 # SDK transcript path guess
 # ---------------------------------------------------------------------------
@@ -778,6 +1043,33 @@ def _guess_transcript_path(workspace_root: str, session_id: str) -> str | None:
         proj_data = os.path.join(base_dir, name)
         sub = os.path.join(proj_data, "agent-transcripts", session_id)
         jsonl = os.path.join(sub, f"{session_id}.jsonl")
+        if os.path.exists(jsonl):
+            return jsonl
+    return None
+
+
+def _guess_claude_transcript_path(workspace_root: str, session_id: str) -> str | None:
+    """Expected JSONL path for a Claude Code session.
+
+    Claude Code stores transcripts flat at
+    `~/.claude/projects/<munged-cwd>/<session-id>.jsonl`, where the cwd is
+    munged by replacing every `/` with `-`. Returns the path only if it
+    exists on disk (the driver's stream is the primary state source; this is
+    just so `cursor_read` can locate the durable file for a Claude Code thread).
+    """
+    if not session_id:
+        return None
+    base_dir = os.path.join(os.path.expanduser("~/.claude"), "projects")
+
+    def _munge(c: str) -> str:
+        return c.replace("/", "-")
+
+    candidates = [_munge(workspace_root)]
+    real = os.path.realpath(workspace_root) if os.path.exists(workspace_root) else workspace_root
+    if real != workspace_root:
+        candidates.append(_munge(real))
+    for name in candidates:
+        jsonl = os.path.join(base_dir, name, f"{session_id}.jsonl")
         if os.path.exists(jsonl):
             return jsonl
     return None

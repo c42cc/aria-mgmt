@@ -68,6 +68,22 @@ let player = null;
 let playbackStream = null;
 const speakerSubscriptions = new Set();
 
+// AUDIO TELEMETRY (stage C): outbound playback counters. Silence used to be
+// invisible here — doPlay returned without a word when player/connection were
+// absent. Now every drop is counted and surfaced.
+let playRx = 0;
+let playBytes = 0;
+let playDropped = 0;
+
+// Deafness detector. After a successful join the WebSocket can report a healthy
+// "connected" state while every inbound audio burst decodes to ZERO frames —
+// the failure mode observed 2026-06-11 when DAVE decrypt / Opus decode broke at
+// the MLS transition. Count consecutive speaking bursts that yielded no frames;
+// past the threshold, surface a hard error to Python instead of failing silently.
+// Reset on any decoded frame and on every fresh join/leave.
+let consecutiveEmptySpeakingBursts = 0;
+const EMPTY_BURST_DEAF_THRESHOLD = 3;
+
 client.once(Events.ClientReady, () => {
   diag("ClientReady", { user: client.user?.tag, id: client.user?.id });
   emit({ event: "ready" });
@@ -99,7 +115,10 @@ function attachConnectionDiagnostics(conn, channel_id) {
       diag("voice recovery failed — destroying connection");
       try { conn.destroy(); } catch {}
       if (connection === conn) connection = null;
-      fail("voice connection lost and could not recover");
+      // Distinct event (not a generic error): the parent must reset its
+      // VoiceController from IN_VOICE back to DISCONNECTED so it stops routing
+      // audio into a dead pipeline and re-joins on the next utterance / reconcile.
+      emit({ event: "voice_lost", message: "voice connection lost and could not recover" });
     }
   });
 
@@ -159,6 +178,7 @@ async function doJoin({ channel_id }) {
     connection = null;
   }
   speakerSubscriptions.clear();
+  consecutiveEmptySpeakingBursts = 0;
 
   const channel = await client.channels.fetch(channel_id);
   if (!channel || !channel.guild) {
@@ -229,17 +249,41 @@ function setupReceiver(conn) {
     downsampler.on("data", (chunk) => {
       if (frameCount === 0) diag("first audio frame from speaker", { userId, bytes: chunk.length });
       frameCount++;
+      // Real audio is flowing — the receive path is healthy; clear the deaf counter.
+      consecutiveEmptySpeakingBursts = 0;
       emit({ event: "audio", user_id: userId, pcm_b64: chunk.toString("base64") });
     });
+    let cleanedUp = false;
     const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       speakerSubscriptions.delete(userId);
       diag("speaker stream ended", { userId, frameCount });
+      if (frameCount > 0) {
+        consecutiveEmptySpeakingBursts = 0;
+        return;
+      }
+      // The user spoke (we subscribed) but decoded nothing. One empty burst is
+      // normal noise; a run of them means the receive path is broken even though
+      // the connection looks healthy. Surface it loudly instead of dying silent.
+      consecutiveEmptySpeakingBursts++;
+      if (consecutiveEmptySpeakingBursts >= EMPTY_BURST_DEAF_THRESHOLD) {
+        fail(
+          `deaf: decoded 0 audio frames across ${consecutiveEmptySpeakingBursts} ` +
+          `consecutive speaking bursts since join — voice receive is broken ` +
+          `(likely DAVE decrypt / Opus decode failure)`
+        );
+        consecutiveEmptySpeakingBursts = 0; // re-arm; don't spam every burst
+      }
     };
     opusStream.on("end", cleanup);
     opusStream.on("close", cleanup);
     opusStream.on("error", (e) => { fail(`opus stream: ${e.message}`); cleanup(); });
-    decoder.on("error", (e) => fail(`opus decode: ${e.message}`));
-    downsampler.on("error", (e) => fail(`downsampler: ${e.message}`));
+    // Route decode/resample errors through cleanup too: a single bad packet must
+    // free the subscription (so the next speaking event rebuilds it) and feed the
+    // deaf detector, rather than wedging a half-dead pipeline in speakerSubscriptions.
+    decoder.on("error", (e) => { fail(`opus decode: ${e.message}`); cleanup(); });
+    downsampler.on("error", (e) => { fail(`downsampler: ${e.message}`); cleanup(); });
   });
 }
 
@@ -326,14 +370,56 @@ function doLeave() {
   }
   player = null;
   speakerSubscriptions.clear();
+  consecutiveEmptySpeakingBursts = 0;
   emit({ event: "left" });
 }
 
+// Authoritative voice presence from THIS bot's independent Discord gateway.
+// The py-cord parent's cached voice states go stale after a bare gateway RESUME
+// (exactly when the parent's reconcile loop must act). This sidecar is a second,
+// independent gateway connection, so its voiceStates cache is unlikely to be
+// stale at the same instant. Scan every guild for the authorized user and report
+// which voice channel (if any) they are in.
+function doQueryPresence() {
+  let channelId = null;
+  let channelName = null;
+  if (AUTHORIZED_USER_ID) {
+    for (const guild of client.guilds.cache.values()) {
+      const vs = guild.voiceStates.cache.get(AUTHORIZED_USER_ID);
+      if (vs && vs.channelId) {
+        channelId = vs.channelId;
+        channelName = vs.channel?.name ?? null;
+        break;
+      }
+    }
+  }
+  emit({ event: "presence", channel_id: channelId, channel_name: channelName });
+}
+
 function doPlay({ pcm_b64 }) {
-  if (!pcm_b64 || !player || !connection) return;
+  if (!pcm_b64) return;
+  const buf = Buffer.from(pcm_b64, "base64");
+  if (!player || !connection) {
+    playDropped++;
+    if (playDropped === 1 || playDropped % 50 === 0) {
+      diag("AUDIO[C doPlay]: DROPPING audio — no player/connection", {
+        dropped: playDropped, bytes: buf.length, hasPlayer: !!player, hasConn: !!connection,
+      });
+    }
+    return;
+  }
   const stream = ensurePlaybackStream();
-  if (!stream) return;
-  stream.push(Buffer.from(pcm_b64, "base64"));
+  if (!stream) {
+    playDropped++;
+    diag("AUDIO[C doPlay]: no playback stream", { dropped: playDropped });
+    return;
+  }
+  playRx++;
+  playBytes += buf.length;
+  if (playRx === 1 || playRx % 100 === 0) {
+    diag("AUDIO[C doPlay]: pushed chunk", { n: playRx, bytes: buf.length, total: playBytes });
+  }
+  stream.push(buf);
 }
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -344,11 +430,12 @@ rl.on("line", async (line) => {
 
   try {
     switch (cmd.action) {
-      case "join":     await doJoin(cmd); break;
-      case "leave":    doLeave(); break;
-      case "play":     doPlay(cmd); break;
-      case "shutdown": process.exit(0);
-      default:         fail(`unknown action: ${cmd.action}`);
+      case "join":           await doJoin(cmd); break;
+      case "leave":          doLeave(); break;
+      case "play":           doPlay(cmd); break;
+      case "query_presence": doQueryPresence(); break;
+      case "shutdown":       process.exit(0);
+      default:               fail(`unknown action: ${cmd.action}`);
     }
   } catch (e) {
     fail(`${cmd.action || "?"} failed: ${e.message}`);

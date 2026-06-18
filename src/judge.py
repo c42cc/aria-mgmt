@@ -7,7 +7,7 @@ records, never in this module.
 Run via CLI:  python -m src.judge [command]
 
 Governance: this module ADVISES. It never modifies system behavior, overrides
-user intent, or intervenes during sessions. See _ARCHITECTURE.md Fundamental 13.
+user intent, or intervenes during sessions. See ARCHITECTURE.md Fundamental 13.
 """
 
 from __future__ import annotations

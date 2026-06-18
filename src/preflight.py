@@ -161,6 +161,61 @@ async def probe_anthropic() -> tuple[bool, str, str, str]:
     return True, "", "", f"model={config.claude_model} usage={getattr(resp, 'usage', None)} text={text[:30]!r}"
 
 
+async def probe_gemini_audio() -> tuple[bool, str, str, str]:
+    """Gemini Live actually EMITS audio bytes for a short prompt (not just
+    connects). This is the probe whose absence let 'voice doesn't work' hide
+    for months: connect succeeded while the model produced no audio."""
+    from .config import config
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=config.google_api_key)
+    cfg = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore"))),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+    )
+    audio = bytearray()
+    tx = ""
+    async with client.aio.live.connect(model=config.gemini_model, config=cfg) as s:
+        await s.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(text="Say exactly: voice check.")]),
+            turn_complete=True,
+        )
+
+        async def collect():
+            nonlocal tx
+            async for msg in s.receive():
+                sc = msg.server_content
+                if not sc:
+                    continue
+                if sc.model_turn:
+                    for p in sc.model_turn.parts:
+                        if p.inline_data and p.inline_data.data:
+                            audio.extend(p.inline_data.data)
+                if sc.output_transcription and sc.output_transcription.text:
+                    tx += sc.output_transcription.text
+                if getattr(sc, "turn_complete", False):
+                    return
+
+        try:
+            await asyncio.wait_for(collect(), timeout=25)
+        except asyncio.TimeoutError:
+            pass
+    if len(audio) < 4000:  # < ~80ms of 24k s16le mono => effectively no voice
+        return (
+            False,
+            f"Gemini Live emitted only {len(audio)} audio bytes for a say-hello",
+            "Check GEMINI_MODEL (demand-throttling?) — model produced no/insufficient audio",
+            f"model={config.gemini_model} tx={tx[:40]!r}",
+        )
+    return True, "", "", (
+        f"model={config.gemini_model} emitted {len(audio)} bytes "
+        f"(~{len(audio)/48000:.1f}s) tx={tx[:30]!r}"
+    )
+
+
 async def probe_gemini_connect() -> tuple[bool, str, str, str]:
     """Gemini Live WebSocket connects and closes cleanly."""
     from .gemini_session import GeminiSession
@@ -738,6 +793,11 @@ async def probe_prompts() -> tuple[bool, str, str, str]:
         "architecture",
         "bug-analysis",
         "refactor",
+        "cc_plan",
+        "cc_implement",
+        "cc_verify",
+        "cc_merge_upstream",
+        "cc_chat_review",
     ]
     sizes = {}
     for name in templates:
@@ -1063,6 +1123,75 @@ async def probe_sparks() -> tuple[bool, str, str, str]:
     return True, "", "", ", ".join(detail_bits) or "no spark nodes configured"
 
 
+async def probe_claude_code() -> tuple[bool, str, str, str]:
+    """Claude Code (Agent SDK) does a round-trip on the Max subscription. WARN.
+
+    Strips ANTHROPIC_API_KEY first (the billing guard the driver applies at
+    every spawn) so a success proves the spawned `claude` authenticated via the
+    subscription OAuth in ~/.claude, NOT the app's per-token key. Advisory: a
+    Claude Code hiccup must never block the whole bot.
+    """
+    from .claude_code import DEFAULT_CLAUDE_CODE_REPO
+
+    if not os.path.isdir(DEFAULT_CLAUDE_CODE_REPO):
+        return (
+            False,
+            f"managed Claude Code repo not found: {DEFAULT_CLAUDE_CODE_REPO}",
+            "Duplicate the repo (live_visuals_4_CC) next to ucs2",
+            "",
+        )
+    # Billing guard: force the subscription path for this probe's `claude`.
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        from claude_agent_sdk import (
+            query, ClaudeAgentOptions, ResultMessage, AssistantMessage, TextBlock,
+        )
+    except Exception as exc:
+        return False, f"claude-agent-sdk import failed: {exc}", ".venv/bin/pip install claude-agent-sdk", ""
+
+    opts = ClaudeAgentOptions(
+        cwd=DEFAULT_CLAUDE_CODE_REPO,
+        setting_sources=[],          # skip the heavy project CLAUDE.md for a fast health check
+        permission_mode="plan",      # no tool execution
+        max_turns=1,
+        max_budget_usd=1.0,
+        system_prompt="You are a health probe. Reply with exactly: PREFLIGHT_OK",
+    )
+    text = ""
+    result: Any = None
+
+    async def _drive() -> None:
+        nonlocal text, result
+        async for msg in query(prompt="Reply with exactly: PREFLIGHT_OK", options=opts):
+            if isinstance(msg, AssistantMessage):
+                text += "".join(b.text for b in msg.content if isinstance(b, TextBlock))
+            elif isinstance(msg, ResultMessage):
+                result = msg
+
+    try:
+        await asyncio.wait_for(_drive(), timeout=60)
+    except asyncio.TimeoutError:
+        return False, "Claude Code round-trip timed out after 60s", "claude /status  (confirm subscription + install)", ""
+
+    if result is None:
+        return False, "no ResultMessage from Claude Code round-trip", "claude /login", text[:120]
+    if getattr(result, "is_error", False):
+        sub = getattr(result, "subtype", "")
+        return (
+            False,
+            f"Claude Code round-trip errored (subtype={sub})",
+            "claude /login   (subscription) — and ensure no ANTHROPIC_API_KEY in the launch shell",
+            str(getattr(result, "result", ""))[:160],
+        )
+    cost = getattr(result, "total_cost_usd", None)
+    leaked = "ANTHROPIC_API_KEY" in os.environ
+    return (
+        True, "", "",
+        f"subscription round-trip OK (notional cost~${cost}); reply={text[:30]!r}; "
+        f"env_key_present_after={leaked}",
+    )
+
+
 async def _run_all_inner(
     *,
     mcp_client: Any = None,
@@ -1089,6 +1218,10 @@ async def _run_all_inner(
     report.results.append(await _run_probe("anthropic", CRITICAL, probe_anthropic))
     if include_gemini:
         report.results.append(await _run_probe("gemini_connect", CRITICAL, probe_gemini_connect))
+        # Connect is necessary but not sufficient: assert the model actually
+        # emits audio bytes. WARN (not CRITICAL) so a transient demand-throttle
+        # at boot surfaces loudly without bricking the bot.
+        report.results.append(await _run_probe("gemini_audio", WARN, probe_gemini_audio))
     report.results.append(await _run_probe("mem0", WARN, probe_mem0))
 
     # Discord
@@ -1146,6 +1279,10 @@ async def _run_all_inner(
         report.results.append(
             await _run_probe("cursor_bridge", WARN, lambda: probe_cursor_bridge(cursor_bridge))
         )
+
+    # Claude Code (Agent SDK) — Aria drives Claude Code on live_visuals_4_CC.
+    # Advisory round-trip that also verifies the subscription billing path.
+    report.results.append(await _run_probe("claude_code", WARN, probe_claude_code))
 
     # Voice + messaging environment — silent breakers that previously had no
     # probe, so a missing ffmpeg / wrong voice id / missing Full Disk Access

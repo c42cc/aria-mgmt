@@ -403,6 +403,90 @@ TOOL_DECLARATIONS = [
             required=["workspace_root", "instruction"],
         ),
     ),
+    # ---- Claude Code (Aria drives Claude Code on a repo) --------------------
+    types.FunctionDeclaration(
+        name="claude_code_spawn",
+        description=(
+            "Start a NEW Claude Code thread on a repo and hand it an instruction. "
+            "This is how you wield Claude Code (the migrated live_visuals_4_CC by "
+            "default). Defaults to Plan Mode, so it proposes a plan to review/edit "
+            "before any change. Returns session_id; then claude_code_read to see the "
+            "plan and claude_code_send (kind=approve) to execute. Before spawning, "
+            "say what you'll tell it and let Corbin adjust the instruction."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "workspace_root": types.Schema(type="STRING", description="Project name or absolute path; omit for the managed live_visuals_4_CC repo."),
+                "instruction": types.Schema(type="STRING", description="The task for the Claude Code thread."),
+                "mode": types.Schema(type="STRING", description="plan (default) | acceptEdits | default."),
+            },
+            required=["instruction"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="claude_code_send",
+        description=(
+            "Send a follow-up to a live Claude Code thread, or approve / reject / "
+            "cancel it. kind=approve proceeds with the reviewed plan; kind=chat sends "
+            "a message (e.g. relaying Corbin's answer to its question); kind=cancel "
+            "stops it. Get the agent_id from claude_code_threads / cursor_agents."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(type="STRING", description="Thread handle from claude_code_threads/cursor_agents."),
+                "message": types.Schema(type="STRING", description="Message for kind=chat, or note for approve/reject."),
+                "kind": types.Schema(type="STRING", description="chat | approve | reject | cancel. Default chat."),
+            },
+            required=["agent_id"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="claude_code_read",
+        description=(
+            "Read a Claude Code thread's latest turns + status — its proposed plan, "
+            "progress, or pending question. Omit agent_id for the managed repo's thread."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "agent_id": types.Schema(type="STRING", description="Thread handle; omit for the managed repo."),
+                "n_turns": types.Schema(type="INTEGER", description="Recent turns (default 5, max 25)."),
+            },
+            required=[],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="claude_code_threads",
+        description=(
+            "List the Claude Code threads Aria is driving, with status and any "
+            "pending questions. Use to find a handle before claude_code_read / send."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "project": types.Schema(type="STRING", description="Optional project filter."),
+            },
+            required=[],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="ask_user",
+        description=(
+            "Ask Corbin an OPEN question and wait for his reply, returning the answer. "
+            "Use when you need an open answer a yes/no can't carry — especially to "
+            "relay a Claude Code thread's pending question and feed his answer back "
+            "via claude_code_send. For a simple approve/skip, use propose_action."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "question": types.Schema(type="STRING", description="The question to put to Corbin."),
+            },
+            required=["question"],
+        ),
+    ),
     types.FunctionDeclaration(
         name="cursor_screenshot",
         description=(
@@ -585,6 +669,13 @@ class GeminiSession:
         # response, and leave the model unaware of what happened. The
         # close path now awaits these with a bounded timeout (L1 fix).
         self._dispatch_tasks: set[asyncio.Task] = set()
+        # Realtime input (audio / audio_stream_end / activity) MUST be suppressed
+        # while a tool call is in flight: Gemini Live closes the socket with 1008
+        # ("Operation is not implemented…") if any send_realtime_input arrives
+        # between a tool_call and its send_tool_response (forensic 2026-06-16,
+        # confirmed on the Google AI dev forum). A counter (not a bool) so
+        # concurrent dispatches each gate and ungate correctly.
+        self._pending_tool_calls: int = 0
 
     @property
     def connected(self) -> bool:
@@ -638,8 +729,12 @@ class GeminiSession:
         self._connected = True
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
-        """Send PCM audio chunk (16kHz mono int16) to Gemini."""
-        if not self._session or not self._connected:
+        """Send PCM audio chunk (16kHz mono int16) to Gemini.
+
+        Dropped while a tool call is pending — Gemini Live rejects realtime
+        input during the tool_call→tool_response window and closes with 1008.
+        """
+        if not self._session or not self._connected or self._pending_tool_calls > 0:
             return
         try:
             await self._session.send_realtime_input(
@@ -659,7 +754,7 @@ class GeminiSession:
         utterance and then need to deterministically end the user turn so
         Aria responds without waiting for VAD timeout.
         """
-        if not self._session or not self._connected:
+        if not self._session or not self._connected or self._pending_tool_calls > 0:
             return
         try:
             await self._session.send_realtime_input(audio_stream_end=True)
@@ -810,6 +905,19 @@ class GeminiSession:
                             self._idle_event.clear()
                             for part in sc.model_turn.parts:
                                 if part.inline_data and part.inline_data.data:
+                                    # AUDIO TELEMETRY (stage A): prove Gemini is
+                                    # actually emitting voice bytes. Silence here
+                                    # means the model produced no audio (preview
+                                    # 503/429/modality), not a transport break.
+                                    _n = len(part.inline_data.data)
+                                    self._audio_out_chunks = getattr(self, "_audio_out_chunks", 0) + 1
+                                    self._audio_out_bytes = getattr(self, "_audio_out_bytes", 0) + _n
+                                    if self._audio_out_chunks == 1 or self._audio_out_chunks % 100 == 0:
+                                        log.info(
+                                            "AUDIO[A gemini-out]: chunk #%d (%d bytes; %d total, ~%.1fs @24k)",
+                                            self._audio_out_chunks, _n, self._audio_out_bytes,
+                                            self._audio_out_bytes / 48000.0,
+                                        )
                                     try:
                                         self._audio_out_queue.put_nowait(part.inline_data.data)
                                     except asyncio.QueueFull:
@@ -858,27 +966,37 @@ class GeminiSession:
                             log.info("Gemini tool call: %s(%s)", fc.name, fc.id)
 
                             if fc.name == "confirm_action":
-                                args = dict(fc.args) if fc.args else {}
-                                action_id = args.get("action_id", "")
-                                if action_id in self._pending_confirmations:
-                                    self._confirmation_results[action_id] = {
-                                        "approved": args.get("approved", False),
-                                        "modifications": args.get("modifications"),
-                                    }
-                                    self._pending_confirmations[action_id].set()
-                                await self._session.send_tool_response(
-                                    function_responses=types.FunctionResponse(
-                                        name=fc.name,
-                                        response={"result": "confirmation recorded"},
-                                        id=fc.id,
+                                self._pending_tool_calls += 1
+                                try:
+                                    args = dict(fc.args) if fc.args else {}
+                                    action_id = args.get("action_id", "")
+                                    if action_id in self._pending_confirmations:
+                                        self._confirmation_results[action_id] = {
+                                            "approved": args.get("approved", False),
+                                            "modifications": args.get("modifications"),
+                                        }
+                                        self._pending_confirmations[action_id].set()
+                                    await self._session.send_tool_response(
+                                        function_responses=types.FunctionResponse(
+                                            name=fc.name,
+                                            response={"result": "confirmation recorded"},
+                                            id=fc.id,
+                                        )
                                     )
-                                )
+                                finally:
+                                    self._pending_tool_calls = max(0, self._pending_tool_calls - 1)
                                 continue
 
                             if self.tool_handler:
+                                # Gate realtime input until this tool's response
+                                # is sent — the done-callback fires after
+                                # _dispatch_tool_call returns (post
+                                # send_tool_response), which reopens the gate.
+                                self._pending_tool_calls += 1
                                 task = asyncio.create_task(self._dispatch_tool_call(fc))
                                 self._dispatch_tasks.add(task)
                                 task.add_done_callback(self._dispatch_tasks.discard)
+                                task.add_done_callback(self._on_dispatch_done)
 
             except asyncio.CancelledError:
                 log.info("Gemini receive loop cancelled")
@@ -918,6 +1036,11 @@ class GeminiSession:
                     log.exception("Gemini reconnect failed")
                     self._connected = False
                     return
+
+    def _on_dispatch_done(self, _task: asyncio.Task) -> None:
+        """A dispatched tool call finished (response sent, or orphaned) —
+        reopen the realtime-input gate so audio can resume."""
+        self._pending_tool_calls = max(0, self._pending_tool_calls - 1)
 
     async def _dispatch_tool_call(self, fc: Any) -> None:
         """Run a tool handler and send the response back to Gemini.

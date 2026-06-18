@@ -179,9 +179,9 @@ unification emerge naturally.
 |---|---|---|
 | Prompt Library (version control) | **Implemented** | `src/prompts.py` — version archival in `prompt_versions` table with origin tracking, rollback by voice |
 | Prompt Library (metadata/affinity) | Deferred | Not yet needed — Phase 1 data doesn't show model-specific prompt tuning demand |
-| Injection Engine (context budget) | **Implemented** | `src/ucs.py` `InjectionEngine` — priority-ordered truncation, persisted to `loop_executions` (`context_truncated`, `turns_dropped`) |
-| Intelligence Loop | **Implemented** (behind flag) | `src/ucs.py` `IntelligenceLoop` — `UCS_ENABLED=true` activates, legacy path is default |
-| Model Router | **Implemented** (behind flag) | `src/ucs.py` `ModelRouter` — reads `models.yaml`, affinity + fallback chains |
+| Injection Engine (context budget) | **Folded in** | Context-budget truncation now lives in the single agent loop; `loop_executions` still records `context_truncated` / `turns_dropped`. |
+| Intelligence Loop | **Removed** | The flag-gated `src/ucs.py` `IntelligenceLoop` (`UCS_ENABLED`) was a dormant duplicate of the agent loop and was deleted; there is one loop, in `src/tools.py`. |
+| Model Router | **Removed** | `src/ucs.py` `ModelRouter` went with the flag; `models.yaml` is still read for model config (`src/config.py`, `src/tools.py`). |
 | Evaluation Layer | **Implemented** (offline CLI) | `src/eval.py` — approval-rate scoring from execution logs |
 | Model Registry | **Implemented** | `models.yaml` — single source of truth for models, costs, capabilities |
 | Execution Logging | **Implemented** | `loop_executions` table — every reasoning call logged with model/tokens/latency/cost |
@@ -190,4 +190,4 @@ unification emerge naturally.
 | Local Dashboard | Deferred | SQL queries suffice |
 
 **Governance:** User voice edits to prompts always win. The eval layer
-advises; it does not override. See `_ARCHITECTURE.md` Fundamental 13.
+advises; it does not override. See `ARCHITECTURE.md` Fundamental 13.

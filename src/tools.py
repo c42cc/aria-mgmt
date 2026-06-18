@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -42,6 +43,13 @@ from .cursor_tools import (
     _cursor_status_new,
     _cursor_threads,
 )
+from .claude_code import (
+    _claude_code_read,
+    _claude_code_send,
+    _claude_code_spawn,
+    _claude_code_threads,
+)
+from .capability import unverified_world_changes
 from .conversation import conversation
 from .outcomes import (
     TRANSIENT_RETRY_BUDGET,
@@ -459,6 +467,11 @@ _progress_callback: Callable[..., Coroutine] | None = None
 # to Corbin's phone and, on approval, runs the task autonomously. This is where
 # human decisions live now that per-command confirmation is off.
 _propose_callback: Callable[..., Coroutine] | None = None
+# Blocking free-text question sink. Injected by bot.py; posts a question to the
+# user and blocks for their typed/spoken reply (returns the answer text). Used
+# when a task — including a Claude Code thread surfaced through Aria — needs an
+# open answer mid-flight, not just a yes/no.
+_ask_callback: Callable[..., Coroutine] | None = None
 # Discord text-history fetchers injected at boot. Wired by bot.py so the
 # tools layer doesn't take a hard dependency on the discord client.
 _discord_history_callback: Callable[..., Coroutine] | None = None
@@ -623,11 +636,12 @@ def init_tools(
     discord_threads_callback: Callable[..., Coroutine] | None = None,
     progress_callback: Callable[..., Coroutine] | None = None,
     propose_callback: Callable[..., Coroutine] | None = None,
+    ask_callback: Callable[..., Coroutine] | None = None,
 ) -> None:
     """Initialize tool dependencies. Call once at bot startup."""
     global _anthropic_client, _cursor_bridge
     global _post_callback, _alert_callback, _thread_callback, _cursor_event_callback
-    global _reconnect_callback, _progress_callback, _propose_callback
+    global _reconnect_callback, _progress_callback, _propose_callback, _ask_callback
     global _discord_history_callback, _discord_threads_callback
 
     # timeout/max_retries bound each agent-loop request (see config note).
@@ -644,6 +658,7 @@ def init_tools(
     _reconnect_callback = reconnect_callback
     _progress_callback = progress_callback
     _propose_callback = propose_callback
+    _ask_callback = ask_callback
     _discord_history_callback = discord_history_callback
     _discord_threads_callback = discord_threads_callback
     _load_project_registry()
@@ -687,6 +702,54 @@ def _load_project_registry() -> None:
         log.warning("Project registry not found at %s", config.projects_registry)
 
 
+async def _invoke_handler(
+    handler: Callable[..., Coroutine[Any, Any, Any]], args: dict
+) -> Any:
+    """The one typed dispatch contract for every tool handler.
+
+    `handle_tool_call` and the do_with_claude loop used to splat caller args
+    straight into a typed handler (`handler(**args)`), so a single drifted
+    argument name crashed the entire call — the root of the
+    `_do_with_claude() got an unexpected keyword argument 'prompt'` failure
+    (forensic 2026-06-16). Here we pass only the kwargs the handler actually
+    accepts: a missing REQUIRED argument returns a clean typed `schema` error
+    the model can correct, and a stray unknown argument is dropped with a loud
+    log line instead of taking down the call.
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return await handler(**args)  # best effort for un-introspectable callables
+    kw_kinds = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return await handler(**args)
+    accepted = {n for n, p in sig.parameters.items() if p.kind in kw_kinds}
+    required = {
+        n for n, p in sig.parameters.items()
+        if p.kind in kw_kinds and p.default is inspect.Parameter.empty
+    }
+    filtered = {k: v for k, v in args.items() if k in accepted}
+    missing = required - filtered.keys()
+    if missing:
+        return json.dumps({
+            "_error_class": "schema",
+            "error": (
+                f"argument mismatch: missing required {sorted(missing)}. "
+                f"Provided {sorted(args)}; this tool accepts {sorted(accepted)}."
+            ),
+        })
+    dropped = args.keys() - accepted
+    if dropped:
+        log.warning(
+            "dispatch dropped unknown args for %s: %s",
+            getattr(handler, "__name__", repr(handler)), sorted(dropped),
+        )
+    return await handler(**filtered)
+
+
 async def handle_tool_call(name: str, args: dict) -> str:
     """Dispatch a tool call by name. Returns JSON string."""
     handlers = {
@@ -698,6 +761,7 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "do_with_claude": _do_with_claude,
         "create_42c_account": _create_42c_account,
         "propose_action": _propose_action,
+        "ask_user": _ask_user_tool,
         "remember": _remember,
         "recall": _recall,
         "cancel_current_task": _cancel_current_task,
@@ -724,6 +788,11 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "cursor_spawn": _cursor_spawn,
         "cursor_screenshot": _cursor_screenshot,
         "cursor_threads": _cursor_threads,
+        # Claude Code (Agent SDK) — Aria drives Claude Code on a repo.
+        "claude_code_spawn": _claude_code_spawn,
+        "claude_code_send": _claude_code_send,
+        "claude_code_read": _claude_code_read,
+        "claude_code_threads": _claude_code_threads,
         # Discord text-history tools — read-only.
         "discord_recent_messages": _discord_recent_messages,
         "discord_list_threads": _discord_list_threads,
@@ -743,6 +812,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "get_focused_app", "focus_app", "dictate_into_focused_app",
         "cursor_agents", "cursor_read", "cursor_send", "cursor_spawn",
         "cursor_screenshot",
+        # Claude Code runs on the Max subscription (Agent SDK credit), bounded
+        # per-run by claude_code_max_budget_usd — not the real-API daily $ cap.
+        "claude_code_spawn", "claude_code_send", "claude_code_read", "claude_code_threads",
         "discord_recent_messages", "discord_list_threads",
         # No paid API spend — just an htpasswd write + Fly deploy. Must remain
         # usable even when the daily ceiling is hit (it's a user-requested action).
@@ -750,6 +822,8 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # Just posts a card + spawns a waiter; the approved task pays its own
         # spend when it runs. Proposing is free.
         "propose_action",
+        # Posts a question + blocks for a reply; spends nothing itself.
+        "ask_user",
         # Spark ops/diagnostics must stay usable even at the daily cap: status
         # is read-only, setup spends nothing on our API, and verify only spends
         # a few cents on Gemini visual checks. Operability beats the gate here.
@@ -765,7 +839,7 @@ async def handle_tool_call(name: str, args: dict) -> str:
 
     start = time.monotonic()
     try:
-        result = await handler(**args)
+        result = await _invoke_handler(handler, args)
         duration_ms = int((time.monotonic() - start) * 1000)
         log_event(name, args, str(result)[:10_000], duration_ms)
         result_str = result if isinstance(result, str) else json.dumps(result)
@@ -841,10 +915,7 @@ async def _plan_with_claude(
     session_key: str,
     prompt_template: str = "planning",
 ) -> str:
-    if config.ucs_enabled:
-        result = await _plan_with_claude_ucs(context, session_key, prompt_template)
-    else:
-        result = await _plan_with_claude_legacy(context, session_key, prompt_template)
+    result = await _plan_with_claude_legacy(context, session_key, prompt_template)
 
     # Ground write at the seam that knows the artifact: this plan is now what
     # "the plan" refers to. Telemetry-class — never breaks the planning path.
@@ -928,61 +999,6 @@ async def _plan_with_claude_legacy(
     )
 
     return result_text
-
-
-async def _plan_with_claude_ucs(
-    context: str,
-    session_key: str,
-    prompt_template: str = "planning",
-) -> str:
-    state = _state_for(session_key)
-    state.cancel = False
-    state.claude_calls += 1
-    if state.claude_calls > config.per_session_claude_calls_max:
-        return json.dumps({"error": f"Per-session Claude call limit ({config.per_session_claude_calls_max}) reached"})
-
-    from .ucs import get_loop
-
-    history = get_planning_history(session_key)
-    memories = mem_recall(context, limit=3)
-
-    started_at_iso = _now_iso()
-    result = await get_loop().execute_planning(
-        context=context,
-        session_key=session_key,
-        prompt_template=prompt_template,
-        memories=memories if memories else None,
-        history=history if history else None,
-        cancel_check=lambda: state.cancel,
-    )
-
-    if memories:
-        memory_context = "\n".join(f"- {m.get('memory', m.get('text', ''))}" for m in memories)
-        history_context = f"Relevant memories:\n{memory_context}\n\n{context}"
-    else:
-        history_context = context
-    append_planning_history(session_key, "user", history_context)
-    append_planning_history(session_key, "assistant", result.text)
-
-    log_event("plan_with_claude", {"session_key": session_key}, result.text[:200], 0, session_key, result.total_cost)
-    log_loop_execution(
-        tool_name="plan_with_claude",
-        session_key=session_key,
-        prompt_template=prompt_template,
-        model_id=result.model_id,
-        routing_path="ucs",
-        tokens_in=result.total_tokens_in,
-        tokens_out=result.total_tokens_out,
-        cost_usd=result.total_cost,
-        latency_ms=result.latency_ms,
-        iterations=result.iterations,
-        status=result.status,
-        context_truncated=result.context_truncated,
-        turns_dropped=result.turns_dropped,
-        started_at=started_at_iso,
-    )
-
-    return result.text
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1529,77 @@ _CURSOR_AGENTS_TOOL_SCHEMA: dict[str, Any] = {
     "input_schema": {"type": "object", "properties": {}, "required": []},
 }
 
+_CLAUDE_CODE_SPAWN_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "claude_code_spawn",
+    "description": (
+        "Start a NEW Claude Code thread on a repo and hand it an instruction. "
+        "This is how Aria drives Claude Code (the migrated live_visuals_4_CC by "
+        "default). Defaults to Plan Mode, so it proposes a plan to review/edit "
+        "before any file changes. Returns session_id; then claude_code_read to "
+        "see the plan and claude_code_send (kind=approve) to execute it."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "workspace_root": {"type": "string", "description": "Project name or absolute path. Omit for the managed live_visuals_4_CC repo."},
+            "instruction": {"type": "string", "description": "The task/instruction for the Claude Code thread."},
+            "mode": {"type": "string", "description": "plan (default) | acceptEdits | default. Plan first unless the user said to just do it."},
+        },
+        "required": ["instruction"],
+    },
+}
+
+_CLAUDE_CODE_SEND_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "claude_code_send",
+    "description": (
+        "Send a follow-up to a live Claude Code thread, or approve / reject / "
+        "cancel it. kind=approve proceeds with the plan (switches to acceptEdits "
+        "so it executes); kind=chat sends a message; kind=cancel tears it down. "
+        "Get the agent_id from cursor_agents / claude_code_threads."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string", "description": "Thread handle (workspace path/name) from claude_code_threads/cursor_agents."},
+            "message": {"type": "string", "description": "The message (for kind=chat), or note for approve/reject."},
+            "kind": {"type": "string", "description": "chat | approve | reject | cancel. Default chat."},
+        },
+        "required": ["agent_id"],
+    },
+}
+
+_CLAUDE_CODE_READ_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "claude_code_read",
+    "description": (
+        "Read the latest turns + status of a Claude Code thread (its proposed "
+        "plan, progress, or pending question). Omit agent_id for the managed "
+        "live_visuals_4_CC thread."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string", "description": "Thread handle; omit for the managed repo."},
+            "n_turns": {"type": "integer", "description": "Recent turns to return (default 5, max 25)."},
+        },
+        "required": [],
+    },
+}
+
+_CLAUDE_CODE_THREADS_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "claude_code_threads",
+    "description": (
+        "List the Claude Code threads Aria is driving, with status and pending "
+        "questions. Use to find a thread handle before claude_code_read / send."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "project": {"type": "string", "description": "Optional project filter; omit for all."},
+        },
+        "required": [],
+    },
+}
+
 
 def _apr1_hash(password: str) -> str:
     """Apache apr1 (MD5) password hash via openssl — the format nginx expects.
@@ -1821,6 +1908,37 @@ async def _set_ground_tool(
                        "path": path or None})
 
 
+_ASK_USER_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "ask_user",
+    "description": (
+        "Ask the user an OPEN question and BLOCK for their typed/spoken reply, "
+        "returning the answer. Use when you need an open answer mid-task that a "
+        "yes/no can't carry — including relaying a Claude Code thread's pending "
+        "question back to the user and feeding their answer to claude_code_send. "
+        "For a simple approve/skip, prefer propose_action."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The question to put to the user."},
+        },
+        "required": ["question"],
+    },
+}
+
+
+async def _ask_user_tool(question: str = "", session_key: str = "") -> str:
+    """Ask the user an open question and block for the reply."""
+    if _ask_callback is None:
+        return json.dumps({"error": "ask_user is not wired (no Discord surface)."})
+    if not (question or "").strip():
+        return json.dumps({"error": "question is required."})
+    answer = await _ask_callback(question, session_key)
+    if not answer:
+        return json.dumps({"answered": False, "note": "No reply before timeout."})
+    return json.dumps({"answered": True, "answer": answer})
+
+
 # Local (non-MCP) tools the do_with_claude loop can dispatch alongside the MCP
 # catalog. create_42c_account provisions a login deterministically; the cursor_*
 # tools give the text agent the same durable Cursor-thread introspection and
@@ -1835,6 +1953,11 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _CURSOR_SEND_TOOL_SCHEMA,
     _CURSOR_SPAWN_TOOL_SCHEMA,
     _CURSOR_AGENTS_TOOL_SCHEMA,
+    _CLAUDE_CODE_SPAWN_TOOL_SCHEMA,
+    _CLAUDE_CODE_SEND_TOOL_SCHEMA,
+    _CLAUDE_CODE_READ_TOOL_SCHEMA,
+    _CLAUDE_CODE_THREADS_TOOL_SCHEMA,
+    _ASK_USER_TOOL_SCHEMA,
     _SPARK_STATUS_TOOL_SCHEMA,
     _SPARK_VERIFY_TOOL_SCHEMA,
     _SPARK_SETUP_TOOL_SCHEMA,
@@ -1847,6 +1970,11 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "cursor_send": _cursor_send,
     "cursor_spawn": _cursor_spawn,
     "cursor_agents": _cursor_agents,
+    "claude_code_spawn": _claude_code_spawn,
+    "claude_code_send": _claude_code_send,
+    "claude_code_read": _claude_code_read,
+    "claude_code_threads": _claude_code_threads,
+    "ask_user": _ask_user_tool,
     "spark_status": _spark_status,
     "spark_verify": _spark_verify,
     "spark_setup": _spark_setup,
@@ -1858,6 +1986,7 @@ _SESSION_KEY_LOCAL_TOOLS = frozenset({
     "create_42c_account",
     "spark_status", "spark_verify", "spark_setup",
     "set_ground",
+    "ask_user",
 })
 
 
@@ -2148,7 +2277,7 @@ async def _do_with_claude_loop(
             system=system_blocks,
             messages=messages,
             tools=tools,
-            max_tokens=4096,
+            max_tokens=config.do_with_claude_max_output_tokens,
         )
 
         usage = response.usage
@@ -2202,6 +2331,19 @@ async def _do_with_claude_loop(
                 status="completed",
                 started_at=started_at_iso,
             )
+            # Postcondition gate: never let a world-changing action stand as
+            # "done" when its own result carried a hard failure signal. Append
+            # an honest, factual "could not confirm" note rather than letting
+            # the narration assert success (the "Done, I emailed it" failure).
+            unverified = unverified_world_changes(tool_trace)
+            if unverified:
+                result = result + (
+                    "\n\n---\n_Unverified: "
+                    + ", ".join(unverified)
+                    + " — I could not confirm these actually succeeded / were "
+                    "delivered (failure signal or no confirmation in the tool "
+                    "result); treat them as not done until confirmed._"
+                )
             _save_ledger("completed")
             state.last_tool_trace = _cap_trace_size(tool_trace) or None
             return result
@@ -2246,7 +2388,7 @@ async def _do_with_claude_loop(
                     local_args = dict(tool_args)
                     if block.name in _SESSION_KEY_LOCAL_TOOLS:
                         local_args.setdefault("session_key", session_key)
-                    result_str = await local_handler(**local_args)
+                    result_str = await _invoke_handler(local_handler, local_args)
                 else:
                     tool_result = await mcp_client.call_tool(
                         block.name, tool_args, session_key=session_key,

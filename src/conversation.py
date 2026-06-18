@@ -10,9 +10,11 @@ This module owns that continuity. It is the single in-memory place where
 turns from both sides are interleaved into one thread.
 
 Failure mode is loud-but-bounded: the buffer is a bounded deque, so we
-cannot OOM from runaway sessions. The buffer is **not** persisted; on
-restart Aria starts fresh. mem0 is the place for durable facts. This
-buffer is the *conversational* context — what was just said.
+cannot OOM from runaway sessions. Every turn is written through to the
+durable conversation log of record (`db.conversation_log`): the buffer is a
+bounded in-memory *cache* over that log, not the source of truth, so a
+restart no longer wipes what was said (`hydrate()` reloads the tail). mem0
+remains the home for durable *facts*; this is the durable *conversation*.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Literal
+
+from .db import append_conversation_turn, recent_conversation_turns
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +159,39 @@ class ConversationBuffer:
         if not body:
             return
         self._turns.append(turn)
+        # Write through to the durable log of record. The in-memory turn is
+        # already recorded above; the persist is best-effort (it logs its own
+        # failure and never raises) so a DB hiccup can't break a live turn.
+        append_conversation_turn(
+            role=turn.role,
+            medium=turn.medium,
+            channel=turn.channel,
+            text=turn.text,
+            session_key=turn.session_key,
+            parent_channel=turn.parent_channel,
+        )
+
+    def hydrate(self, limit: int = _MAX_TURNS) -> int:
+        """Reload the tail of the durable log into the cache on startup, so a
+        restart resumes the conversation instead of beginning blank.
+
+        Only fills when the buffer is empty, so it never duplicates live turns.
+        Returns the number of turns loaded.
+        """
+        if self._turns:
+            return 0
+        loaded = 0
+        for r in recent_conversation_turns(limit=limit):
+            self._turns.append(Turn(
+                role=r.get("role", "user"),
+                medium=r.get("medium", "text"),
+                channel=r.get("channel") or "",
+                text=r.get("text") or "",
+                session_key=r.get("session_key") or "",
+                parent_channel=r.get("parent_channel") or "",
+            ))
+            loaded += 1
+        return loaded
 
     # -- readers --------------------------------------------------------
 

@@ -33,6 +33,16 @@ class Config:
     authorized_voice_user_id: str = os.getenv("AUTHORIZED_VOICE_USER_ID", "")
 
     # Models
+    # Voice model. gemini-3.1-flash-live-preview. The native-audio family was
+    # pinned here before (more natural voice, less 429-throttled), but the Live
+    # API native-audio path is fundamentally unreliable for the tool loop: it
+    # intermittently 500s on TTS, emits 0 audio bytes under demand, and — the
+    # real blocker — does NOT reliably emit function calls, so spoken requests
+    # never reached do_with_claude (forensic 2026-06-16). 3.1-flash-live
+    # transcribes cleanly and calls tools correctly (verified live: voice ->
+    # transcribe -> tool_call -> audio reply, no throttle). If 3.1 demand
+    # throttling (429/503) recurs that is an ops concern — a model that cannot
+    # call tools is not an acceptable fallback. Override via GEMINI_MODEL in .env.
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     claude_model: str = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
     cursor_model: str = os.getenv("CURSOR_MODEL", "composer-2")
@@ -47,6 +57,15 @@ class Config:
     per_session_claude_calls_max: int = int(os.getenv("PER_SESSION_CLAUDE_CALLS_MAX", "15"))
     per_session_cursor_runs_max: int = int(os.getenv("PER_SESSION_CURSOR_RUNS_MAX", "5"))
     do_with_claude_max_iterations: int = int(os.getenv("DO_WITH_CLAUDE_MAX_ITERATIONS", "30"))
+    # Per-iteration output-token ceiling for the do_with_claude loop. Raised from
+    # the old hardcoded 4096 so artifact builds (a full minimalist HTML page with
+    # inline CSS) come back in ONE response instead of being truncated mid-tag —
+    # the throttle behind "the HTML she sent looked thin". The $5 loop cost cap
+    # remains the real backstop, so this only buys quality, not runaway spend.
+    do_with_claude_max_output_tokens: int = int(os.getenv("DO_WITH_CLAUDE_MAX_OUTPUT_TOKENS", "8192"))
+    # Per-run cost ceiling for a Claude Code thread (ClaudeAgentOptions.max_budget_usd).
+    # The run stops itself at this client-side estimate; the daily cap is the outer bound.
+    claude_code_max_budget_usd: float = float(os.getenv("CLAUDE_CODE_MAX_BUDGET_USD", "10"))
 
     # Wall-clock bound on each Anthropic request inside the agent loop. Without
     # this the SDK default (600s timeout x 2 retries) lets one hung request
@@ -57,9 +76,6 @@ class Config:
     # SpicyLit / Grok
     grok_api_key: str = os.getenv("GROK_API_KEY", "")
     discord_spicylit_channel_id: str = os.getenv("DISCORD_SPICYLIT_CHANNEL_ID", "")
-
-    # UCS feature flag — Phase 2 parallel path
-    ucs_enabled: bool = os.getenv("UCS_ENABLED", "false").lower() == "true"
 
     # External Cursor observer (hooks-driven, watches other IDE windows)
     cursor_event_host: str = os.getenv("UCS_CURSOR_EVENT_HOST", "127.0.0.1")
