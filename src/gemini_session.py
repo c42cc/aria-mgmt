@@ -166,6 +166,35 @@ TOOL_DECLARATIONS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="run_playbook",
+        description=(
+            "Run a named PLAYBOOK — an ordered list of tasks — end to end in the "
+            "background. Use when Corbin says 'run my morning playbook', 'kick off "
+            "the <name> playbook', or names a saved routine. I work through the "
+            "steps in order, ping him as each finishes, and stop to ask only if one "
+            "hits a wall. This is the 'name it and walk away' payoff. Use "
+            "list_playbooks if unsure of the name."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "name": types.Schema(type="STRING", description="The playbook name (e.g. 'morning', 'example')."),
+                "session_key": types.Schema(type="STRING", description="Discord thread ID."),
+            },
+            required=["name"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_playbooks",
+        description="List the available playbooks (saved ordered task routines Corbin can run).",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "session_key": types.Schema(type="STRING", description="Discord thread ID."),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
         name="create_42c_account",
         description="Create a login account on the 42c.pw website (shared HTTP Basic Auth) so someone can see what Corbin is working on. Adds the credential and redeploys so it goes live (~1-2 min), then returns the login URL plus the username and password to share. Use only for a standalone 'make an account for X' request; for 'make an account AND text them', route to do_with_claude instead so it does both.",
         parameters=types.Schema(

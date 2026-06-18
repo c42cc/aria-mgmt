@@ -787,6 +787,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # read it back later from the Task object, not the chat.
         "start_task": _start_task,
         "task_status": _task_status,
+        # Playbooks: an ordered list of Tasks — name it, walk away.
+        "run_playbook": _run_playbook,
+        "list_playbooks": _list_playbooks,
         "create_42c_account": _create_42c_account,
         "propose_action": _propose_action,
         "ask_user": _ask_user_tool,
@@ -864,6 +867,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # pays its own spend when it runs); reading a Task is free. Must stay
         # usable at the cap so "start this and walk away" / "how's X?" always work.
         "start_task", "task_status",
+        # A playbook just spawns a background sequence of Tasks (each pays its own
+        # spend); listing is free.
+        "run_playbook", "list_playbooks",
         # Spark ops/diagnostics must stay usable even at the daily cap: status
         # is read-only, setup spends nothing on our API, and verify only spends
         # a few cents on Gemini visual checks. Operability beats the gate here.
@@ -2615,6 +2621,41 @@ async def _task_status(task_id: str = "", session_key: str = "") -> str:
         return "Active tasks:\n" + "\n".join(tasks.task_summary(t) for t in active)
     t = latest_task()
     return tasks.task_summary(t) if t else "No tasks yet."
+
+
+async def _run_playbook(name: str = "", session_key: str = "") -> str:
+    """Run a named playbook — an ordered list of Tasks — in the background. The
+    payoff: name it, walk away, get pinged as each step finishes or on a halt."""
+    from . import playbook
+
+    name = (name or "").strip()
+    if not name:
+        avail = ", ".join(playbook.list_playbooks()) or "(none)"
+        return json.dumps({"error": f"run_playbook needs a name. Available: {avail}"})
+
+    async def _engine(g: str, sk: str) -> str:
+        return await _do_with_claude(g, session_key=sk)
+
+    try:
+        n = playbook.start_playbook(name, _engine)
+    except (FileNotFoundError, ValueError):
+        avail = ", ".join(playbook.list_playbooks()) or "(none yet)"
+        return json.dumps({"error": f"no runnable playbook '{name}'. Available: {avail}"})
+    return (
+        f"Running playbook '{name}' ({n} steps) in the background. I'll work "
+        f"through them in order and ping you as each finishes — or stop and ask if "
+        f'one hits a wall. Walk away; ask "how are my tasks?" anytime.'
+    )
+
+
+async def _list_playbooks(session_key: str = "") -> str:
+    """List the available playbooks (ordered Task sequences in workflows/)."""
+    from . import playbook
+
+    names = playbook.list_playbooks()
+    if not names:
+        return "No playbooks yet — add one at workflows/<name>.playbook.md (a numbered list of steps)."
+    return "Playbooks: " + ", ".join(names)
 
 
 async def _do_with_claude_loop(
