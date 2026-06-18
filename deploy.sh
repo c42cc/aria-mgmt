@@ -26,6 +26,18 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 
 # ---------------------------------------------------------------------------
+# Guard 0: on the trunk. The running process is pinned to main; deploying from
+# a feature branch is the drift that silently dropped tools from the live bot
+# (and `git push origin main` from a branch pushes main, not your work). Refuse
+# loudly — land the work on main (merge) first, then deploy.
+# ---------------------------------------------------------------------------
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$BRANCH" != "main" ]; then
+    echo -e "${RED}\u2717 deploy refuses: on '$BRANCH', not the trunk 'main'. Merge to main first, then deploy.${RESET}"
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # Guard 1: REQUIRED env vars present in .env
 # ---------------------------------------------------------------------------
 echo -e "${CYAN}Pre-deploy guards...${RESET}"
@@ -103,7 +115,9 @@ echo -e "${CYAN}Restarting Aria...${RESET}"
 bash ./kill.sh
 
 LOG="/tmp/ucs2-deploy-$(date +%s).log"
-nohup .venv/bin/python -m src.bot > "$LOG" 2>&1 &
+# Restart via the one launch path (pins to main + reinstall + exec), the same
+# script the launchd KeepAlive uses, so deploy and KeepAlive can't diverge.
+nohup bash ops/launch.sh > "$LOG" 2>&1 &
 PID=$!
 echo "  Launched src.bot (pid $PID)"
 echo "  Log: $LOG"

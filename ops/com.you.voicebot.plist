@@ -5,17 +5,16 @@
     <key>Label</key>
     <string>com.you.voicebot</string>
 
-    <!-- Launch the bot DIRECTLY (not `make run`). `make run` shells out to
-         `pkill -f src.bot`, whose own command line contains "src.bot", so under
-         launchd KeepAlive it can kill its own launching shell and crash-loop.
-         The editable install (install.sh / `pip install -e .`) means src/ is
-         imported live, so a restart always runs current source. -->
+    <!-- Launch through ops/launch.sh: it pins the running process to the trunk
+         (git checkout main) before the editable reinstall + exec, so KeepAlive
+         can never again boot a drifted feature branch (the original incident).
+         launch.sh does NOT pkill (a `pkill -f src.bot` under KeepAlive can kill
+         its own launching shell and crash-loop) and `exec`s python, so launchd
+         supervises the bot process directly. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2/.venv/bin/python</string>
-        <string>-u</string>
-        <string>-m</string>
-        <string>src.bot</string>
+        <string>/bin/bash</string>
+        <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2/ops/launch.sh</string>
     </array>
 
     <!-- CWD = repo root so dotenv finds .env (secrets stay in .env, not here). -->

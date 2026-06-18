@@ -3319,6 +3319,11 @@ def main():
     if not config.discord_bot_token:
         log.error("DISCORD_APP_BOT_TOKEN not set.")
         sys.exit(1)
+    # Freeze the build hash at boot so the deployed_trunk preflight gate can
+    # detect a post-boot source edit (live != boot). Done once, here, at the
+    # true process start — the probe never stamps, so drift cannot self-launder.
+    from . import build_hash
+    build_hash.stamp_boot()
     bot.run(config.discord_bot_token)
 
 

@@ -23,12 +23,12 @@ help:
 	@echo "  audit-dedup  - scan data/audit.jsonl for duplicate API calls inside 5s windows"
 	@echo "  clean        - remove __pycache__, .pytest_cache"
 
-# Always reinstall in editable mode so the freshly running process matches
-# the source on disk (kills the "stale launch" bug class).
+# One launch path (ops/launch.sh): pin to the trunk (git checkout main), reinstall
+# in editable mode so the running process matches source, then exec the bot. The
+# separate `kill` target runs first (launch.sh never pkills — that would crash-loop
+# launchd). Same script the launchd KeepAlive and deploy.sh restart use.
 run: kill
-	@$(PIP) install -e . --quiet
-	@echo "Launching bot..."
-	@$(PYTHON) -m src.bot
+	@bash ops/launch.sh
 
 restart: run
 

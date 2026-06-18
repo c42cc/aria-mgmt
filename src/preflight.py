@@ -14,7 +14,6 @@ Run as CLI: `python -m src.preflight` (exits non-zero on critical failure).
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -575,35 +574,46 @@ async def probe_dep_drift() -> tuple[bool, str, str, str]:
     return True, "", "", "pip check clean, py-cord present, numpy<2"
 
 
-async def probe_running_code() -> tuple[bool, str, str, str]:
-    """Live source SHA matches a sentinel written at boot. Detects stale launches."""
-    sentinel_path = os.path.join("data", ".preflight_boot_sha")
-    src_dir = os.path.join(os.path.dirname(__file__))
-    hasher = hashlib.sha256()
-    for name in sorted(os.listdir(src_dir)):
-        if not name.endswith(".py"):
-            continue
-        path = os.path.join(src_dir, name)
-        with open(path, "rb") as f:
-            hasher.update(name.encode())
-            hasher.update(f.read())
-    current_sha = hasher.hexdigest()[:16]
+async def probe_deployed_trunk() -> tuple[bool, str, str, str]:
+    """The running process IS the pinned trunk: on branch `main`, the build tree
+    clean, and the build unchanged since boot. CRITICAL — a drifted process
+    refuses ready instead of lying green.
 
-    if os.path.exists(sentinel_path):
-        with open(sentinel_path) as f:
-            recorded = f.read().strip()
-        if recorded != current_sha:
-            return (
-                False,
-                f"source code changed since process started (sentinel={recorded} now={current_sha})",
-                "Restart: make run",
-                "",
-            )
+    Replaces the old WARN `running_code` sentinel, which self-laundered: it
+    re-wrote the sentinel to whatever was running on every call and prescribed
+    "Restart: make run", so a restart on a feature branch turned the warning
+    green. This compares against the trunk (`main`) and a boot hash frozen once
+    per process (`build_hash.stamp_boot`), so neither a feature branch nor a
+    post-boot edit can re-bless itself.
+    """
+    from . import build_hash
 
-    os.makedirs(os.path.dirname(sentinel_path), exist_ok=True)
-    with open(sentinel_path, "w") as f:
-        f.write(current_sha)
-    return True, "", "", f"sha={current_sha}"
+    live = build_hash.compute_build_hash()
+    boot = build_hash.boot_hash()
+    if boot is not None and boot != live:
+        return (
+            False,
+            f"source changed since process started (boot={boot[:12]} now={live[:12]})",
+            f"git checkout {build_hash.TRUNK} && git pull --ff-only && make run",
+            "",
+        )
+    branch = build_hash.current_branch()
+    if branch != build_hash.TRUNK:
+        return (
+            False,
+            f"running branch '{branch}', not the pinned trunk '{build_hash.TRUNK}'",
+            f"git checkout {build_hash.TRUNK} && git pull --ff-only && make run",
+            f"sha={live[:12]}",
+        )
+    dirty = build_hash.build_tree_dirty()
+    if dirty:
+        return (
+            False,
+            "uncommitted changes to build files (running != committed source)",
+            "commit or stash the build changes, then: make run",
+            dirty.splitlines()[0],
+        )
+    return True, "", "", f"trunk={branch} sha={live[:12]}"
 
 
 async def probe_wake_word_model() -> tuple[bool, str, str, str]:
@@ -1207,7 +1217,7 @@ async def _run_all_inner(
     # Probes that don't need outside services
     report.results.append(await _run_probe("config", CRITICAL, probe_config))
     report.results.append(await _run_probe("dep_drift", CRITICAL, probe_dep_drift))
-    report.results.append(await _run_probe("running_code", WARN, probe_running_code))
+    report.results.append(await _run_probe("deployed_trunk", CRITICAL, probe_deployed_trunk))
     report.results.append(await _run_probe("prompts", CRITICAL, probe_prompts))
     report.results.append(await _run_probe("db", CRITICAL, probe_db))
     report.results.append(await _run_probe("models_yaml", WARN, probe_models_yaml))
