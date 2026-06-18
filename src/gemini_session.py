@@ -604,6 +604,23 @@ TOOL_DECLARATIONS = [
             required=["node"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="backup_model",
+        description=(
+            "Back up a Hugging Face model to encrypted cold storage. Launches a diskless "
+            "modelvault backup on an ephemeral cloud VM that streams the model into GCS and "
+            "self-deletes; it returns right away (it starts the job, it does not wait for the "
+            "multi-terabyte transfer). Use when the user says 'back up <model>', e.g. 'back up "
+            "huggingface.co/org/model'. Speak a short confirmation and offer to check on it later."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "url": types.Schema(type="STRING", description="Model URL or id, e.g. 'huggingface.co/org/model' or 'org/model'."),
+            },
+            required=["url"],
+        ),
+    ),
 ]
 
 TranscriptEntry = collections.namedtuple("TranscriptEntry", ["role", "text", "ts"])

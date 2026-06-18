@@ -800,6 +800,8 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "spark_status": _spark_status,
         "spark_verify": _spark_verify,
         "spark_setup": _spark_setup,
+        # modelvault cold-backup (launches a cloud VM; sibling repo).
+        "backup_model": _backup_model,
     }
     handler = handlers.get(name)
     if not handler:
@@ -828,6 +830,9 @@ async def handle_tool_call(name: str, args: dict) -> str:
         # is read-only, setup spends nothing on our API, and verify only spends
         # a few cents on Gemini visual checks. Operability beats the gate here.
         "spark_status", "spark_verify", "spark_setup",
+        # Backup spend is GCP (the VM + storage), not our Anthropic daily cap; the
+        # launch itself costs nothing on our API. Must stay usable at the cap.
+        "backup_model",
     )
     if spend >= config.daily_spend_cap_usd and name not in _free_tools:
         return json.dumps({"error": f"Daily spend cap (${config.daily_spend_cap_usd}) reached. Current: ${spend:.2f}"})
@@ -1939,6 +1944,64 @@ async def _ask_user_tool(question: str = "", session_key: str = "") -> str:
     return json.dumps({"answered": True, "answer": answer})
 
 
+# modelvault cold-backup bridge. Aria does NOT do the transfer — she launches the
+# diskless modelvault cloud runner (a sibling repo), which spins up an ephemeral
+# GCE VM that streams the model into encrypted GCS and self-deletes. The script
+# returns in seconds (it only starts the job), so this tool is "send a link and
+# walk away". The engine lives in its own repo; this is just the trigger.
+_MODELVAULT_CLOUD_BACKUP_SH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),  # <agi_env_v1>
+    "modelvault", "ops", "cloud_backup.sh",
+)
+
+_BACKUP_MODEL_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "backup_model",
+    "description": (
+        "Back up a Hugging Face model to encrypted cold storage. Launches a diskless "
+        "modelvault backup on an ephemeral cloud VM that streams the model into GCS and "
+        "self-deletes; returns right away (it starts the job, it does NOT wait for the "
+        "multi-terabyte transfer). Use when the user says 'back up <model>', e.g. 'back "
+        "up huggingface.co/org/model'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Model URL or id, e.g. 'huggingface.co/org/model' or 'org/model'."},
+        },
+        "required": ["url"],
+    },
+}
+
+
+async def _backup_model(url: str = "", session_key: str = "") -> str:
+    """Launch a diskless modelvault cloud backup of a model URL. Returns fast."""
+    target = (url or "").strip()
+    if not target:
+        return json.dumps({"error": "url is required (e.g. huggingface.co/org/model)"})
+    if not os.path.exists(_MODELVAULT_CLOUD_BACKUP_SH):
+        return json.dumps({"error": f"modelvault cloud_backup.sh not found at {_MODELVAULT_CLOUD_BACKUP_SH}"})
+    await _emit_progress(session_key, f"launching cloud backup of {target}")
+    proc = await asyncio.create_subprocess_exec(
+        "bash", _MODELVAULT_CLOUD_BACKUP_SH, target,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return json.dumps({"ok": False, "url": target,
+                           "error": "cloud_backup.sh did not return within 180s"})
+    out = stdout.decode(errors="replace").strip()
+    err = stderr.decode(errors="replace").strip()
+    if proc.returncode != 0:
+        # Loud, with the fix (e.g. gcloud auth). Never a silent failure.
+        return json.dumps({"ok": False, "url": target,
+                           "error": f"cloud_backup.sh failed (rc={proc.returncode})",
+                           "detail": (err or out)[-800:]})
+    return json.dumps({"ok": True, "url": target, "launched": True, "status": out[-800:]})
+
+
 # Local (non-MCP) tools the do_with_claude loop can dispatch alongside the MCP
 # catalog. create_42c_account provisions a login deterministically; the cursor_*
 # tools give the text agent the same durable Cursor-thread introspection and
@@ -1962,6 +2025,7 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _SPARK_VERIFY_TOOL_SCHEMA,
     _SPARK_SETUP_TOOL_SCHEMA,
     _SET_GROUND_TOOL_SCHEMA,
+    _BACKUP_MODEL_TOOL_SCHEMA,
 ]
 _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "create_42c_account": _create_42c_account,
@@ -1979,6 +2043,7 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "spark_verify": _spark_verify,
     "spark_setup": _spark_setup,
     "set_ground": _set_ground_tool,
+    "backup_model": _backup_model,
 }
 
 # Local tools that receive the loop's session_key automatically.
@@ -1987,6 +2052,7 @@ _SESSION_KEY_LOCAL_TOOLS = frozenset({
     "spark_status", "spark_verify", "spark_setup",
     "set_ground",
     "ask_user",
+    "backup_model",
 })
 
 
