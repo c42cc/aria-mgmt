@@ -243,6 +243,30 @@ def _build_context(session_key: str = "") -> str:
     except Exception:
         log.debug("context: MCP capabilities omitted", exc_info=True)
 
+    # Precondition awareness: surface capabilities whose precondition is unmet
+    # RIGHT NOW so the model drops them from its options instead of discovering
+    # the wall by failing on it (the Messages-Automation thrash). capability_for
+    # is the one home for "can I use this" — read here at planning time and at
+    # dispatch time, never two homes.
+    try:
+        from .capability import capability_for
+        unmet_caps: list[str] = []
+        for server, tool, label in (
+            ("apple", "messages_chat", "apple Messages send"),
+            ("apple", "contacts_lookup", "apple Contacts"),
+        ):
+            fix = capability_for(server, tool).unmet()
+            if fix:
+                unmet_caps.append(f"    - {label} — UNAVAILABLE: {fix}")
+        if unmet_caps:
+            lines.append(
+                "  unavailable (precondition unmet — do NOT choose these; surface "
+                "the fix to the user instead of attempting and walling):"
+            )
+            lines.extend(unmet_caps)
+    except Exception:
+        log.debug("context: capability preconditions omitted", exc_info=True)
+
     try:
         remaining = max(0.0, config.daily_spend_cap_usd - get_daily_spend())
         lines.append(
@@ -2824,7 +2848,10 @@ async def _do_with_claude_loop(
                     block.name, str(tool_args)[:200],
                     outcome.reason[:200], session_key,
                 )
-                blocker = format_block(outcome.reason, outcome.need)
+                # A wall carries the partial work + the one ask — never an empty
+                # "Blocked". "Here's what I got, here's what I couldn't do, here's
+                # the one thing I need" is what a chief of staff hands you.
+                blocker = _blocker_with_findings(outcome.reason, outcome.need, tool_trace)
                 break
             if outcome.is_transient:
                 used = retry_used.get(outcome.family, 0)
@@ -2834,9 +2861,10 @@ async def _do_with_claude_loop(
                         block.name, outcome.family,
                         outcome.reason[:200], session_key,
                     )
-                    blocker = format_block(
+                    blocker = _blocker_with_findings(
                         outcome.reason,
                         outcome.need or "a stable connection, or a different approach",
+                        tool_trace,
                     )
                     break
                 retry_used[outcome.family] = used + 1

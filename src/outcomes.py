@@ -52,6 +52,11 @@ _AUTOMATION_NEED = (
     "then resend (one-time grant; I can't do it from here, and improvising another "
     "send path won't help)"
 )
+_LONG_JOB_NEED = (
+    "this is a long-running transfer that can't fit the shell tool's timeout — "
+    "say the word and I'll run it as a background job (the durable runner), not "
+    "through the timeout-bounded shell"
+)
 
 # A macOS app-scripting send (osascript/AppleScript to Messages/Contacts/Notes)
 # that HANGS is an Automation permission wall, not a transient blip — even when
@@ -69,6 +74,19 @@ _APPLE_AUTOMATION_HANG: tuple[str, ...] = (
 _APPLE_AUTOMATION_MARKERS: tuple[str, ...] = (
     "osascript", "applescript", "tell application", "imessage:", "mobilesms",
     "addressbook", "jxa", "send_message", "messages_chat",
+)
+
+# Commands that are inherently long transfers: a timeout on one of these is the
+# WRONG TOOL (the shell guillotines long commands), not a transient blip. They
+# route to the background-job runner, never a retry. This is the 21GB-clone
+# grind the forensic named — a timeout misread as TRANSIENT, retried into the
+# same wall, $6 spent to a false "Blocked: a stable connection".
+_LONG_TRANSFER_MARKERS: tuple[str, ...] = (
+    "git clone", "git lfs", "lfs pull", "lfs fetch",
+    "huggingface", "hf download", "snapshot_download", "aria2c",
+)
+_TIMEOUT_MARKERS: tuple[str, ...] = (
+    "timed out", "timeout", "did not respond in time", "execution timed out",
 )
 
 
@@ -279,6 +297,19 @@ def _match(low: str, patterns: tuple[str, ...]) -> bool:
     return any(p in low for p in patterns)
 
 
+def _is_long_transfer(tool_name: str, args: dict | None) -> bool:
+    """True when the call is an inherently long data transfer (a model/repo
+    clone or download). A timeout on one of these is the wrong tool, not a blip;
+    it belongs on the background-job runner."""
+    blob = (tool_name or "").lower()
+    if args:
+        try:
+            blob += " " + json.dumps(args, default=str).lower()
+        except Exception:
+            blob += " " + str(args).lower()
+    return any(m in blob for m in _LONG_TRANSFER_MARKERS)
+
+
 def _is_apple_automation_context(tool_name: str, args: dict | None, low: str) -> bool:
     """True when the tool call was a macOS app-scripting send (so a hang means a
     missing Automation grant, not a network blip). Scans the command/args, the
@@ -339,6 +370,19 @@ def classify_outcome(tool_name: str, args: dict | None, result_str: str) -> Outc
             BLOCKED,
             _short_reason(s) or "macOS blocked the Messages/Contacts automation (no Automation permission)",
             _AUTOMATION_NEED,
+            family,
+        )
+
+    # 1c. A timeout on an inherently long transfer (git clone / git lfs /
+    #     huggingface download) is NOT a transient blip — the shell tool
+    #     guillotines long commands, so retrying just re-hits the same wall (the
+    #     21GB-clone grind). Route it to the background runner instead. This is
+    #     OUR mis-routing to fix, never a third-party "stable connection" excuse.
+    if _is_long_transfer(tool_name, args) and _match(low, _TIMEOUT_MARKERS):
+        return Outcome(
+            BLOCKED,
+            _short_reason(s) or "the transfer exceeded the shell tool's timeout",
+            _LONG_JOB_NEED,
             family,
         )
 
