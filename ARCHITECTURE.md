@@ -119,6 +119,33 @@ session instead of Gemini.
 
 The SpicyLit capability is the reference example.
 
+### The Task and the Playbook
+
+A **Task** (`src/tasks.py`, the `tasks` table in `src/db.py`) is a durable,
+backgroundable unit of work: `{goal, status ∈ {queued,running,needs_you,done,
+failed}, transcript, artifacts, blocking_ask, build_hash}`. It outlives the voice
+session and the agent loop — "how's X going?" reads the Task object, not the
+chat. The agent loop is the **engine** that advances a Task: a wall becomes
+`needs_you` carrying the one ask, a crash becomes `failed` (loud). A Task runs in
+the background (an asyncio task in the long-running bot process), so the user can
+walk away; an orphan a restart left mid-flight is reconciled to `needs_you`, never
+silently stuck. A **playbook** (`src/playbook.py`, editable markdown in
+`workflows/<name>.playbook.md`) is, definitionally, an ordered list of Tasks: run
+them in order, halt on the first that needs you. Name it, give a few commands,
+leave your desk.
+
+### Verified Truth — one definition of "done"
+
+"Done" is not a green meter, a passing unit test, or a rebuilt branch. It is a
+real request completing on the live build and a calibrated judge marking it
+correct. Two instruments enforce this: the **live-outcome meter**
+(`scripts/live_meter.py`) submits a real `do_with_claude` request and asserts a
+genuine success, writing a receipt keyed to the build hash; and the **calibrated
+judge** (`src/judge.py` + `src/judge_calibration.py`) earns the right to gate a
+Task's done claim only after agreeing with a labeled good/bad corpus
+(agreement ≥ 0.9 and good/bad separation) — an uncalibrated judge advises, it
+never decides. A mechanism failure is a loud `JudgeError`, never a silent verdict.
+
 ### Preflight as the Gate
 
 Before the bot accepts any voice command, it runs a battery of capability
@@ -405,8 +432,16 @@ points; cross-references inside the code are reliable.
 | Conversational session (SpicyLit) | `capabilities/spicy_lit/grok_voice.py` |
 | Tool dispatch & tool implementations | `src/tools.py` |
 | The agent loop (the only one) | `src/tools.py::_do_with_claude_loop` |
+| The Task primitive (durable, backgroundable work) | `src/tasks.py` + `src/db.py` (`tasks`) |
+| The playbook (an ordered list of Tasks) | `src/playbook.py` + `workflows/*.playbook.md` |
 | Ground working set + findings ledger | `src/db.py` (`ground`, `loop_findings`) |
-| Outcome policy (progress/transient/blocked + discovery families) | `src/outcomes.py` |
+| Outcome policy (progress / wall-with-work-and-one-ask + discovery families + long-transfer→background) | `src/outcomes.py` |
+| Build hash (running == source; keys proof receipts) | `src/build_hash.py` |
+| One launch path (pins the trunk: checkout main → reinstall → exec) | `ops/launch.sh` |
+| The live-outcome meter (a real request on the trunk build) | `scripts/live_meter.py` |
+| Judge calibration (earns the right to gate) | `src/judge_calibration.py` + `evals/calibration_corpus.json` |
+| The one gate (the door to main) | `scripts/gate.sh` |
+| Enforce-by-absence ledger + checker | `configs/structural_absences.json` + `tools/structural_absence_check.py` |
 | Offline eval CLI (scores prompt versions from `loop_executions`) | `src/eval.py` |
 | Product correctness harness | `src/judge.py` + `specs/correctness/` |
 | MCP client and dispatch | `src/mcp.py` |
@@ -436,6 +471,7 @@ points; cross-references inside the code are reliable.
 | Claude general-agent persona | `prompts/do_with_claude_system.md` |
 | Project name → path map (rendered into every agent loop's context) | `projects/registry.md` |
 | Saved workflows | `workflows/` |
+| Playbooks (ordered Task routines: "run my morning playbook") | `workflows/*.playbook.md` |
 | Model registry + loop profiles | `models.yaml` |
 
 ### Capabilities
@@ -472,7 +508,8 @@ points; cross-references inside the code are reliable.
 | Memory vector store | `data/mem0/` |
 | MCP call audit | `data/audit.jsonl` |
 | Correctness verdicts | `data/verdicts.ndjson` |
-| Stale-launch sentinel | `data/.preflight_boot_sha` |
+| Build-hash receipts (live-outcome meter + judge calibration) | `data/receipts/` |
+| Boot build-hash stamp (read by `deployed_trunk`) | `data/.preflight_boot_sha` |
 
 ---
 
@@ -531,10 +568,15 @@ one of these, treat that as a bug, not a feature.
     the Mac. The bot runs on the Mac. There is no remote worker, no PC
     handoff, no GPU dependency.
 
-12. **Both launch paths ensure fresh code.** `make run` (development) and
-    `deploy.sh` (production) both reinstall the package in editable mode
-    before launching, so the running code always matches the source on
-    disk. The preflight `running_code` probe verifies this at boot.
+12. **One trunk; running == source.** Every launch path goes through
+    `ops/launch.sh` (the launchd KeepAlive, `make run`, and `deploy.sh`'s
+    restart): it checks out `main`, reinstalls editable, then execs the bot — so
+    the running process is always the pinned trunk. The CRITICAL `deployed_trunk`
+    preflight probe verifies this at boot via a build hash (`src/build_hash.py`),
+    refusing ready on a feature branch, a dirty build tree, or a post-boot edit.
+    It replaced the WARN `running_code` sentinel, which self-laundered by
+    re-blessing whatever branch was running. `scripts/gate.sh` is the one door to
+    `main` (lints + structural-absence ledger + unit suite).
 
 13. **User voice edits to prompts always win.** The eval layer advises; it
     does not override. When a user tunes a prompt by voice through the

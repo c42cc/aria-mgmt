@@ -128,10 +128,13 @@ own pipelines.
   compiled against the 1.x ABI; numpy>=2 crashes at import.
 - **Gemini Live is an async context manager**, not an awaitable. The bridge
   uses `__aenter__` / `__aexit__` directly.
-- **Both launch paths ensure fresh code.** `make run` (development) and
-  `deploy.sh` (production) both reinstall in editable mode, so the running
-  code always matches source. The `running_code` preflight probe verifies
-  this with a SHA sentinel.
+- **One trunk; running == source.** Every launch path goes through
+  `ops/launch.sh` (launchd KeepAlive, `make run`, `deploy.sh` restart): checkout
+  `main` → editable reinstall → exec. The CRITICAL `deployed_trunk` preflight
+  probe verifies the live build hash (`src/build_hash.py`) matches the pinned
+  trunk and the boot stamp, refusing ready on a feature branch / dirty tree /
+  post-boot edit. `scripts/gate.sh` is the one door to `main`. See the
+  `one-trunk`, `halt-dont-heal`, and `done-means-verified-on-this-build` rules.
 
 ## Don't substitute models
 

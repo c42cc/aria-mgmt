@@ -400,7 +400,7 @@ How each subsystem fails, and what the system does about it.
 | Cursor wrapper | Subprocess dies | All pending futures resolve with `CursorBridgeError`; event consumers drain. Bridge is not auto-restarted; restarting the parent (`make run` or `deploy.sh`) cycles it. |
 | Discord voice sidecar | Subprocess exits | Reader logs the exit; `!join` will fail noisily until the parent is restarted. |
 | MCP server | Server crashes | The catalog entry is still present but calls return an error; `health_check` shows it as down; preflight on rerun catches it. |
-| Stale launch | Source on disk drifted from running process | Preflight `running_code` probe fails warn-level; restarting via `make run` or `deploy.sh` is the fix. |
+| Stale launch / branch drift | Running process is not the pinned trunk, the build tree is dirty, or source changed since boot | CRITICAL `deployed_trunk` probe refuses ready and prints the exact fix (`git checkout main … && make run`). Every launch path goes through `ops/launch.sh`, which checks out `main` first, so a restart returns to the trunk (it can never re-bless a feature branch the way the old WARN `running_code` did). |
 | Dependency drift | numpy>=2, discord.py instead of py-cord, etc. | `dep_drift` probe fails critical with the fix command. |
 | Cost ceiling | Daily cap reached | Dispatcher returns an error for paid tools; read-only and control tools still work. |
 
@@ -416,7 +416,9 @@ because:
 - SQLite is WAL with `busy_timeout`.
 - mem0 stores files atomically.
 - The audit log is append-only.
-- The preflight `running_code` probe writes a fresh sentinel on boot.
+- `ops/launch.sh` checks out `main` and `src/build_hash.stamp_boot()` freezes the
+  build hash at boot; the CRITICAL `deployed_trunk` probe compares the live build
+  to it (and to the trunk) so a drifted or post-boot-edited process refuses ready.
 
 If you add a graceful shutdown, the sequence to follow is the reverse of
 boot: close Gemini → stop MCP fleet → stop voice bridge → stop cursor bridge →
