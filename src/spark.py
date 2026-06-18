@@ -744,6 +744,17 @@ DEFAULT_AUDIT_INSTRUCTION = REPO_ROOT / "ops" / "spark" / "audit_collapse_instru
 DEFAULT_RUN_MODE = "bypassPermissions"
 _VALID_MODES = ("plan", "default", "acceptEdits", "bypassPermissions")
 
+# Model + reasoning policy.
+#   - The node's *interactive/default* claude is Opus 4.8 at MAX effort (set in
+#     the committed .claude/settings.json + ~/.bashrc by setup_cc_workspace.sh).
+#   - The forensic-audit RUN intentionally differs: Opus 4.8 at MEDIUM effort
+#     with NO extended thinking (MAX_THINKING_TOKENS=0 disables thinking even on
+#     4.8, where effort otherwise drives reasoning depth).
+AUDIT_MODEL = "claude-opus-4-8"
+AUDIT_EFFORT = "medium"
+AUDIT_EXTENDED_THINKING = False
+_VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
 
 def _new_run_id() -> str:
     return time.strftime("cc_%Y%m%dT%H%M%S")
@@ -826,13 +837,19 @@ _RUNNER_TEMPLATE = """#!/usr/bin/env bash
 # Max subscription is used (never the metered key).
 set -uo pipefail
 source "$HOME/.config/spark/env.sh" 2>/dev/null || true
+# Pin reasoning HERE: this runner is non-interactive (it does NOT source
+# ~/.bashrc), so the node's interactive 'max effort' default never applies. The
+# CLAUDE_CODE_EFFORT_LEVEL env var beats the --effort flag, so we set it for
+# determinism; {thinking_label} extended thinking.
+export CLAUDE_CODE_EFFORT_LEVEL="{effort}"
+{thinking_export}
 RUNDIR="$HOME/{runs}/{run_id}"
 mkdir -p "$RUNDIR"
 cd "$HOME/{workspace}" || {{ echo "FATAL: no workspace $HOME/{workspace}" > "$RUNDIR/run.log"; echo 127 > "$RUNDIR/rc"; touch "$RUNDIR/DONE"; exit 127; }}
 git switch "{branch}" 2>/dev/null || git switch -c "{branch}" 2>/dev/null || git checkout -b "{branch}" 2>/dev/null || true
-{{ echo "[runner] $(date -Is) branch=$(git branch --show-current) head=$(git rev-parse --short HEAD)"; }} >> "$RUNDIR/meta.txt"
+{{ echo "[runner] $(date -Is) model={model} effort={effort} thinking={thinking_label} branch=$(git branch --show-current) head=$(git rev-parse --short HEAD)"; }} >> "$RUNDIR/meta.txt"
 env -u ANTHROPIC_API_KEY claude -p "$(cat "$RUNDIR/instruction.md")" \\
-  --permission-mode {mode} --output-format stream-json --verbose \\
+  --model {model} --permission-mode {mode} --output-format stream-json --verbose \\
   >> "$RUNDIR/run.log" 2>&1
 echo $? > "$RUNDIR/rc"
 touch "$RUNDIR/DONE"
@@ -841,16 +858,23 @@ touch "$RUNDIR/DONE"
 
 def run_audit(node: str, instruction: str, *, branch: str | None = None,
               mode: str = DEFAULT_RUN_MODE, run_id: str | None = None,
+              model: str = AUDIT_MODEL, effort: str = AUDIT_EFFORT,
+              extended_thinking: bool = AUDIT_EXTENDED_THINKING,
               force_unauthed: bool = False) -> dict:
     """Launch a detached, disconnection-proof Claude Code run on the node: write
     the instruction + a runner into ~/REMOTE_RUNS/<run_id>/, ensure a fresh
     branch, and start `claude -p` in a detached tmux session that streams
-    stream-json to run.log and touches a DONE sentinel. Returns immediately."""
+    stream-json to run.log and touches a DONE sentinel. Returns immediately.
+
+    Model/reasoning default to the audit policy (Opus 4.8, medium effort, no
+    extended thinking); override per-run if needed."""
     alias, _ip, _role = resolve_node(node)
     run_id = run_id or _new_run_id()
     branch = branch or f"collapse/{time.strftime('%Y%m%d-%H%M%S')}"
     if mode not in _VALID_MODES:
         raise ValueError(f"bad permission mode {mode!r} (one of {_VALID_MODES})")
+    if effort not in _VALID_EFFORTS:
+        raise ValueError(f"bad effort {effort!r} (one of {_VALID_EFFORTS})")
     if not instruction.strip():
         raise ValueError("instruction is required")
 
@@ -862,10 +886,16 @@ def run_audit(node: str, instruction: str, *, branch: str | None = None,
                          f"missing). Run `ssh -t {alias}` then `claude` -> `/login`, "
                          "then retry. (force_unauthed=True launches anyway.)"}
 
+    thinking_export = ("export MAX_THINKING_TOKENS=0" if not extended_thinking
+                       else "# extended thinking enabled (effort drives depth on Opus 4.8)")
+    thinking_label = "NO" if not extended_thinking else "WITH"
+
     rundir_rel = f"{REMOTE_RUNS}/{run_id}"
     _ssh_put(alias, f"{rundir_rel}/instruction.md", instruction)
     runner = _RUNNER_TEMPLATE.format(
-        runs=REMOTE_RUNS, run_id=run_id, workspace=REMOTE_WORKSPACE, branch=branch, mode=mode,
+        runs=REMOTE_RUNS, run_id=run_id, workspace=REMOTE_WORKSPACE, branch=branch,
+        mode=mode, model=model, effort=effort,
+        thinking_export=thinking_export, thinking_label=thinking_label,
     )
     _ssh_put(alias, f"{rundir_rel}/run.sh", runner, executable=True)
 
@@ -876,6 +906,7 @@ def run_audit(node: str, instruction: str, *, branch: str | None = None,
         return {"ok": False, "node": alias, "run_id": run_id,
                 "error": f"tmux launch failed (rc={rc})", "detail": out.strip()[:400]}
     return {"ok": True, "node": alias, "run_id": run_id, "branch": branch, "mode": mode,
+            "model": model, "effort": effort, "extended_thinking": extended_thinking,
             "tmux_session": run_id, "rundir": f"~/{rundir_rel}",
             "log": f"~/{rundir_rel}/run.log",
             "note": "detached tmux run started; poll with run_status(node, run_id)."}

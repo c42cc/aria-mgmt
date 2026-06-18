@@ -92,9 +92,14 @@ rsync -az -e "ssh -o BatchMode=yes" "$TEMPLATE/" "$NODE:$REMOTE_DIR/" \
   git config user.name 'Aria ($NODE)'
   git config user.email 'aria@$NODE.local'
   chmod +x scripts/bootstrap_cc.sh 2>/dev/null || true
+  # Interactive claude on this node defaults to MAX effort (model + thinking come
+  # from the committed .claude/settings.json: Opus 4.8, thinking on). The audit
+  # runner is NON-interactive (never sources ~/.bashrc) and pins its own medium
+  # effort + no extended thinking, so this default never bleeds into the run.
+  grep -qxF 'export CLAUDE_CODE_EFFORT_LEVEL=max' ~/.bashrc 2>/dev/null || echo 'export CLAUDE_CODE_EFFORT_LEVEL=max' >> ~/.bashrc
   echo \"  HEAD: \$(git rev-parse --short HEAD) on \$(git branch --show-current)\"
 " || die "post-sync git config failed"
-log "overlay git-excluded; commit identity set"
+log "overlay git-excluded; commit identity set; interactive claude default = Opus 4.8 @ max effort"
 
 # ── 4. Bootstrap (venvs + node_modules) ──────────────────────────────────────
 if [ "${SKIP_BOOTSTRAP:-}" = "1" ]; then

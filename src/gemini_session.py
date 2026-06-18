@@ -644,9 +644,10 @@ TOOL_DECLARATIONS = [
             "Executable: launch the forensic AUDIT + COLLAPSE run on a spark node as a detached "
             "job that survives disconnects. It refreshes the collapse ledger, then performs the "
             "collapses wave-by-wave on a new branch, running the quality gate after each wave. "
-            "Returns a run id right away and I watch it in the background, reporting when it "
-            "finishes — no need to stay connected. Requires spark_cc_sync done and the node "
-            "logged in. Consequential — offer via propose_action so Corbin taps to approve."
+            "Defaults to the audit reasoning policy: Opus 4.8, medium effort, no extended "
+            "thinking. Returns a run id right away and I watch it in the background, reporting "
+            "when it finishes — no need to stay connected. Requires spark_cc_sync done and the "
+            "node logged in. Consequential — offer via propose_action so Corbin taps to approve."
         ),
         parameters=types.Schema(
             type="OBJECT",
@@ -654,6 +655,8 @@ TOOL_DECLARATIONS = [
                 "node": types.Schema(type="STRING", description="'spark1' or 'spark2' (default spark1)."),
                 "branch": types.Schema(type="STRING", description="Branch to create/use; default collapse/<date>."),
                 "mode": types.Schema(type="STRING", description="Claude permission mode: 'bypassPermissions' (default), 'acceptEdits', or 'plan'."),
+                "effort": types.Schema(type="STRING", description="Adaptive reasoning effort low/medium/high/xhigh/max; default medium for the audit."),
+                "extended_thinking": types.Schema(type="BOOLEAN", description="Enable extended thinking; default false for the audit."),
             },
         ),
     ),

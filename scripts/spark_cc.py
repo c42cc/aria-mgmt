@@ -61,6 +61,11 @@ def main() -> int:
     p.add_argument("--node", required=True)
     p.add_argument("--branch", default="")
     p.add_argument("--mode", default=spark.DEFAULT_RUN_MODE, choices=list(spark._VALID_MODES))
+    p.add_argument("--model", default=spark.AUDIT_MODEL, help=f"default {spark.AUDIT_MODEL}")
+    p.add_argument("--effort", default=spark.AUDIT_EFFORT, choices=list(spark._VALID_EFFORTS),
+                   help=f"adaptive reasoning effort (default {spark.AUDIT_EFFORT})")
+    p.add_argument("--extended-thinking", action="store_true",
+                   help="enable extended thinking (default off for the audit)")
     p.add_argument("--instruction-file", default=str(DEFAULT_INSTRUCTION))
     p.add_argument("--force-unauthed", action="store_true")
 
@@ -86,6 +91,8 @@ def main() -> int:
             instr = Path(args.instruction_file).read_text()
             return _emit(spark.run_audit(
                 args.node, instr, branch=args.branch or None, mode=args.mode,
+                model=args.model, effort=args.effort,
+                extended_thinking=args.extended_thinking,
                 force_unauthed=args.force_unauthed))
         if args.cmd == "status":
             return _emit(spark.run_status(args.node, args.run_id))

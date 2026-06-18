@@ -1912,10 +1912,12 @@ async def _spark_cc_auth(node: str = "spark1", probe: bool = False, session_key:
 
 
 async def _spark_run(node: str = "spark1", branch: str = "", mode: str = "",
+                     model: str = "", effort: str = "", extended_thinking: bool = False,
                      instruction: str = "", session_key: str = "") -> str:
     """EXECUTABLE: launch the detached forensic audit+collapse run on a node.
 
-    Defaults to the packaged audit+collapse instruction and the standard branch.
+    Defaults to the packaged audit+collapse instruction, the standard branch, and
+    the audit reasoning policy (Opus 4.8, medium effort, no extended thinking).
     Returns immediately with a run_id; a background watcher reports completion.
     Consequential — Aria offers it via propose_action (tap to approve)."""
     target = (node or "spark1").strip().lower()
@@ -1931,6 +1933,8 @@ async def _spark_run(node: str = "spark1", branch: str = "", mode: str = "",
     try:
         res = await asyncio.to_thread(
             spark.run_audit, target, instr, branch=(branch or None), mode=(mode or spark.DEFAULT_RUN_MODE),
+            model=(model or spark.AUDIT_MODEL), effort=(effort or spark.AUDIT_EFFORT),
+            extended_thinking=bool(extended_thinking),
         )
     except Exception as e:
         log.exception("spark_run failed")
@@ -2102,8 +2106,9 @@ _SPARK_RUN_TOOL_SCHEMA: dict[str, Any] = {
         "EXECUTABLE: launch the forensic AUDIT + COLLAPSE run on a spark node as a detached "
         "tmux job (survives disconnects). It refreshes the collapse ledger against HEAD, then "
         "performs the collapses wave-by-wave on a new branch, running the quality gate after "
-        "each wave and halting loudly on RED. Returns a run_id immediately; Aria watches it "
-        "and reports when it finishes. Requires spark_cc_sync done + the node on the Max "
+        "each wave and halting loudly on RED. Defaults to the audit reasoning policy: Opus 4.8, "
+        "medium effort, no extended thinking. Returns a run_id immediately; Aria watches it and "
+        "reports when it finishes. Requires spark_cc_sync done + the node on the Max "
         "subscription. Consequential — offer via propose_action (tap to approve)."
     ),
     "input_schema": {
@@ -2112,6 +2117,9 @@ _SPARK_RUN_TOOL_SCHEMA: dict[str, Any] = {
             "node": {"type": "string", "description": "spark1 or spark2 (default spark1)."},
             "branch": {"type": "string", "description": "Branch to create/use; default collapse/<date>."},
             "mode": {"type": "string", "description": "Claude permission mode: bypassPermissions (default, autonomous), acceptEdits, plan, or default."},
+            "model": {"type": "string", "description": "Model slug; default claude-opus-4-8."},
+            "effort": {"type": "string", "description": "Adaptive reasoning effort: low/medium/high/xhigh/max. Default medium (the audit policy)."},
+            "extended_thinking": {"type": "boolean", "description": "Enable extended thinking. Default false (the audit policy)."},
             "instruction": {"type": "string", "description": "Override the run instruction; default is the packaged audit+collapse brief."},
         },
     },
