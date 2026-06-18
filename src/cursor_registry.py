@@ -46,7 +46,9 @@ log = logging.getLogger(__name__)
 Severity = Literal["high", "low"]
 Source = Literal["sdk", "ide", "claude_code", "unknown"]
 Status = Literal["running", "waiting", "finished", "errored", "unknown"]
-EventKind = Literal["finished", "errored", "question", "started", "progress"]
+EventKind = Literal[
+    "finished", "errored", "question", "started", "progress", "cancelled", "stalled"
+]
 
 # A thread whose status is "running" but whose last hook landed longer ago than
 # this is no longer treated as *live*-running (the agent likely finished and we
@@ -951,8 +953,10 @@ def _classify_hook(
             return "finished", "high", f"Cursor task completed in {label}."
         if status == "error":
             return "errored", "high", f"Cursor task errored in {label}."
-        if status == "aborted":
-            return "finished", "low", f"Cursor task aborted in {label}."
+        if status in ("aborted", "cancelled", "canceled", "stopped"):
+            # A user-initiated cancel is NOT a buzz — the explicit "stop bugging
+            # me on cancel" rule. Recorded to the silent audit stream, never paged.
+            return "cancelled", "low", f"Cursor task cancelled in {label}."
         return "finished", "low", f"Cursor agent loop ended in {label} (status={status or 'unknown'})."
 
     if hook_type == "subagentStop":
@@ -963,7 +967,9 @@ def _classify_hook(
     if hook_type == "postToolUse":
         tn = tool_name.lower().replace(" ", "")
         if "createplan" in tn or "create_plan" in tn:
-            return "started", "high", f"Cursor constructed a plan in {label}."
+            # A constructed plan is a DECISION awaiting approval — a question, so
+            # the one typed gate buzzes it (not a generic 'started' that doesn't).
+            return "question", "high", f"Cursor constructed a plan awaiting approval in {label}."
         if tool_name.lower() == "task":
             return "started", "low", f"Cursor dispatched a subagent in {label}."
         return None, "low", ""

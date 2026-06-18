@@ -80,7 +80,6 @@ Override the URL with `UCS_CURSOR_EVENT_URL` in Cursor's hook environment
 ```
 UCS_CURSOR_EVENT_HOST=127.0.0.1
 UCS_CURSOR_EVENT_PORT=8731
-UCS_CURSOR_DM_PAGER_ENABLED=true
 ```
 
 The HTTP server only binds to 127.0.0.1 and rejects non-loopback

@@ -80,7 +80,8 @@ class Config:
     # External Cursor observer (hooks-driven, watches other IDE windows)
     cursor_event_host: str = os.getenv("UCS_CURSOR_EVENT_HOST", "127.0.0.1")
     cursor_event_port: int = int(os.getenv("UCS_CURSOR_EVENT_PORT", "8731"))
-    cursor_dm_pager_enabled: bool = os.getenv("UCS_CURSOR_DM_PAGER_ENABLED", "true").lower() == "true"
+    # A running Cursor thread quiet for this long emits a one-shot 'stalled' buzz.
+    cursor_stall_minutes: int = int(os.getenv("UCS_CURSOR_STALL_MINUTES", "15"))
 
     # Lurk-in-voice: when true, the voice sidecar stays connected to the
     # voice channel after the authorized user leaves (Gemini and audio

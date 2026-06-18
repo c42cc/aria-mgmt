@@ -78,6 +78,11 @@ _last_voice_alert_at: dict[str, float] = {}
 # task used to drop on process churn. Started once in on_ready's boot-only init.
 _judge_sweep_task: asyncio.Task | None = None
 _JUDGE_SWEEP_INTERVAL_SEC = 120.0
+_cursor_stall_task: asyncio.Task | None = None
+_STALL_WATCH_INTERVAL_SEC = 60.0
+# Watermark per agent: the last_event_at we already stall-notified at. A new
+# event changes last_event_at, so the key differs and the thread re-arms.
+_stall_notified_at: dict[str, float] = {}
 
 _wake_listener = None          # WakeWordListener | None (typed loosely to avoid import at module level)
 _local_speaker: SpeakerOutput | None = None
@@ -731,9 +736,11 @@ async def _post_proposal_card(
     recommendation Corbin opts INTO, not a gate on something already decided.
     Primes the same check/cross reactions the reaction handler resolves.
     """
-    # Decisions are the ONE thing allowed to buzz. They go to the MAIN channel
-    # (#ucs), @mention Corbin, and post NON-silent — distinct from the silent
-    # #ucs-alerts stream. DMs are off, so the main channel is the buzz surface.
+    # Decisions are the ONE thing allowed to buzz. The interactive proposal CARD
+    # (approve/reject buttons) lives in the MAIN channel (#ucs), @mentions Corbin,
+    # and posts NON-silent — distinct from the silent #ucs-alerts stream. Plain,
+    # button-less buzzes go DM-first via _notify_user_buzz (DMs are on); the card
+    # stays in-channel because its buttons do.
     mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
     mention = f"<@{mention_id}> " if mention_id else ""
     # Plain language, no markdown noise — this is what shows in a phone push,
@@ -816,7 +823,8 @@ async def _propose_action(
         pending.message_id = card.id
         _confirmation_message_index[card.id] = action_id
 
-    # The @mention card in the main channel is the buzz; no DM (Corbin's are off).
+    # The @mention card lives in the main channel because its approve/reject
+    # buttons do; that non-silent @mention is the buzz.
     asyncio.create_task(
         _await_and_run_proposal(action_id, title, task, session_key),
         name=f"proposal_{action_id}",
@@ -1593,6 +1601,45 @@ async def _judge_sweep_loop() -> None:
             log.exception("Judge sweep iteration failed — continuing")
 
 
+async def _cursor_stall_watch_loop() -> None:
+    """The third buzz case: a running Cursor thread that goes quiet past the
+    stall window. Emits a one-shot 'stalled' event (which the one typed gate
+    buzzes), then re-arms automatically when a new event lands — the watermark is
+    keyed to the thread's last_event_at, so a resumed-then-restalled thread can
+    stall again. Generalizes the cursor-watch policy: completion, a
+    question/decision, OR a stall — never a user-cancel or routine progress."""
+    from .cursor_registry import RegistryEvent
+
+    await bot.wait_until_ready()
+    stall_sec = max(60.0, config.cursor_stall_minutes * 60.0)
+    while not bot.is_closed():
+        try:
+            await asyncio.sleep(_STALL_WATCH_INTERVAL_SEC)
+            now = time.time()
+            for agent in cursor_registry.agents():
+                if agent.status != "running" or agent.last_event_at <= 0:
+                    continue
+                if now - agent.last_event_at < stall_sec:
+                    continue
+                if _stall_notified_at.get(agent.agent_id) == agent.last_event_at:
+                    continue
+                _stall_notified_at[agent.agent_id] = agent.last_event_at
+                mins = int((now - agent.last_event_at) / 60)
+                await _narrate_registry_event(RegistryEvent(
+                    kind="stalled",
+                    agent=agent,
+                    severity="high",
+                    reason=(
+                        f"Cursor thread in {agent.project_label} has been quiet for "
+                        f"{mins} min (running, no new activity) — it may be stuck."
+                    ),
+                ))
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Cursor stall watch iteration failed — continuing")
+
+
 # ---------------------------------------------------------------------------
 # Cursor event consumer
 # ---------------------------------------------------------------------------
@@ -1980,6 +2027,29 @@ async def _notify_user_buzz(content: str) -> bool:
         return False
 
 
+# The ONE attention policy: the typed kinds that buzz. Everything else
+# (a user-initiated 'cancelled', routine 'progress', a subagent 'started')
+# is silent-audit-only. This is the single gate — no severity heuristic, no
+# trailing-"?" guess — that governs a finished thread, an errored thread, a
+# question/decision (incl. a plan awaiting approval), and a 15-min stall.
+_BUZZ_KINDS: tuple[str, ...] = ("finished", "completed", "errored", "question", "stalled")
+
+
+async def _notify_task_event(task_id: int) -> None:
+    """Attention gate for Tasks (Primitive 1 -> Primitive 4). A Task reaching
+    needs_you / done / failed is exactly when a chief of staff interrupts you;
+    running / queued never buzz. Routes through the one buzz channel."""
+    from .db import get_task
+    from . import tasks as _tasks
+
+    t = get_task(task_id)
+    if not t or t["status"] not in ("needs_you", "done", "failed"):
+        return
+    mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
+    prefix = f"<@{mention_id}> " if mention_id else ""
+    await _notify_user_buzz(prefix + _tasks.task_summary(t))
+
+
 async def _narrate_registry_event(evt: RegistryEvent) -> None:
     """Single owner of voice / DM / alert routing for cursor registry events.
 
@@ -2051,9 +2121,7 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
             # high-severity ones: a thread finishing with an unknown/aborted
             # status comes through as severity=low but is still exactly what
             # Corbin asked to hear about.
-            if evt.severity == "high" or evt.kind in (
-                "finished", "completed", "errored", "question",
-            ):
+            if evt.kind in _BUZZ_KINDS:
                 speech = _format_registry_speech(evt)
                 await gemini.inject_text(
                     f"[Cursor watch heads-up — narrate this and ask what to do next] {speech}",
@@ -2082,13 +2150,11 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     # ASKING a question — must reach Corbin's phone.
     await _safe_post(audit_line, silent=True)
 
-    if (
-        evt.kind not in ("finished", "completed", "errored", "question")
-        and evt.severity != "high"
-    ):
-        # Low-severity progress / subagent churn: the silent stream is enough.
-        # Any HIGH-severity event (incl. a constructed plan awaiting approval)
-        # is a decision and still buzzes below.
+    if evt.kind not in _BUZZ_KINDS:
+        # The one typed gate: only completion, a question/decision (incl. an
+        # errored thread or a plan awaiting approval), or a 15-min stall buzzes.
+        # A user-initiated CANCEL, routine progress, and subagent dispatch are
+        # silent-audit-only — recorded above, never a buzz.
         return
 
     # Completions first try the richer "here's the next move — approve?"
@@ -2217,6 +2283,7 @@ async def on_ready():
     global cursor_observer
     global _voice_reconcile_task
     global _judge_sweep_task
+    global _cursor_stall_task
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
 
     if not _on_ready_done:
@@ -2227,8 +2294,11 @@ async def on_ready():
         try:
             from . import tasks as _tasks
             _tasks.reconcile_orphaned_on_boot()
+            # The attention gate for Tasks: buzz when one reaches needs_you /
+            # done / failed (the "walk away and trust the buzz" payoff).
+            _tasks.set_notifier(_notify_task_event)
         except Exception:
-            log.exception("task orphan reconcile failed (non-fatal)")
+            log.exception("task orphan reconcile / notifier wiring failed (non-fatal)")
         # Resume the conversation from the durable log of record so a restart
         # no longer starts blank (Primitive 3). Idempotent: only fills an empty
         # buffer, never duplicates live turns; best-effort so it can't block boot.
@@ -2442,6 +2512,12 @@ async def on_ready():
         if _judge_sweep_task is None or _judge_sweep_task.done():
             _judge_sweep_task = asyncio.create_task(
                 _judge_sweep_loop(), name="judge_sweep"
+            )
+
+        # The 15-min stall watchdog — the third buzz case.
+        if _cursor_stall_task is None or _cursor_stall_task.done():
+            _cursor_stall_task = asyncio.create_task(
+                _cursor_stall_watch_loop(), name="cursor_stall_watch"
             )
 
         _on_ready_done = True
