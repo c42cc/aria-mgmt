@@ -5,11 +5,13 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup
+.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter
 
 help:
 	@echo "Targets:"
 	@echo "  run          - kill prior bot, reinstall (editable), launch fresh"
+	@echo "  gate         - the one door to main: lints + structural absences + unit suite"
+	@echo "  meter        - the live-outcome meter: a real request on the trunk build (real API \$$)"
 	@echo "  preflight    - run capability preflight (same probes the bot runs at boot)"
 	@echo "  bootstrap    - one-command fresh-machine setup (venv, npm, MCP, OAuth, prompts)"
 	@echo "  kill         - kill any running bot processes"
@@ -31,6 +33,12 @@ run: kill
 	@bash ops/launch.sh
 
 restart: run
+
+gate:
+	@bash scripts/gate.sh
+
+meter:
+	@$(PYTHON) scripts/live_meter.py
 
 preflight:
 	@$(PYTHON) -m src.preflight

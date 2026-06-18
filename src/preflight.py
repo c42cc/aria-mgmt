@@ -592,11 +592,11 @@ async def probe_deployed_trunk() -> tuple[bool, str, str, str]:
     refuses ready instead of lying green.
 
     Replaces the old WARN `running_code` sentinel, which self-laundered: it
-    re-wrote the sentinel to whatever was running on every call and prescribed
-    "Restart: make run", so a restart on a feature branch turned the warning
-    green. This compares against the trunk (`main`) and a boot hash frozen once
-    per process (`build_hash.stamp_boot`), so neither a feature branch nor a
-    post-boot edit can re-bless itself.
+    re-wrote the sentinel to whatever was running on every call and prescribed a
+    bare restart, so a restart on a feature branch turned the warning green. This
+    compares against the trunk (`main`) and a boot hash frozen once per process
+    (`build_hash.stamp_boot`), so neither a feature branch nor a post-boot edit
+    can re-bless itself.
     """
     from . import build_hash
 

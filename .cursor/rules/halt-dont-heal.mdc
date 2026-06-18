@@ -1,0 +1,46 @@
+---
+description: Halt, don't heal — a guard is the confession of an un-found primitive
+alwaysApply: true
+---
+
+# Halt, don't heal
+
+Ported from the live_visuals_4 discipline. When something is missing, untagged, or
+broken, the move is to HALT loudly and collapse the root — never to add a layer
+that hides it.
+
+## The reflexes to STOP and rethink
+
+If you catch yourself reaching for any of these, stop — each is a confession that
+the real primitive has not been found:
+
+- a **retry / backoff / auto-reconnect** to paper over a failure,
+- a **fallback default** (`x or ""`, `?? default`, "if it fails, use None") feeding
+  a deciding path,
+- a **reconciler / drift-test / parity check** whose job is to make two copies
+  agree — the move is "where are the two copies? collapse them", not "approve the
+  checker",
+- a **try/except: pass** or any silent swallow.
+
+## We never accept silent failures, and never blame a third party
+
+- No silent fallbacks. A broken dependency, a timeout, a "thundering herd", a
+  delay — it is 100% ours to surface and fix at the root. Never attribute a
+  failure to a third-party service.
+- A mechanism failure is loud and typed (see `JudgeError`): a broken instrument
+  must never read as a measurement.
+- Missing data, an untagged action, or a broken dep → halt and report exactly what
+  broke and the one-command fix. Do not heal past it.
+
+## Recombine the catcher with the producer
+
+If a system exists only to catch and handle the symptoms another system produces,
+that is two homes for one fact. Collapse them into one more-fundamental primitive
+(e.g. the loop reading capability health BEFORE it chooses an approach, instead of
+discovering a dead tool by failing on it).
+
+## Eliminate legacy
+
+We do not support legacy, style variants, or back-compat bloat. When a collapse
+makes something gone, record it in `configs/structural_absences.json` so it stays
+gone — do not leave a dead path "just in case".

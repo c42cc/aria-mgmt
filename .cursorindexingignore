@@ -1,0 +1,10 @@
+# Large/binary runtime artifacts: not indexed, still @-referenceable on demand.
+data/
+voice_test_out/
+*.pcm
+*.wav
+*.mp4
+*.png
+*.db
+*.db-wal
+*.db-shm

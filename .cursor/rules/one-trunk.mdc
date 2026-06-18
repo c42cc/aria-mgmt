@@ -1,0 +1,40 @@
+---
+description: One trunk (main) — running == source, and the gate is the only door
+alwaysApply: true
+---
+
+# One trunk
+
+This exists because an automated agent left `HEAD` on a feature branch, launchd's
+KeepAlive booted that branch, and the standard `backup_model` tool silently
+vanished from the running bot while every meter stayed green. The fix is
+structural, not vigilance.
+
+## There is one trunk, and it is `main`
+
+- The bot runs `main`. Every launch path goes through `ops/launch.sh`, which does
+  `git checkout main` before the editable reinstall + exec. The launchd plist,
+  `make run`, and `deploy.sh`'s restart all call that one script.
+- Do not run the production bot on a feature branch. The CRITICAL `deployed_trunk`
+  preflight probe refuses ready if the process is not on `main`, the build tree is
+  dirty, or the build changed since boot — and it compares against the trunk and a
+  once-per-process boot hash, so nothing can self-launder the way the old
+  `running_code` WARN + "Restart: make run" did.
+
+## "Running == source" is a build hash, not a sentinel
+
+`src/build_hash.py` is the one content hash of the build (src + prompts + specs +
+models.yaml). It is how `deployed_trunk` detects drift and how the live-outcome
+receipt is keyed. Never reintroduce a boot sentinel that a probe re-writes on
+every run — that is the self-laundering bug.
+
+## The gate is the only door to main
+
+- Work on a branch. Never commit or push directly to `main`. Merging to `main`
+  needs an explicit ask (and the merge itself is the one place feature work lands).
+- `scripts/gate.sh` is the single door: globbed lints + the structural-absence
+  ledger + the unit suite. CI, the `ops/hooks/pre-push` hook, and `make gate` all
+  call it, so the gate definition has one home and cannot drift.
+- Green on the gate is the STATIC half of done. The RUNTIME half is
+  `scripts/live_meter.py`: a real request genuinely completing on the trunk build,
+  receipted to the build hash.

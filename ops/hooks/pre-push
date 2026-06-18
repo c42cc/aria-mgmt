@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Refuse a push that updates `main` while the gate is red. The gate (scripts/gate.sh)
+# is the single door to the trunk; this hook makes it un-bypassable on a main push.
+#
+# Install it yourself once (the project rules bar the agent from touching .git/ or
+# git config, so this is a manual, one-time step):
+#     ln -sf ../../ops/hooks/pre-push .git/hooks/pre-push
+#   or:
+#     git config core.hooksPath ops/hooks
+set -uo pipefail
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    if [ "$remote_ref" = "refs/heads/main" ]; then
+        echo "pre-push: this push updates main — running the gate first..."
+        if ! bash "$(git rev-parse --show-toplevel)/scripts/gate.sh"; then
+            echo "pre-push: REFUSED — the gate is red. Land green, then push to main."
+            exit 1
+        fi
+    fi
+done
+exit 0

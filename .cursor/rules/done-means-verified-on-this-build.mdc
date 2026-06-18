@@ -1,0 +1,38 @@
+---
+description: Done means a real request passed on the live build — receipted, watched
+alwaysApply: true
+---
+
+# Done means verified on this build
+
+This exists because "fixed" was claimed for months on mechanism-level green
+(preflight passed, a unit test passed, a branch was rebuilt) while the end-to-end
+outcome was still red. Mechanism-green is a proxy. It is not done.
+
+## The one definition of done
+
+A change is done only when **a real request completes on the live process and a
+calibrated judge marks it correct, and you watched it happen** — recorded as a
+build-hash-keyed receipt for the running build. Not a green meter, not a passing
+unit test, not a rebuilt branch.
+
+- The static half: `scripts/gate.sh` is green (lints + structural absences + unit
+  suite).
+- The runtime half: `scripts/live_meter.py` certifies a real `do_with_claude`
+  request genuinely succeeded (a real tool fired, not Blocked) on the trunk build,
+  and writes `data/receipts/<build_hash>.json`.
+- A receipt is valid only for the exact build that produced it. Any change to the
+  build (src / prompts / specs / models.yaml) changes the hash, so a stale receipt
+  cannot certify a new build. The CRITICAL `deployed_trunk` gate guarantees the
+  live pid IS that build, so the receipt proves the live pid.
+
+## Don't trust boot-time, on-disk, or offline-score green
+
+None of them is "done". If a change can be called "fixed" without a real request
+passing on the live build, the meter is wrong — fix the meter, don't relax the
+definition.
+
+## Unverified counts as fail
+
+A check that cannot honestly run is `unverified`, which counts as a failure and is
+recorded + alerted — it never silently disappears and never reads as a pass.
