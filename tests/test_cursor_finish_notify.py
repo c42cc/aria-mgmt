@@ -1,15 +1,16 @@
-"""Regression: a finished/errored/asking Cursor thread must ALWAYS reach the
-user off-voice.
+"""Regression: the cursor-watch off-voice delivery contract.
 
-The bug: off-voice, `_narrate_registry_event` only buzzed when a completion
-could be turned into a `propose_next` suggestion. When the model returned
-nothing (or the event was a low-severity finish / an error / a question), the
-code fell through to a FORCED-SILENT `#ucs-alerts` post and the user got no
-notification at all — "a thread finished and Aria never messaged me."
+A watched thread buzzes the user OFF-VOICE only when it genuinely STOPPED TO ASK
+— the `question` kind (an explicit AskQuestion/askFollowup tool call, or a plan
+awaiting approval). A thread that merely finishes, errors, or stalls is recorded
+to the forced-silent `#ucs-alerts` audit stream and NEVER manufactured into a
+buzz. This is the 2026-06-19 collapse of the fabricated-question firehose: it
+killed the "finished -> invent a next step" auto-proposal and the trailing-'?'
+prose heuristic that buzzed the user about live_visuals_4/ucs "questions" that
+were never asked.
 
-These tests isolate the narrator's off-voice delivery contract and prove every
-terminal/actionable transition now lands a guaranteed buzz, while pure
-progress/started events stay on the silent stream.
+These tests isolate `_narrate_registry_event`'s off-voice path and prove a
+question buzzes while finished/errored/stalled/progress/started stay silent.
 
 Run with:
     .venv/bin/python -m unittest tests.test_cursor_finish_notify -v
@@ -81,26 +82,24 @@ class TestNotifyUserBuzz(unittest.IsolatedAsyncioTestCase):
 
 
 class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
-    """Off-voice (`gemini` not connected), every terminal/actionable event
-    buzzes; progress/started do not."""
+    """Off-voice (`gemini` not connected), ONLY a `question` buzzes; a mere
+    finish / error / stall / progress / start stays on the silent audit stream."""
 
-    def _patches(self, *, proposal=False, buzz=True):
+    def _patches(self, *, buzz=True):
         from src import bot
 
         self._buzz = AsyncMock(return_value=buzz)
-        self._propose = AsyncMock(return_value=proposal)
         return [
             patch.object(bot, "gemini", None),  # off voice
             patch.object(bot, "conversation", MagicMock()),
             patch.object(bot, "post_to_alerts", AsyncMock()),
-            patch.object(bot, "_maybe_propose_next_after_completion", self._propose),
             patch.object(bot, "_notify_user_buzz", self._buzz),
         ]
 
-    async def _run(self, evt, *, proposal=False, buzz=True):
+    async def _run(self, evt, *, buzz=True):
         from src import bot
 
-        ctxs = self._patches(proposal=proposal, buzz=buzz)
+        ctxs = self._patches(buzz=buzz)
         for c in ctxs:
             c.start()
         try:
@@ -109,29 +108,26 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
             for c in reversed(ctxs):
                 c.stop()
 
-    async def test_finished_low_severity_buzzes_when_no_proposal(self):
-        # The 8:50 case: status-less finish + model had no suggestion.
-        await self._run(_make_event("finished", "low"), proposal=False)
-        self._buzz.assert_awaited_once()
-
-    async def test_finished_high_severity_buzzes_when_proposal_empty(self):
-        await self._run(_make_event("finished", "high"), proposal=False)
-        self._buzz.assert_awaited_once()
-
-    async def test_finished_proposal_fires_no_direct_buzz(self):
-        # When the richer proposal card fires it buzzes on its own; don't double.
-        await self._run(_make_event("finished", "high"), proposal=True)
-        self._propose.assert_awaited_once()
-        self._buzz.assert_not_awaited()
-
-    async def test_errored_buzzes_and_skips_proposal(self):
-        await self._run(_make_event("errored", "high"))
-        self._propose.assert_not_awaited()  # errors don't go through propose_next
-        self._buzz.assert_awaited_once()
-
     async def test_question_buzzes(self):
         await self._run(_make_event("question", "high", question="Which approach?"))
         self._buzz.assert_awaited_once()
+
+    async def test_finished_does_not_buzz(self):
+        # A window you drive ending is not a question — silent-audit-only.
+        await self._run(_make_event("finished", "high"))
+        self._buzz.assert_not_awaited()
+
+    async def test_finished_low_severity_does_not_buzz(self):
+        await self._run(_make_event("finished", "low"))
+        self._buzz.assert_not_awaited()
+
+    async def test_errored_does_not_buzz(self):
+        await self._run(_make_event("errored", "high"))
+        self._buzz.assert_not_awaited()
+
+    async def test_stalled_does_not_buzz(self):
+        await self._run(_make_event("stalled", "low"))
+        self._buzz.assert_not_awaited()
 
     async def test_progress_does_not_buzz(self):
         await self._run(_make_event("progress", "low"))

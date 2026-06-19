@@ -1,10 +1,13 @@
 """Step 5 lock: one typed attention gate.
 
+- The buzz allow-set is a single policy: ONLY a `question` (a thread that
+  stopped to ask) buzzes. Everything else — cancelled / progress / started /
+  finished / errored / stalled — is silent-audit-only.
 - A user-initiated CANCEL is a silent 'cancelled' kind, never a buzz (the
   explicit "stop bugging me on cancel" complaint).
 - A constructed plan is a 'question' (decision) and DOES buzz.
-- The buzz allow-set is the single policy; cancelled / progress / started are
-  outside it.
+- A thread merely finishing or erroring does NOT buzz (the collapse of the
+  fabricated-question firehose: a window you drive ending is not a question).
 - A Task reaching needs_you / done / failed buzzes; running / queued do not.
 """
 
@@ -42,15 +45,17 @@ class ClassifyHook(unittest.TestCase):
             self.assertEqual(kind, "cancelled", status)
             self.assertNotIn(kind, _BUZZ_KINDS, status)
 
-    def test_completed_and_error_buzz(self):
+    def test_completed_and_error_do_not_buzz(self):
+        # The honest-signal collapse: a thread finishing or erroring is still
+        # classified, but it is silent-audit-only — only an explicit ask buzzes.
         from src.cursor_registry import _classify_hook
         from src.bot import _BUZZ_KINDS
         kind, _s, _r = _classify_hook("stop", {"status": "completed"}, _agent())
         self.assertEqual(kind, "finished")
-        self.assertIn(kind, _BUZZ_KINDS)
+        self.assertNotIn(kind, _BUZZ_KINDS)
         kind, _s, _r = _classify_hook("stop", {"status": "error"}, _agent())
         self.assertEqual(kind, "errored")
-        self.assertIn(kind, _BUZZ_KINDS)
+        self.assertNotIn(kind, _BUZZ_KINDS)
 
     def test_constructed_plan_is_a_question(self):
         from src.cursor_registry import _classify_hook

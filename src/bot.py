@@ -1602,12 +1602,11 @@ async def _judge_sweep_loop() -> None:
 
 
 async def _cursor_stall_watch_loop() -> None:
-    """The third buzz case: a running Cursor thread that goes quiet past the
-    stall window. Emits a one-shot 'stalled' event (which the one typed gate
-    buzzes), then re-arms automatically when a new event lands — the watermark is
-    keyed to the thread's last_event_at, so a resumed-then-restalled thread can
-    stall again. Generalizes the cursor-watch policy: completion, a
-    question/decision, OR a stall — never a user-cancel or routine progress."""
+    """Record a one-shot 'stalled' AUDIT line when a running Cursor thread goes
+    quiet past the stall window, re-arming when a new event lands (the watermark
+    is keyed to the thread's last_event_at, so a resumed-then-restalled thread
+    can stall again). Silent-audit-only: a stall is an observation, not a thread
+    asking you, so it never buzzes — only an explicit ask (`question`) does."""
     from .cursor_registry import RegistryEvent
 
     await bot.wait_until_ready()
@@ -1628,10 +1627,10 @@ async def _cursor_stall_watch_loop() -> None:
                 await _narrate_registry_event(RegistryEvent(
                     kind="stalled",
                     agent=agent,
-                    severity="high",
+                    severity="low",
                     reason=(
                         f"Cursor thread in {agent.project_label} has been quiet for "
-                        f"{mins} min (running, no new activity) — it may be stuck."
+                        f"{mins} min (running, no new activity)."
                     ),
                 ))
         except asyncio.CancelledError:
@@ -1984,48 +1983,6 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
     return "\n".join(lines)
 
 
-# Rate-limit auto-proposals so a burst of watched windows finishing at once
-# can't fire a wall of decision buzzes. One auto-proposal per project per window.
-_last_proposal_at: dict[str, float] = {}
-_AUTO_PROPOSAL_COOLDOWN_SEC = 600.0
-
-
-async def _maybe_propose_next_after_completion(agent: "CursorAgent") -> bool:
-    """A watched thread finished. Instead of a useless 'it's done' buzz, ask
-    Claude for the single best next action and push it as a decision (which
-    buzzes). Returns True if a proposal was posted. Rate-limited per project.
-    """
-    if not config.propose_next_on_completion:
-        return False
-    project = (agent.workspace_root or "").rstrip("/").split("/")[-1] or "project"
-    now = time.monotonic()
-    if now - _last_proposal_at.get(project, 0.0) < _AUTO_PROPOSAL_COOLDOWN_SEC:
-        return False
-    summary = (agent.last_assistant_text or agent.pending_question or "").strip()
-    if not summary:
-        return False
-    try:
-        from .tools import suggest_next_action
-        nxt = await suggest_next_action(project, summary)
-    except Exception:
-        log.exception("suggest_next_action raised")
-        return False
-    if not nxt:
-        return False
-    _last_proposal_at[project] = now
-    try:
-        await _propose_action(
-            title=f"Next step on {project}",
-            why=f"That thread just finished: {_clip(summary, 600)}",
-            task=nxt,
-            session_key="",
-        )
-        return True
-    except Exception:
-        log.exception("propose-next failed for %s", project)
-        return False
-
-
 async def _notify_user_buzz(content: str) -> bool:
     """Deliver a phone-buzzing notification to the authorized user.
 
@@ -2067,12 +2024,17 @@ async def _notify_user_buzz(content: str) -> bool:
         return False
 
 
-# The ONE attention policy: the typed kinds that buzz. Everything else
-# (a user-initiated 'cancelled', routine 'progress', a subagent 'started')
-# is silent-audit-only. This is the single gate — no severity heuristic, no
-# trailing-"?" guess — that governs a finished thread, an errored thread, a
-# question/decision (incl. a plan awaiting approval), and a 15-min stall.
-_BUZZ_KINDS: tuple[str, ...] = ("finished", "completed", "errored", "question", "stalled")
+# The ONE attention policy: a watched thread buzzes the user ONLY when it has
+# genuinely STOPPED TO ASK — an explicit AskQuestion/askFollowup tool call
+# (`_extract_ask_question`) or a constructed plan awaiting approval. Both map to
+# the `question` kind; nothing else buzzes. A thread that merely finishes,
+# errors, stalls, or emits progress is silent-audit-only (recorded to
+# #ucs-alerts, absorbed into voice context) — a window you drive ending is NOT
+# Aria having a question for you. This is the collapse of the fabricated-
+# question firehose (2026-06-19): killed alongside the trailing-'?' prose
+# heuristic and the "finished -> invent a next step" auto-proposal, both of
+# which manufactured decisions the agent never asked.
+_BUZZ_KINDS: tuple[str, ...] = ("question",)
 
 
 async def _task_done_gate(goal: str, result: str, session_key: str) -> tuple[bool, list[str]]:
@@ -2131,16 +2093,13 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     1. Record the cursor event in the conversation buffer (always).
     2. Silent audit to `#ucs-alerts` (always — it's a glanceable, no-buzz
        stream, never a notification).
-    3. On voice + idle gate: structured context inject + speech trigger for
-       every terminal/actionable transition (finished/errored/question) or
-       any high-severity event. The wait_until_idle gate prevents the
+    3. On voice + idle gate: structured context inject for EVERY event (so Aria
+       holds what's happening), but a spoken heads-up ONLY for a `question`
+       (a thread that stopped to ask). The wait_until_idle gate prevents the
        narration from being batched into Aria's in-flight turn.
-    4. Not on voice: every terminal/actionable transition gets a guaranteed
-       phone buzz. Completions first try the richer "next move?" proposal
-       (which buzzes the main channel on its own); anything that doesn't fire
-       a proposal — and every error/question — falls through to
-       `_notify_user_buzz` (DM, else a non-silent `#ucs` @mention). Nothing
-       meaningful is ever silently dropped.
+    4. Not on voice: ONLY a `question` reaches the phone (via `_notify_user_buzz`
+       — DM, else a non-silent `#ucs` @mention). A thread that merely finishes,
+       errors, or stalls is silent-audit-only — never manufactured into a buzz.
     5. Mark `agent.last_delivered_at` only when Aria SPOKE it aloud (step 3),
        so a phone-only ping still surfaces on the next voice-join briefing.
     """
@@ -2190,14 +2149,16 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                     "continuing to the heads-up trigger anyway"
                 )
             spoke_aloud = False
-            # Speak aloud for every terminal/actionable transition, not just
-            # high-severity ones: a thread finishing with an unknown/aborted
-            # status comes through as severity=low but is still exactly what
-            # Corbin asked to hear about.
+            # Speak up only for a thread that STOPPED TO ASK (the `question`
+            # kind: an explicit AskQuestion or a plan awaiting approval). A mere
+            # finish/error/stall is injected as silent context above but never
+            # interrupts the conversation — Aria is reactive, not a narrator of
+            # every window you drive.
             if evt.kind in _BUZZ_KINDS:
                 speech = _format_registry_speech(evt)
                 await gemini.inject_text(
-                    f"[Cursor watch heads-up — narrate this and ask what to do next] {speech}",
+                    f"[Cursor watch heads-up — a watched thread stopped to ask you this; "
+                    f"narrate it and ask what to do] {speech}",
                     turn_complete=True,
                 )
                 spoke_aloud = True
@@ -2218,32 +2179,16 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
             )
 
     # Not on voice. #ucs-alerts is a forced-silent stream, so record the audit
-    # line there (a glanceable trail) but NEVER rely on it to notify. Every
-    # terminal/actionable transition — a thread FINISHED, ERRORED, or is
-    # ASKING a question — must reach Corbin's phone.
+    # line there (a glanceable trail) but NEVER rely on it to notify. The ONLY
+    # phone buzz is a thread that genuinely STOPPED TO ASK (the `question` kind:
+    # an explicit AskQuestion/askFollowup tool call, or a plan awaiting
+    # approval). A thread that merely finishes, errors, or stalls is recorded to
+    # the silent audit stream above and never manufactured into a buzz — a
+    # window you drive ending is not Aria having something to ask you.
     await _safe_post(audit_line, silent=True)
 
     if evt.kind not in _BUZZ_KINDS:
-        # The one typed gate: only completion, a question/decision (incl. an
-        # errored thread or a plan awaiting approval), or a 15-min stall buzzes.
-        # A user-initiated CANCEL, routine progress, and subagent dispatch are
-        # silent-audit-only — recorded above, never a buzz.
         return
-
-    # Completions first try the richer "here's the next move — approve?"
-    # proposal, which buzzes the main channel on its own. If it doesn't fire
-    # (model had no suggestion, rate-limited, disabled, or an empty summary)
-    # we fall through to a deterministic buzz so the finish is NEVER silently
-    # dropped — the exact bug behind "a thread finished and Aria never
-    # messaged me."
-    if evt.kind in ("finished", "completed"):
-        try:
-            if await _maybe_propose_next_after_completion(agent):
-                return
-        except Exception:
-            log.exception(
-                "propose-next path raised — falling back to direct notify"
-            )
 
     await _notify_user_buzz(_format_registry_dm(evt))
 
@@ -2590,7 +2535,8 @@ async def on_ready():
                 _judge_sweep_loop(), name="judge_sweep"
             )
 
-        # The 15-min stall watchdog — the third buzz case.
+        # The 15-min stall watchdog — records a silent-audit stall line (it does
+        # not buzz; only an explicit ask does).
         if _cursor_stall_task is None or _cursor_stall_task.done():
             _cursor_stall_task = asyncio.create_task(
                 _cursor_stall_watch_loop(), name="cursor_stall_watch"

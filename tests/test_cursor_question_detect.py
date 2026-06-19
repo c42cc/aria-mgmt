@@ -2,12 +2,12 @@
 `AskQuestion` TOOL must be detected as a question (high severity), not a
 silent `progress` turn.
 
-The bug: question detection only read assistant `text` blocks and only fired on
-a trailing '?'. Agents ask decisions by CALLING `AskQuestion` (the '?' is
-mid-prompt, followed by declarative sentences), so the real decision was
-invisible and Aria never pinged — "why the fuck did aria miss this question?"
-
-These tests isolate the detector against the exact tool shape Cursor emits.
+The bug it fixed: question detection used to also fire on a trailing '?', which
+both MISSED tool-asked decisions (the '?' is mid-prompt) and FABRICATED
+decisions out of any turn that merely ended in '?'. The trailing-'?' heuristic
+is now DELETED — an explicit AskQuestion/askFollowup tool call is the only
+signal that a thread stopped to ask. These tests isolate that detector against
+the exact tool shape Cursor emits, and prove a bare trailing '?' is progress.
 
 Run with:
     .venv/bin/python -m unittest tests.test_cursor_question_detect -v
@@ -61,12 +61,6 @@ _ASK_TURN_CONTENT = [
 
 
 class TestAskToolDetection(unittest.TestCase):
-    def test_prose_heuristic_misses_it(self):
-        from src.cursor_registry import _question_in_text
-
-        text = _ASK_TURN_CONTENT[0]["text"]
-        self.assertIsNone(_question_in_text(text), "prose heuristic should miss tool-asked questions")
-
     def test_extract_ask_question_catches_it(self):
         from src.cursor_registry import _extract_ask_question
 
@@ -101,6 +95,14 @@ class TestAskToolDetection(unittest.TestCase):
         self.assertIn("PAINT REALITY", ask_q)
 
 
+# A turn that merely ENDS in a question mark, with NO ask-the-user tool call.
+# Under the old trailing-'?' heuristic this fabricated a high-severity question
+# and buzzed the user; now it must be plain progress.
+_TRAILING_Q_CONTENT = [
+    {"type": "text", "text": "I refactored the module and it builds. Want me to run the tests now?"},
+]
+
+
 class TestRegistryEmitsQuestionEvent(unittest.IsolatedAsyncioTestCase):
     """End-to-end at the registry layer: folding an SDK assistant event that
     contains an AskQuestion tool call emits a high-severity `question`."""
@@ -130,6 +132,33 @@ class TestRegistryEmitsQuestionEvent(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("question", "high"), kinds, f"expected a high question event, got {kinds}")
         q_evt = next(e for e in events if e.kind == "question")
         self.assertIn("PAINT REALITY", q_evt.reason)
+
+    async def test_trailing_question_mark_is_not_a_question(self):
+        """A turn that merely ENDS in '?' (no AskQuestion tool call) is progress,
+        never a manufactured question — the trailing-'?' heuristic is deleted."""
+        from src.cursor_registry import CursorAgentRegistry
+
+        reg = CursorAgentRegistry()
+        events = []
+
+        async def emit(evt):
+            events.append(evt)
+
+        reg.set_emit_callback(emit)
+        await reg.register_from_sdk(
+            session_id="sid-2", workspace_root="/tmp/proj_noq", instruction="x"
+        )
+        events.clear()
+
+        await reg.record_sdk_event(
+            session_id="sid-2",
+            event="assistant",
+            data={"message": {"content": _TRAILING_Q_CONTENT}},
+        )
+
+        kinds = [e.kind for e in events]
+        self.assertNotIn("question", kinds, f"trailing '?' must NOT be a question, got {kinds}")
+        self.assertIn("progress", kinds)
 
 
 _NEW_ASK_CONTENT = [

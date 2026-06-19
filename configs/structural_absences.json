@@ -11,6 +11,21 @@
       "substring": "def probe_running_code",
       "where": ["src"],
       "why": "the WARN, self-laundering running_code probe is replaced by the CRITICAL deployed_trunk probe (step 0). It must not return."
+    },
+    {
+      "substring": "def _question_in_text",
+      "where": ["src"],
+      "why": "the trailing-'?' question heuristic. It fabricated a high-severity 'it's asking you' decision out of ANY assistant turn that merely ended in a question mark (incl. a dev assistant's own writing in a watched window), buzzing the user about questions that were never asked. Deleted 2026-06-19; a `question` is now detected ONLY via an explicit AskQuestion/askFollowup tool call (cursor_registry._extract_ask_question)."
+    },
+    {
+      "substring": "def _maybe_propose_next_after_completion",
+      "where": ["src"],
+      "why": "the 'finished -> invent a next step' auto-proposal. On every watched-thread completion it called Claude to manufacture a 'next step' and pushed it to the phone as a tap-to-approve decision, framing a window the user merely finished driving as something asking for a decision (the live_visuals_4/ucs 'fabricated question' the user hit 2026-06-19). Deleted; a completion is silent-audit-only — only an explicit ask buzzes."
+    },
+    {
+      "substring": "def suggest_next_action",
+      "where": ["src"],
+      "why": "the cheap Claude call behind the deleted auto-proposal (_maybe_propose_next_after_completion). Its only job was to invent a next-step decision to buzz; with the proposal gone it is dead. Removed 2026-06-19 — do not resurrect a 'guess what the user wants next' model call on the cursor-watch path."
     }
   ],
 

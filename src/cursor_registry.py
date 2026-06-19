@@ -203,34 +203,14 @@ def _sid_from_transcript_path(path: str | None) -> str:
     return ""
 
 
-def _question_in_text(text: str) -> str | None:
-    """Heuristic: if the assistant's last block ends in a question, return it.
-
-    Cursor agents that need clarification typically write a short trailing
-    paragraph that ends in `?`. We don't try to be clever — false positives
-    just mean Aria asks Corbin one extra time.
-    """
-    if not text:
-        return None
-    body = text.strip()
-    if not body:
-        return None
-    # Take the last non-empty paragraph.
-    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-    if not paragraphs:
-        return None
-    last = paragraphs[-1]
-    if last.endswith("?"):
-        return last[:500]
-    return None
-
-
 # Tools whose use means "I am asking the user to make a decision RIGHT NOW."
-# This is the unambiguous decision signal — an agent that calls one of these has
-# stopped to wait for the user, which is exactly when Aria must ping. Real
-# questions are asked by CALLING this tool, not by writing a trailing '?': the
-# AskQuestion that slipped through silently was a tool_use whose prompt had a '?'
-# mid-text followed by declarative sentences, so `_question_in_text` never saw it.
+# This is the ONLY honest "stopped to wait for you" signal — an agent that calls
+# one of these has halted for the user, which is exactly (and only) when Aria
+# pings. A question is asked by CALLING this tool, never inferred from prose: a
+# trailing-'?' heuristic was deleted (2026-06-19) because it fabricated "it's
+# asking you" out of any turn that merely ended in a question mark — including a
+# dev assistant's own writing — buzzing the user about questions that never
+# existed.
 _ASK_TOOL_NAMES = {"askquestion", "askfollowupquestion", "askfollowup", "askuser"}
 
 
@@ -241,10 +221,11 @@ def _normalize_tool_name(name: str) -> str:
 def _extract_ask_question(content: object) -> str | None:
     """Return the prompt of an 'ask the user' tool call in an assistant turn.
 
-    Reads the `tool_use` block directly — the prose heuristic in
-    `_question_in_text` never inspects tool calls, which is why a tool-asked
-    decision was invisible and never pinged. The moment the agent emits the
-    ask we have the question text and surface it as a high-severity decision.
+    Reads the `tool_use` block directly. This is the single source of a
+    `question` event: the moment the agent emits an explicit ask we have the
+    question text and surface it as a high-severity decision. There is no prose
+    fallback — inferring a question from a trailing '?' fabricated decisions the
+    agent never asked.
     """
     if not isinstance(content, list):
         return None
@@ -628,17 +609,16 @@ class CursorAgentRegistry:
         if kind == "assistant" and text:
             agent.last_assistant_text = text[: self._truncate_chars]
             sess.last_assistant_text = agent.last_assistant_text
-            q = _question_in_text(text)
-            agent.pending_question = q
-            if q:
-                evt_kind, severity, reason = (
-                    "question", "high", f"{agent.project_label} (Claude Code) asks: {q[:200]}",
-                )
-            else:
-                evt_kind, severity, reason = (
-                    "progress", "low",
-                    f"{agent.project_label} Claude Code thread {sess.sid[:8]} produced a turn.",
-                )
+            # This path receives the assistant text only — no structured
+            # tool_use blocks — so there is no explicit AskQuestion to detect
+            # here. A Claude Code turn is therefore always progress, never a
+            # manufactured question. (The trailing-'?' prose heuristic that used
+            # to run here was deleted: it fabricated "it's asking you".)
+            agent.pending_question = None
+            evt_kind, severity, reason = (
+                "progress", "low",
+                f"{agent.project_label} Claude Code thread {sess.sid[:8]} produced a turn.",
+            )
         elif kind == "completion":
             agent.status = "finished"
             evt_kind, severity, reason = (
@@ -718,8 +698,9 @@ class CursorAgentRegistry:
                     if joined:
                         agent.last_assistant_text = joined[: self._truncate_chars]
                         sess.last_assistant_text = agent.last_assistant_text
-                    # Explicit ask-the-user tool call wins over the prose heuristic.
-                    q = ask_q or _question_in_text(joined)
+                    # A question exists ONLY when the agent made an explicit
+                    # ask-the-user tool call — never inferred from prose.
+                    q = ask_q
                     agent.pending_question = q
                     if q:
                         kind, severity, reason = (
@@ -867,10 +848,11 @@ class CursorAgentRegistry:
                                 if la:
                                     agent.last_assistant_text = la[: self._truncate_chars]
                                     sess.last_assistant_text = agent.last_assistant_text
-                                # An explicit ask-the-user tool call is the gold
-                                # decision signal and ALWAYS wins over the prose
-                                # heuristic (which only catches a trailing '?').
-                                q = ask_q or _question_in_text(la)
+                                # An explicit ask-the-user tool call is the ONLY
+                                # decision signal. A question is never inferred
+                                # from prose (the trailing-'?' heuristic that
+                                # fabricated decisions was deleted).
+                                q = ask_q
                                 agent.pending_question = q
                                 if primed:
                                     kind: EventKind = "question" if q else "progress"
