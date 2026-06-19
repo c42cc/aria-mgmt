@@ -131,6 +131,13 @@ class Config:
         os.path.dirname(os.path.dirname(__file__)), "cursor_wrapper"
     )
     cursor_user_data_dir: str = os.path.expanduser("~/.cursor")
+    # Chrome DevTools Protocol port for driving the real Cursor IDE as an
+    # actuator (src/cursor_ide_driver.py). Cursor must be launched with
+    # `--remote-debugging-port=<this>` for IDE sends to fire for real; enable
+    # it once with `ops/cursor_ide_debug.sh`. When the port is closed the
+    # driver returns a typed blocker naming this fix — it never falls back to a
+    # blind paste, and never claims an unverified send (the 06:18 forensic).
+    cursor_cdp_port: int = int(os.getenv("CURSOR_CDP_PORT", "9223"))
 
 
 config = Config()

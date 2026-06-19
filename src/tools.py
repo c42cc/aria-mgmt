@@ -3702,7 +3702,7 @@ async def _send_to_cursor_chat(
     message: str,
     new_agent: bool = True,
     send_delay_sec: float = 0.7,
-    verify_timeout_sec: float = 0.0,
+    verify_timeout_sec: float = 12.0,
 ) -> str:
     """Type a message into the Cursor chat input for `project` and send it.
 
@@ -3879,13 +3879,37 @@ return "OK|" & (item 1 of hits)
                 landed_via = "transcript_mtime_advanced"
                 break
 
+    if landed:
+        return json.dumps({
+            "ok": True,
+            "matched": matched,
+            "chars_sent": len(message),
+            "open_method": open_label,
+            "verified_landed": True,
+            "verify_signal": landed_via,
+            "route": "osascript_ide",
+        })
+    # DP2 (forensic 2026-06-19 06:18): an UNVERIFIED send is not a success.
+    # The old return shipped `ok:true` + a soft `verified_landed:false` that the
+    # model narrated around as "Sent. Delivered. it'll pick it up." Killed: an
+    # unconfirmed paste is a typed blocker naming the one fix (real CDP IDE
+    # driving, which verifies), so it can never read as delivered.
     return json.dumps({
-        "ok": True,
+        "ok": False,
+        "_error_class": "unverified",
         "matched": matched,
         "chars_sent": len(message),
         "open_method": open_label,
-        "verified_landed": landed,
-        "verify_signal": landed_via or ("no transcript directory observed" if not transcripts_dir else "timed out waiting for mtime change"),
+        "verify_signal": landed_via or (
+            "no transcript directory observed" if not transcripts_dir
+            else "timed out waiting for mtime change"
+        ),
+        "need": (
+            "I pasted this into the Cursor window but could NOT confirm it landed "
+            "or was processed, so I will not claim it was sent. Enable real IDE "
+            "driving (ops/cursor_ide_debug.sh) so sends are verified, or check the "
+            "window yourself"
+        ),
     })
 
 

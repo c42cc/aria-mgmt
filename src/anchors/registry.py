@@ -15,6 +15,7 @@ import time
 
 from .base import Anchor, AnchorReport
 from .calendar_google import GoogleCalendarAnchor
+from .claimed_delivery import ClaimedDeliveryAnchor
 from .filesystem import (
     FilesystemListAnchor,
     FilesystemReadAnchor,
@@ -61,6 +62,10 @@ _TOOL_MAP: dict[str, type] = {
     "execute-command": ShellAnchor,
 
     "plan_with_claude": PlanCitationAnchor,
+
+    # DP4: a cursor_send that claims delivery it never verified is failed
+    # deterministically — the judge's narration-trust is no longer the only gate.
+    "cursor_send": ClaimedDeliveryAnchor,
 }
 
 
@@ -72,6 +77,7 @@ _WRITE_TOOLS = frozenset({
     "create-event", "create_event",
     "write_file",
     "execute_command", "execute-command",
+    "cursor_send",
 })
 
 

@@ -26,6 +26,7 @@ is to *remove* moving parts elsewhere, not add a layer.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -294,13 +295,16 @@ _HARD_FAILURE_MARKERS: tuple[str, ...] = (
     "traceback (most recent call last)",
 )
 
-# Tools whose SUCCESS result is known to carry a positive confirmation token
-# (a message id / "sent successfully"). For these, the absence of any such
-# token means delivery is unconfirmed — the per-send "did it actually land?"
-# check, not just "did it explicitly fail?". Scoped to tools whose success
-# shape we have actually observed, so a real success is never mislabeled.
-# (Apple `messages_chat` has no positive delivery receipt in its result, so it
-# is verified by absence-of-failure above, not by a required token.)
+# A world-changing tool's OWN structured result is the single home for "did it
+# land?" — DP3 (forensic 2026-06-19 06:18). The old gate could only read
+# send_email's plain-text token, so cursor_send's `{"ok":false,
+# "verified_landed":false}` blocker was invisible to it and got narrated as
+# "Delivered." Now a typed envelope is judged by its own verdict (ok /
+# verified_landed / _error_class, see `_structured_verdict`); the per-tool token
+# list below survives ONLY as the narrow PLAIN-TEXT-send fallback — some MCP
+# sends confirm only with a token in prose, while Apple `messages_chat` has no
+# positive receipt at all and is verified by absence-of-failure, never by a
+# required token.
 _CONFIRM_REQUIRED_TOOLS: tuple[str, ...] = ("send_email",)
 _SEND_CONFIRM_TOKENS: tuple[str, ...] = (
     "sent successfully", "message sent", "email sent", "messageid",
@@ -318,13 +322,43 @@ def _is_world_changing(name: str, args: Optional[dict]) -> bool:
     return ("message" in name or "contact" in name) and action in ("create", "send")
 
 
+def _structured_verdict(result: str) -> Optional[bool]:
+    """Read a tool result's OWN verification verdict when it is a typed JSON
+    envelope — the single home for "did it land?".
+
+    Returns True (the tool confirmed its own success), False (a typed failure /
+    blocker / explicitly-unverified result), or None (not a structured
+    envelope — judge it by text instead).
+    """
+    t = (result or "").lstrip()
+    if not t.startswith("{"):
+        return None
+    try:
+        obj = json.loads(t)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("_error_class") is not None:
+        return False
+    if obj.get("verified_landed") is False:
+        return False
+    if obj.get("ok") is False:
+        return False
+    if obj.get("verified_landed") is True or obj.get("ok") is True:
+        return True
+    return None
+
+
 def unverified_world_changes(trace: Optional[list[dict]]) -> list[str]:
     """World-changing actions in `trace` we cannot confirm succeeded. Returns
     deduped tool labels for an honest 'could not confirm' note.
 
-    An action is flagged when it is world-changing AND either (a) its result
-    carries an unambiguous failure marker, or (b) it is a send whose success
-    shape must include a confirmation token yet has none. Reads/searches and
+    The single home is the tool's OWN structured verdict (`_structured_verdict`):
+    a typed envelope reporting `_error_class`, `ok:false`, or
+    `verified_landed:false` is flagged; one reporting `ok:true` /
+    `verified_landed:true` is confirmed. A plain-text result is judged by failure
+    markers, plus the narrow plain-text-send token check. Reads/searches and
     confirmed sends are never flagged, so the note stays low-false-positive.
     """
     flagged: list[str] = []
@@ -332,14 +366,24 @@ def unverified_world_changes(trace: Optional[list[dict]]) -> list[str]:
         name = (e.get("tool") or "").lower()
         if not _is_world_changing(name, e.get("args")):
             continue
-        result = (e.get("result") or "").lower()
+        result = e.get("result") or ""
         label = e.get("tool") or "action"
-        if any(m in result for m in _HARD_FAILURE_MARKERS):
+
+        verdict = _structured_verdict(result)
+        if verdict is True:
+            continue  # the tool confirmed its own success — never flag
+        if verdict is False:
+            if label not in flagged:
+                flagged.append(label)
+            continue
+
+        low = result.lower()
+        if any(m in low for m in _HARD_FAILURE_MARKERS):
             if label not in flagged:
                 flagged.append(label)
             continue
         if any(t in name for t in _CONFIRM_REQUIRED_TOOLS):
-            if not any(tok in result for tok in _SEND_CONFIRM_TOKENS):
+            if not any(tok in low for tok in _SEND_CONFIRM_TOKENS):
                 if label not in flagged:
                     flagged.append(label)
     return flagged

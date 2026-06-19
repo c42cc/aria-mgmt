@@ -191,3 +191,30 @@ def test_unverified_passes_send_email_with_confirmation():
     trace = [{"tool": "send_email", "args": {"to": "x@y.com"},
               "result": "Email sent successfully. Message ID: 19ed20bee33d8ca2"}]
     assert unverified_world_changes(trace) == []
+
+
+# DP3 (forensic 2026-06-19 06:18): the gate must read a tool's OWN structured
+# verdict so cursor_send's unverified blocker is no longer invisible.
+
+def test_unverified_flags_cursor_send_blocker():
+    # The exact new typed-blocker shape from drive_ide_chat / _send_to_cursor_chat.
+    trace = [{"tool": "cursor_send", "args": {"agent_id": "x"},
+              "result": '{"ok": false, "_error_class": "unverified", '
+                        '"verify_signal": "transcript_did_not_advance"}'}]
+    assert unverified_world_changes(trace) == ["cursor_send"]
+
+
+def test_unverified_flags_verified_landed_false_even_if_ok_true():
+    # The OLD lie shape: ok:true with verified_landed:false. The deciding fact
+    # (verified_landed) wins — this is flagged, not silently passed.
+    trace = [{"tool": "cursor_send", "args": {"agent_id": "x"},
+              "result": '{"ok": true, "verified_landed": false, '
+                        '"verify_signal": "timed out waiting for mtime change"}'}]
+    assert unverified_world_changes(trace) == ["cursor_send"]
+
+
+def test_unverified_passes_verified_cursor_send():
+    trace = [{"tool": "cursor_send", "args": {"agent_id": "x"},
+              "result": '{"ok": true, "verified_landed": true, '
+                        '"verify_signal": "transcript_advanced"}'}]
+    assert unverified_world_changes(trace) == []

@@ -297,6 +297,18 @@ async def _cursor_threads(
             row["live"] = False
             row["live_note"] = "no live hook signal — status is distilled from the transcript, not confirmed live"
 
+    # DP6 (forensic 2026-06-19 06:16: "give me the last three" -> returned the
+    # OLDEST three). Hand the model an explicitly-ordered, ranked list so "the
+    # last / latest / most-recent N" can never invert. Sort newest-first by the
+    # transcript mtime (the ground-truth recency) and stamp a 1-indexed
+    # `recency_rank`: rank 1 IS the most recently active thread, so "the last N"
+    # is unambiguously ranks 1..N — the model never re-derives the order.
+    rows = [r for _, r in sorted(
+        zip(threads, rows), key=lambda tr: tr[0].get("mtime", 0.0), reverse=True
+    )]
+    for i, row in enumerate(rows, start=1):
+        row["recency_rank"] = i
+
     out: dict = {
         "project": project_label,
         "workspace_root": workspace_root,
@@ -304,6 +316,8 @@ async def _cursor_threads(
         "count": len(rows),
         # The direct answer to "what's underway / still working RIGHT NOW".
         "live_running_count": live_running,
+        "ordering": "most_recent_first; recency_rank 1 = most recently active. "
+                    "'the last/latest/most-recent N' = ranks 1..N.",
         "threads": rows,
     }
     if errors:
@@ -486,15 +500,21 @@ async def _cursor_send(
             log.exception("cursor_send SDK route failed for %s", agent.agent_id)
             return json.dumps({"error": f"sdk {kind_norm} failed: {e}"})
 
-    # IDE fallback path uses the existing osascript handlers in src/tools.py.
-    # Imported lazily so cursor_tools doesn't pull tools at import time.
-    from .tools import _send_to_cursor_chat
+    # IDE route: drive the real IDE over CDP and VERIFY the send landed (the
+    # transcript advances) — or return a typed blocker. This replaces the
+    # osascript paste-and-pray whose "ok:true + verified_landed:false" became
+    # the "Sent. Delivered. it'll pick it up" lie (forensic 2026-06-19 06:18).
+    # No blind-paste fallback (halt-dont-heal): a closed CDP port is a named,
+    # one-command-fixable blocker, never a fake delivery.
+    from .cursor_ide_driver import drive_ide_chat
 
-    project = agent.project_label or agent.workspace_root
     new_agent_flag = kind_norm == "new_agent"
-    return await _send_to_cursor_chat(
-        project=project, message=body, new_agent=new_agent_flag
+    result = await drive_ide_chat(
+        agent.workspace_root, body, new_agent=new_agent_flag
     )
+    result.setdefault("agent_id", agent.agent_id)
+    result.setdefault("kind", kind_norm)
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------

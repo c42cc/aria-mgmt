@@ -1861,6 +1861,20 @@ def _cached_thread_label(sid: str) -> str:
     return str(row.get("label") or "").strip()
 
 
+# DP1 (forensic 2026-06-19 06:19: "there is no fucking agent for cursor"). Only
+# these sources are autonomous CONSUMERS — a message sent to them is genuinely
+# processed and written back on their own. A Cursor `ide` window is driven by
+# the human (or, on demand, by Aria via the CDP IDE driver, which verifies);
+# there is NO background agent that auto-consumes a relayed answer. The narrator
+# must never frame an idle IDE window as an agent that is "asking you" and
+# "waiting for a reply to relay".
+_AUTONOMOUS_CONSUMER_SOURCES = ("sdk", "claude_code")
+
+
+def _is_autonomous_consumer(agent: "CursorAgent") -> bool:
+    return getattr(agent, "source", "") in _AUTONOMOUS_CONSUMER_SOURCES
+
+
 def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
     """Structured silent-context block for Gemini before the heads-up trigger.
 
@@ -1885,6 +1899,16 @@ def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
     lines.append(f"  reason: {evt.reason}")
     if agent.pending_question:
         lines.append(f"  pending_question: {agent.pending_question[:400]}")
+        if not _is_autonomous_consumer(agent):
+            lines.append(
+                "  NOTE: this is a Cursor IDE window the user DRIVES; its last "
+                "message just ended with a question. There is NO background agent "
+                "waiting to consume a relayed answer — do NOT claim you 'sent it' or "
+                "'relayed it' to a waiting agent. To answer it for real, cursor_send "
+                "DRIVES the IDE over CDP and confirms only once the thread actually "
+                "responds; if it returns a blocker (e.g. CDP port off), surface that "
+                "verbatim — never a fabricated 'delivered'."
+            )
     if agent.last_assistant_text:
         snippet = agent.last_assistant_text[:600].replace("\n", " ")
         lines.append(f"  last_assistant_text: {snippet}")
@@ -1892,12 +1916,21 @@ def _format_registry_context_for_inject(evt: RegistryEvent) -> str:
         lines.append(
             "  recent_plan_files: " + ", ".join(agent.recent_plan_files[-3:])
         )
-    lines.append(
-        "  For follow-ups: read this exact thread with "
-        "cursor_read(thread_handle above), or cursor_send to it. For the full "
-        "picture of every thread in this project, call cursor_threads. "
-        "(cursor_send kind=chat/new_agent/approve/reject/cancel).]"
-    )
+    if _is_autonomous_consumer(agent):
+        lines.append(
+            "  For follow-ups: read this exact thread with "
+            "cursor_read(thread_handle above), or cursor_send to it. For the full "
+            "picture of every thread in this project, call cursor_threads. "
+            "(cursor_send kind=chat/new_agent/approve/reject/cancel).]"
+        )
+    else:
+        lines.append(
+            "  For follow-ups: read this exact thread with "
+            "cursor_read(thread_handle above). To act ON it, cursor_send DRIVES the "
+            "IDE for real and verifies the send landed — report its verified result "
+            "or its blocker verbatim, never a fabricated delivery. For every thread "
+            "in this project, call cursor_threads.]"
+        )
     return "\n".join(lines)
 
 
@@ -1935,8 +1968,15 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
         lines.append(f"Latest: {snippet}")
     # Decision-oriented tail: tell Corbin what he can actually do about it,
     # rather than a generic "join voice". Context > noise.
-    if agent.pending_question:
+    if agent.pending_question and _is_autonomous_consumer(agent):
         lines.append("\u2192 Reply here with the answer and I'll relay it, or say it in voice.")
+    elif agent.pending_question:
+        # DP1: an idle IDE window has no agent waiting to consume a relayed reply.
+        lines.append(
+            "\u2192 That's a Cursor IDE window you drive (nothing picks up a reply on "
+            "its own). Say the word and I'll drive the IDE to answer it for real \u2014 "
+            "I'll only confirm once the thread actually responds."
+        )
     elif evt.kind in ("error", "errored", "failed"):
         lines.append("\u2192 Looks stuck. Reply 'fix it' and I'll investigate + propose an approach to approve.")
     else:

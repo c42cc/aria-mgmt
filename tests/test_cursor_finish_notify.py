@@ -142,5 +142,48 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
         self._buzz.assert_not_awaited()
 
 
+class TestNoPhantomAgentFraming(unittest.TestCase):
+    """DP1 (forensic 2026-06-19 06:19): an idle IDE window must be framed as a
+    window-you-drive, never as an agent waiting for a relayed answer."""
+
+    def _agent(self, source: str):
+        from src.cursor_registry import CursorAgent
+
+        a = CursorAgent(
+            agent_id="/tmp/x", workspace_root="/tmp/x",
+            project_label="x", source=source,
+        )
+        a.pending_question = "Proceed to Phase 3 or finish verification first?"
+        return a
+
+    def test_ide_question_dm_does_not_promise_to_relay(self):
+        from src import bot
+        from src.cursor_registry import RegistryEvent
+
+        evt = RegistryEvent(kind="question", agent=self._agent("ide"),
+                            severity="high", reason="x is asking")
+        dm = bot._format_registry_dm(evt)
+        self.assertNotIn("relay", dm.lower())
+        self.assertIn("window you drive", dm.lower())
+
+    def test_sdk_question_dm_still_relays(self):
+        from src import bot
+        from src.cursor_registry import RegistryEvent
+
+        evt = RegistryEvent(kind="question", agent=self._agent("sdk"),
+                            severity="high", reason="x is asking")
+        dm = bot._format_registry_dm(evt)
+        self.assertIn("relay", dm.lower())
+
+    def test_ide_inject_context_forbids_fake_delivery(self):
+        from src import bot
+        from src.cursor_registry import RegistryEvent
+
+        evt = RegistryEvent(kind="question", agent=self._agent("ide"),
+                            severity="high", reason="x is asking")
+        ctx = bot._format_registry_context_for_inject(evt)
+        self.assertIn("no background agent", ctx.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -451,6 +451,9 @@ points; cross-references inside the code are reliable.
 | Cursor agent registry (source of truth: per-thread status, JSONL tailer, AskQuestion detection) | `src/cursor_registry.py` |
 | Cursor-watch narrator (voice / DM / `#ucs` delivery) | `src/bot.py::_narrate_registry_event` |
 | Cursor read/send tools (`cursor_read`, `cursor_send`, `cursor_threads`) | `src/cursor_tools.py` |
+| Cursor IDE actuator (drives the real IDE over CDP; success only on a verified transcript advance, else a typed blocker) | `src/cursor_ide_driver.py` |
+| Enable Cursor IDE driving (one-time relaunch with the CDP debug port) | `ops/cursor_ide_debug.sh` |
+| Claimed-delivery judge anchor (floors a fabricated "Sent/Delivered" to FAILED) | `src/anchors/claimed_delivery.py` |
 | Cursor hooks forwarder | `hooks/cursor-event.py` (+ `hooks/install.py`) |
 | Claude Agent SDK (Claude Code) driver | `src/claude_code.py` |
 | Durable conversation buffer (voice + text + cursor events) | `src/conversation.py` |
