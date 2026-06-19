@@ -1602,11 +1602,12 @@ async def _judge_sweep_loop() -> None:
 
 
 async def _cursor_stall_watch_loop() -> None:
-    """Record a one-shot 'stalled' AUDIT line when a running Cursor thread goes
-    quiet past the stall window, re-arming when a new event lands (the watermark
-    is keyed to the thread's last_event_at, so a resumed-then-restalled thread
-    can stall again). Silent-audit-only: a stall is an observation, not a thread
-    asking you, so it never buzzes — only an explicit ask (`question`) does."""
+    """Buzz a one-shot 'stalled' summary when a running Cursor thread goes quiet
+    past the stall window, re-arming when a new event lands (the watermark is
+    keyed to the thread's last_event_at, so a resumed-then-restalled thread can
+    stall again). A stall is the only way a silently-hung thread surfaces — no
+    stop hook fires for a hang — so it counts as a STOP and notifies, with a
+    factual 'quiet for N min' summary, never a 'definitely stuck' claim."""
     from .cursor_registry import RegistryEvent
 
     await bot.wait_until_ready()
@@ -1627,7 +1628,7 @@ async def _cursor_stall_watch_loop() -> None:
                 await _narrate_registry_event(RegistryEvent(
                     kind="stalled",
                     agent=agent,
-                    severity="low",
+                    severity="high",
                     reason=(
                         f"Cursor thread in {agent.project_label} has been quiet for "
                         f"{mins} min (running, no new activity)."
@@ -1963,8 +1964,17 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
     if agent.pending_question:
         lines.append(f"It's asking: {agent.pending_question[:300]}")
     elif agent.last_assistant_text:
-        snippet = agent.last_assistant_text[:300].replace("\n", " ")
-        lines.append(f"Latest: {snippet}")
+        # A factual little summary of what the thread actually did: its own last
+        # words (agents end on a wrap-up). Labeled by stop type — never an
+        # invented "next step".
+        snippet = agent.last_assistant_text[:400].replace("\n", " ")
+        if evt.kind in ("finished", "completed"):
+            label = "Summary"
+        elif evt.kind in ("error", "errored", "failed"):
+            label = "Last (before error)"
+        else:
+            label = "Latest"
+        lines.append(f"{label}: {snippet}")
     # Decision-oriented tail: tell Corbin what he can actually do about it,
     # rather than a generic "join voice". Context > noise.
     if agent.pending_question and _is_autonomous_consumer(agent):
@@ -2024,17 +2034,17 @@ async def _notify_user_buzz(content: str) -> bool:
         return False
 
 
-# The ONE attention policy: a watched thread buzzes the user ONLY when it has
-# genuinely STOPPED TO ASK — an explicit AskQuestion/askFollowup tool call
-# (`_extract_ask_question`) or a constructed plan awaiting approval. Both map to
-# the `question` kind; nothing else buzzes. A thread that merely finishes,
-# errors, stalls, or emits progress is silent-audit-only (recorded to
-# #ucs-alerts, absorbed into voice context) — a window you drive ending is NOT
-# Aria having a question for you. This is the collapse of the fabricated-
-# question firehose (2026-06-19): killed alongside the trailing-'?' prose
-# heuristic and the "finished -> invent a next step" auto-proposal, both of
-# which manufactured decisions the agent never asked.
-_BUZZ_KINDS: tuple[str, ...] = ("question",)
+# The ONE attention policy: a watched thread buzzes the user every time it STOPS
+# — a question it stopped to ask, a completion, an error, or a 15-min stall —
+# each carrying a factual little summary of what it actually did
+# (`_format_registry_dm` reads the thread's own last words / the question / the
+# error; it never invents one). Routine 'progress', a 'started', and a
+# user-initiated 'cancelled' stay silent-audit-only. The fabrication sources are
+# gone (2026-06-19): a `question` comes ONLY from an explicit AskQuestion/
+# askFollowup tool call (never a trailing '?'), and a completion is summarized
+# from real output (never a Claude-invented "next step"). So every stop pings,
+# but no stop is manufactured into a decision the agent never posed.
+_BUZZ_KINDS: tuple[str, ...] = ("question", "finished", "completed", "errored", "stalled")
 
 
 async def _task_done_gate(goal: str, result: str, session_key: str) -> tuple[bool, list[str]]:
@@ -2094,12 +2104,15 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     2. Silent audit to `#ucs-alerts` (always — it's a glanceable, no-buzz
        stream, never a notification).
     3. On voice + idle gate: structured context inject for EVERY event (so Aria
-       holds what's happening), but a spoken heads-up ONLY for a `question`
-       (a thread that stopped to ask). The wait_until_idle gate prevents the
-       narration from being batched into Aria's in-flight turn.
-    4. Not on voice: ONLY a `question` reaches the phone (via `_notify_user_buzz`
-       — DM, else a non-silent `#ucs` @mention). A thread that merely finishes,
-       errors, or stalls is silent-audit-only — never manufactured into a buzz.
+       holds what's happening), plus a spoken heads-up for every STOP
+       (question / finished / errored / stalled) with a factual summary. The
+       wait_until_idle gate prevents the narration from being batched into
+       Aria's in-flight turn.
+    4. Not on voice: every STOP reaches the phone (via `_notify_user_buzz` — DM,
+       else a non-silent `#ucs` @mention), carrying a factual little summary
+       (`_format_registry_dm`). Routine progress / started / cancelled stay
+       silent-audit-only. No stop is ever manufactured into a question or a
+       "next step" the agent never posed.
     5. Mark `agent.last_delivered_at` only when Aria SPOKE it aloud (step 3),
        so a phone-only ping still surfaces on the next voice-join briefing.
     """
@@ -2149,16 +2162,16 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                     "continuing to the heads-up trigger anyway"
                 )
             spoke_aloud = False
-            # Speak up only for a thread that STOPPED TO ASK (the `question`
-            # kind: an explicit AskQuestion or a plan awaiting approval). A mere
-            # finish/error/stall is injected as silent context above but never
-            # interrupts the conversation — Aria is reactive, not a narrator of
-            # every window you drive.
+            # Speak up for every STOP (question / finished / errored / stalled):
+            # a watched thread that asked, completed, errored, or went quiet is
+            # exactly what Corbin asked to hear about — with a factual summary,
+            # never an invented decision. Routine progress/started stay silent
+            # context above and don't interrupt.
             if evt.kind in _BUZZ_KINDS:
                 speech = _format_registry_speech(evt)
                 await gemini.inject_text(
-                    f"[Cursor watch heads-up — a watched thread stopped to ask you this; "
-                    f"narrate it and ask what to do] {speech}",
+                    f"[Cursor watch heads-up — a watched thread just stopped; narrate "
+                    f"this summary and ask what to do next] {speech}",
                     turn_complete=True,
                 )
                 spoke_aloud = True
@@ -2178,13 +2191,12 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                 "Failed to inject registry event into Gemini — falling back to DM rung"
             )
 
-    # Not on voice. #ucs-alerts is a forced-silent stream, so record the audit
-    # line there (a glanceable trail) but NEVER rely on it to notify. The ONLY
-    # phone buzz is a thread that genuinely STOPPED TO ASK (the `question` kind:
-    # an explicit AskQuestion/askFollowup tool call, or a plan awaiting
-    # approval). A thread that merely finishes, errors, or stalls is recorded to
-    # the silent audit stream above and never manufactured into a buzz — a
-    # window you drive ending is not Aria having something to ask you.
+    # Not on voice. #ucs-alerts is a forced-silent stream (the glanceable trail),
+    # so record the audit line there, then buzz the phone for every STOP — a
+    # question, a completion, an error, or a stall — each carrying a factual
+    # little summary (`_format_registry_dm` reads the thread's own last words /
+    # the question / the error). Routine progress/started/cancelled return here
+    # silently. No stop is manufactured into a decision the agent never posed.
     await _safe_post(audit_line, silent=True)
 
     if evt.kind not in _BUZZ_KINDS:
@@ -2535,8 +2547,8 @@ async def on_ready():
                 _judge_sweep_loop(), name="judge_sweep"
             )
 
-        # The 15-min stall watchdog — records a silent-audit stall line (it does
-        # not buzz; only an explicit ask does).
+        # The 15-min stall watchdog — a silently-hung thread has no stop hook, so
+        # this surfaces it as a STOP and buzzes a factual 'quiet for N min' line.
         if _cursor_stall_task is None or _cursor_stall_task.done():
             _cursor_stall_task = asyncio.create_task(
                 _cursor_stall_watch_loop(), name="cursor_stall_watch"

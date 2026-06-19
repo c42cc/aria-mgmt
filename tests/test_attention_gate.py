@@ -1,13 +1,14 @@
 """Step 5 lock: one typed attention gate.
 
-- The buzz allow-set is a single policy: ONLY a `question` (a thread that
-  stopped to ask) buzzes. Everything else — cancelled / progress / started /
-  finished / errored / stalled — is silent-audit-only.
+- The buzz allow-set is a single policy: every STOP buzzes — a `question`, a
+  `finished`/`completed`, an `errored`, or a `stalled` — each with a factual
+  summary. Routine 'progress', a 'started', and a user-initiated 'cancelled'
+  are silent-audit-only.
 - A user-initiated CANCEL is a silent 'cancelled' kind, never a buzz (the
   explicit "stop bugging me on cancel" complaint).
 - A constructed plan is a 'question' (decision) and DOES buzz.
-- A thread merely finishing or erroring does NOT buzz (the collapse of the
-  fabricated-question firehose: a window you drive ending is not a question).
+- A completion/error buzzes with a summary, but is NEVER turned into a
+  fabricated question or a Claude-invented "next step" (those sources are gone).
 - A Task reaching needs_you / done / failed buzzes; running / queued do not.
 """
 
@@ -45,17 +46,17 @@ class ClassifyHook(unittest.TestCase):
             self.assertEqual(kind, "cancelled", status)
             self.assertNotIn(kind, _BUZZ_KINDS, status)
 
-    def test_completed_and_error_do_not_buzz(self):
-        # The honest-signal collapse: a thread finishing or erroring is still
-        # classified, but it is silent-audit-only — only an explicit ask buzzes.
+    def test_completed_and_error_buzz(self):
+        # Every STOP notifies: a completion and an error are both classified and
+        # both in the buzz set (each carries a factual summary).
         from src.cursor_registry import _classify_hook
         from src.bot import _BUZZ_KINDS
         kind, _s, _r = _classify_hook("stop", {"status": "completed"}, _agent())
         self.assertEqual(kind, "finished")
-        self.assertNotIn(kind, _BUZZ_KINDS)
+        self.assertIn(kind, _BUZZ_KINDS)
         kind, _s, _r = _classify_hook("stop", {"status": "error"}, _agent())
         self.assertEqual(kind, "errored")
-        self.assertNotIn(kind, _BUZZ_KINDS)
+        self.assertIn(kind, _BUZZ_KINDS)
 
     def test_constructed_plan_is_a_question(self):
         from src.cursor_registry import _classify_hook

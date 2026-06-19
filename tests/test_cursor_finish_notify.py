@@ -1,16 +1,16 @@
 """Regression: the cursor-watch off-voice delivery contract.
 
-A watched thread buzzes the user OFF-VOICE only when it genuinely STOPPED TO ASK
-— the `question` kind (an explicit AskQuestion/askFollowup tool call, or a plan
-awaiting approval). A thread that merely finishes, errors, or stalls is recorded
-to the forced-silent `#ucs-alerts` audit stream and NEVER manufactured into a
-buzz. This is the 2026-06-19 collapse of the fabricated-question firehose: it
-killed the "finished -> invent a next step" auto-proposal and the trailing-'?'
-prose heuristic that buzzed the user about live_visuals_4/ucs "questions" that
-were never asked.
+A watched thread buzzes the user OFF-VOICE on every STOP — a `question`, a
+`finished`/`completed`, an `errored`, or a `stalled` — each carrying a factual
+little summary (`_format_registry_dm` reads the thread's own last words / the
+question / the error). Routine progress/started stay on the forced-silent
+`#ucs-alerts` audit stream. Crucially, a completion/error is summarized from
+REAL output — never manufactured into a fabricated question or a Claude-invented
+"next step" (the 2026-06-19 collapse deleted both the trailing-'?' prose
+heuristic and the "finished -> invent a next step" auto-proposal).
 
-These tests isolate `_narrate_registry_event`'s off-voice path and prove a
-question buzzes while finished/errored/stalled/progress/started stay silent.
+These tests isolate `_narrate_registry_event`'s off-voice path: every stop
+buzzes with a summary; progress/started stay silent.
 
 Run with:
     .venv/bin/python -m unittest tests.test_cursor_finish_notify -v
@@ -82,8 +82,8 @@ class TestNotifyUserBuzz(unittest.IsolatedAsyncioTestCase):
 
 
 class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
-    """Off-voice (`gemini` not connected), ONLY a `question` buzzes; a mere
-    finish / error / stall / progress / start stays on the silent audit stream."""
+    """Off-voice (`gemini` not connected), every STOP buzzes with a summary;
+    routine progress/started stay on the silent audit stream."""
 
     def _patches(self, *, buzz=True):
         from src import bot
@@ -112,22 +112,22 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
         await self._run(_make_event("question", "high", question="Which approach?"))
         self._buzz.assert_awaited_once()
 
-    async def test_finished_does_not_buzz(self):
-        # A window you drive ending is not a question — silent-audit-only.
+    async def test_finished_buzzes(self):
         await self._run(_make_event("finished", "high"))
-        self._buzz.assert_not_awaited()
+        self._buzz.assert_awaited_once()
 
-    async def test_finished_low_severity_does_not_buzz(self):
+    async def test_finished_low_severity_buzzes(self):
+        # A status-less finish still notifies (a stop is a stop).
         await self._run(_make_event("finished", "low"))
-        self._buzz.assert_not_awaited()
+        self._buzz.assert_awaited_once()
 
-    async def test_errored_does_not_buzz(self):
+    async def test_errored_buzzes(self):
         await self._run(_make_event("errored", "high"))
-        self._buzz.assert_not_awaited()
+        self._buzz.assert_awaited_once()
 
-    async def test_stalled_does_not_buzz(self):
-        await self._run(_make_event("stalled", "low"))
-        self._buzz.assert_not_awaited()
+    async def test_stalled_buzzes(self):
+        await self._run(_make_event("stalled", "high"))
+        self._buzz.assert_awaited_once()
 
     async def test_progress_does_not_buzz(self):
         await self._run(_make_event("progress", "low"))
@@ -136,6 +136,27 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
     async def test_started_does_not_buzz(self):
         await self._run(_make_event("started", "low"))
         self._buzz.assert_not_awaited()
+
+
+class TestDmCarriesSummary(unittest.TestCase):
+    """Every stop DM carries a factual little summary of what the thread did —
+    its own last words / the question / the error — never an invented next step."""
+
+    def test_finished_dm_includes_last_assistant_text(self):
+        from src import bot
+
+        evt = _make_event("finished", "high", reason="Cursor task completed in proj.")
+        evt.agent.last_assistant_text = "Refactored the auth module and all 40 tests pass."
+        dm = bot._format_registry_dm(evt)
+        self.assertIn("Cursor task completed", dm)
+        self.assertIn("Refactored the auth module", dm)
+
+    def test_question_dm_includes_the_question(self):
+        from src import bot
+
+        evt = _make_event("question", "high", reason="proj is asking", question="Ship v1 or wait?")
+        dm = bot._format_registry_dm(evt)
+        self.assertIn("Ship v1 or wait?", dm)
 
 
 class TestNoPhantomAgentFraming(unittest.TestCase):
