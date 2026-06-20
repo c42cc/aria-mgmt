@@ -1601,13 +1601,42 @@ async def _judge_sweep_loop() -> None:
             log.exception("Judge sweep iteration failed — continuing")
 
 
+async def _deliver_pending_question_if_unsurfaced(agent: "CursorAgent") -> bool:
+    """State-driven question delivery. If `agent` has a pending question that has
+    not yet been surfaced (its text differs from the `question_delivered_for`
+    watermark), deliver it and return True; else return False.
+
+    This is the structural guarantee behind "a question always reaches Corbin": a
+    pending question is durable STATE, so it pings even when the fragile one-shot
+    tailer event was swallowed by priming or a bot restart. Watermarked so it
+    fires exactly once per question (re-armed when the ask clears)."""
+    pq = agent.pending_question
+    if not pq or pq == agent.question_delivered_for:
+        return False
+    agent.question_delivered_for = pq
+    await _narrate_registry_event(RegistryEvent(
+        kind="question",
+        agent=agent,
+        severity="high",
+        reason=f"{agent.project_label} is asking: {pq[:200]}",
+    ))
+    return True
+
+
 async def _cursor_stall_watch_loop() -> None:
-    """Buzz a one-shot 'stalled' summary when a running Cursor thread goes quiet
-    past the stall window, re-arming when a new event lands (the watermark is
-    keyed to the thread's last_event_at, so a resumed-then-restalled thread can
-    stall again). A stall is the only way a silently-hung thread surfaces — no
-    stop hook fires for a hang — so it counts as a STOP and notifies, with a
-    factual 'quiet for N min' summary, never a 'definitely stuck' claim."""
+    """The cursor-watch attention backstop — two state-driven guarantees that a
+    blocked thread always reaches Corbin, independent of the fragile one-shot
+    hook/tailer events:
+
+    1. Pending question: a thread with an unsurfaced `pending_question` is pinged
+       (watermarked per question text). This is the structural fix for a question
+       the live tailer event swallowed — priming or a restart drops the one-shot
+       emit, but the durable state survives, so the ask still pings.
+    2. Stall: a running thread quiet past the stall window buzzes a one-shot
+       'quiet for N min' summary (keyed to last_event_at, so a resumed-then-
+       restalled thread re-arms). A stall is the only way a silently-hung thread
+       surfaces — no stop hook fires for a hang — so it counts as a STOP, with a
+       factual summary, never a 'definitely stuck' claim."""
     from .cursor_registry import RegistryEvent
 
     await bot.wait_until_ready()
@@ -1617,6 +1646,11 @@ async def _cursor_stall_watch_loop() -> None:
             await asyncio.sleep(_STALL_WATCH_INTERVAL_SEC)
             now = time.time()
             for agent in cursor_registry.agents():
+                # Pending-question backstop (ANY status): a blocked thread's ask
+                # is durable STATE, so it pings even if the one-shot event was
+                # swallowed by priming / a restart.
+                if await _deliver_pending_question_if_unsurfaced(agent):
+                    continue
                 if agent.status != "running" or agent.last_event_at <= 0:
                     continue
                 if now - agent.last_event_at < stall_sec:
@@ -2129,6 +2163,13 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
         "Registry event: kind=%s severity=%s agent=%s source=%s",
         evt.kind, evt.severity, agent.agent_id, agent.source,
     )
+
+    if evt.kind == "question":
+        # Mark this pending question surfaced the instant we commit to
+        # delivering it (synchronously, before any await) so the state-driven
+        # attention backstop does not also re-ping it. The backstop is what
+        # catches a question the fragile one-shot tailer event missed.
+        agent.question_delivered_for = agent.pending_question or evt.reason
 
     audit_line = (
         f"**[Cursor watch] {evt.reason}** "

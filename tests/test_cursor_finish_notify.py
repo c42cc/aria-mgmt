@@ -144,6 +144,81 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
         self._buzz.assert_not_awaited()
 
 
+class TestPendingQuestionBackstop(unittest.IsolatedAsyncioTestCase):
+    """The state-driven question backstop (forensic 2026-06-20: a question asked
+    while the tailer was unprimed never reached Corbin). A pending question is
+    durable STATE, so it ALWAYS pings — even when the fragile one-shot tailer
+    event was swallowed by priming or a restart — watermarked to fire once."""
+
+    def _patches(self):
+        from src import bot
+
+        self._buzz = AsyncMock(return_value=True)
+        return [
+            patch.object(bot, "gemini", None),  # off voice
+            patch.object(bot, "conversation", MagicMock()),
+            patch.object(bot, "post_to_alerts", AsyncMock()),
+            patch.object(bot, "_notify_user_buzz", self._buzz),
+        ]
+
+    def _agent(self, *, pending=None, delivered=None):
+        from src.cursor_registry import CursorAgent
+
+        a = CursorAgent(agent_id="/tmp/q", workspace_root="/tmp/q",
+                        project_label="q", source="ide")
+        a.pending_question = pending
+        a.question_delivered_for = delivered
+        return a
+
+    async def _deliver(self, agent):
+        from src import bot
+
+        ctxs = self._patches()
+        for c in ctxs:
+            c.start()
+        try:
+            return await bot._deliver_pending_question_if_unsurfaced(agent)
+        finally:
+            for c in reversed(ctxs):
+                c.stop()
+
+    async def test_unsurfaced_question_pings_and_watermarks(self):
+        # The exact failure: a pending ask the live event never delivered.
+        a = self._agent(pending="Ship v1 or wait?", delivered=None)
+        delivered = await self._deliver(a)
+        self.assertTrue(delivered)
+        self._buzz.assert_awaited_once()
+        self.assertEqual(a.question_delivered_for, "Ship v1 or wait?")
+
+    async def test_already_surfaced_question_does_not_re_ping(self):
+        a = self._agent(pending="Ship v1 or wait?", delivered="Ship v1 or wait?")
+        delivered = await self._deliver(a)
+        self.assertFalse(delivered)
+        self._buzz.assert_not_awaited()
+
+    async def test_no_pending_question_is_noop(self):
+        a = self._agent(pending=None, delivered=None)
+        delivered = await self._deliver(a)
+        self.assertFalse(delivered)
+        self._buzz.assert_not_awaited()
+
+    async def test_narrator_marks_watermark_on_question_event(self):
+        # The normal one-shot path also marks the watermark, so the backstop
+        # never double-delivers the same question.
+        from src import bot
+
+        evt = _make_event("question", "high", question="Proceed?")
+        ctxs = self._patches()
+        for c in ctxs:
+            c.start()
+        try:
+            await bot._narrate_registry_event(evt)
+        finally:
+            for c in reversed(ctxs):
+                c.stop()
+        self.assertEqual(evt.agent.question_delivered_for, "Proceed?")
+
+
 class TestDmCarriesSummary(unittest.TestCase):
     """Every stop DM carries a factual little summary of what the thread did —
     its own last words / the question / the error — never an invented next step."""

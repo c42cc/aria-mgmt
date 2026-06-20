@@ -97,6 +97,14 @@ class CursorAgent:
     last_assistant_text: str = ""
     last_user_text: str = ""
     pending_question: str | None = None
+    # The pending_question text already surfaced to Corbin. Question delivery is
+    # driven from THIS durable state, not only the fragile one-shot tailer event
+    # that `priming` or a bot restart can swallow: the attention watch loop pings
+    # any pending_question that does not match this watermark, so an unanswered
+    # ask is never silently dropped (forensic 2026-06-20: a question asked while
+    # the tailer was unprimed never reached him). Re-armed to None the moment the
+    # question clears (answered), so a later ask pings again.
+    question_delivered_for: str | None = None
     last_event_at: float = 0.0
     last_event_reason: str = ""
     recent_plan_files: list[str] = field(default_factory=list)
@@ -854,6 +862,10 @@ class CursorAgentRegistry:
                                 # fabricated decisions was deleted).
                                 q = ask_q
                                 agent.pending_question = q
+                                if not q:
+                                    # Answered/cleared — re-arm so a later ask
+                                    # (even identical text) pings again.
+                                    agent.question_delivered_for = None
                                 if primed:
                                     kind: EventKind = "question" if q else "progress"
                                     severity: Severity = "high" if q else "low"
