@@ -132,5 +132,44 @@ class FailedPostconditionIsAWall(unittest.TestCase):
         self.assertTrue(outcome.need)
 
 
+class _FakeMCP:
+    def __init__(self, tools: dict):
+        # tools: {tool_name: server_name}
+        self._tools = {name: {} for name in tools}
+        self._tool_to_server = dict(tools)
+
+
+class PostconditionCoverageProbe(unittest.IsolatedAsyncioTestCase):
+    """The mechanical half: a state-changing verb with no post-condition is a
+    loud, enumerated coverage gap — never a silent hole."""
+
+    async def test_uncovered_write_verb_is_flagged(self):
+        from src.preflight import probe_postcondition_coverage
+
+        client = _FakeMCP({
+            "write_file": "filesystem",    # W, has FilesystemWriteAnchor -> covered
+            "delete_file": "filesystem",   # I, no anchor -> uncovered
+            "read_file": "filesystem",     # R -> ignored (not state-changing)
+        })
+        ok, err, fix, detail = await probe_postcondition_coverage(client)
+        self.assertFalse(ok)
+        self.assertIn("delete_file", err)
+        self.assertNotIn("write_file", err)   # covered
+        self.assertNotIn("read_file", err)    # read tier is not state-changing
+
+    async def test_fully_covered_passes(self):
+        from src.preflight import probe_postcondition_coverage
+
+        client = _FakeMCP({"write_file": "filesystem", "read_file": "filesystem"})
+        ok, err, fix, detail = await probe_postcondition_coverage(client)
+        self.assertTrue(ok, err)
+
+    async def test_no_client_is_noop(self):
+        from src.preflight import probe_postcondition_coverage
+
+        ok, _, _, _ = await probe_postcondition_coverage(None)
+        self.assertTrue(ok)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

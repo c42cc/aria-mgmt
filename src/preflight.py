@@ -512,6 +512,51 @@ async def probe_anchor_smoke() -> tuple[bool, str, str, str]:
     return True, "", "", f"{len(healthy)}/{len(anchors)} anchors: {summary}"
 
 
+async def probe_postcondition_coverage(mcp_client: Any) -> tuple[bool, str, str, str]:
+    """Operation A — the MECHANICAL half of universal verified-done.
+
+    Every discovered state-changing (W/I/X) MCP verb must have a registered
+    post-condition (src/anchors/registry.py::_TOOL_MAP) or a declared waiver
+    (POSTCONDITION_WAIVERS, with rationale). A write tool with no post-condition
+    is a silent trust hole — a "done" that can never be proven. This makes the
+    gap LOUD and enumerated at boot so it cannot ship unnoticed. WARN, not
+    critical: a newly-onboarded server tool surfaces here, it does not take
+    Aria offline (the per-server-onboarding pattern). The dispatch floor itself
+    (mcp.call_tool) enforces every verb that DOES have a post-condition.
+    """
+    if mcp_client is None or not getattr(mcp_client, "_tools", None):
+        return True, "", "", "no MCP tools discovered yet"
+    from .mcp import _classify_tier
+    from .anchors import anchor_for
+    from .anchors.postcondition import STATE_CHANGING_TIERS
+    from .anchors.registry import POSTCONDITION_WAIVERS
+
+    uncovered: list[str] = []
+    covered = 0
+    for tool in mcp_client._tools:
+        server = mcp_client._tool_to_server.get(tool)
+        if not server:
+            continue
+        tier = _classify_tier(server, tool)
+        if tier not in STATE_CHANGING_TIERS:
+            continue
+        if anchor_for(tool) is not None:
+            covered += 1
+        elif tool not in POSTCONDITION_WAIVERS:
+            uncovered.append(f"{server}.{tool}[{tier}]")
+
+    if uncovered:
+        return (
+            False,
+            f"{len(uncovered)} state-changing MCP verb(s) have NO post-condition "
+            f"(verified-done coverage gap): {', '.join(sorted(uncovered))}",
+            "Add an anchor in src/anchors/registry.py::_TOOL_MAP for each, or a "
+            "documented waiver in POSTCONDITION_WAIVERS.",
+            f"covered={covered} uncovered={len(uncovered)}",
+        )
+    return True, "", "", f"all {covered} state-changing MCP verbs carry a post-condition"
+
+
 async def probe_cursor_bridge(cursor_bridge: Any) -> tuple[bool, str, str, str]:
     """Cursor bridge subprocess alive and responds to a ping."""
     if cursor_bridge is None or not cursor_bridge.alive:
@@ -1289,6 +1334,13 @@ async def _run_all_inner(
         # dependence on it; this probe surfaces silent regressions.
         report.results.append(
             await _run_probe("mcp_time", WARN, lambda: probe_mcp_time(mcp_client))
+        )
+        # Operation A: every state-changing MCP verb must carry a post-condition.
+        report.results.append(
+            await _run_probe(
+                "postcondition_coverage", WARN,
+                lambda: probe_postcondition_coverage(mcp_client),
+            )
         )
 
     # Anchor health checks

@@ -69,6 +69,16 @@ _TOOL_MAP: dict[str, type] = {
 }
 
 
+# Operation A: the explicit escape hatch for the post-condition coverage check
+# (src/preflight.py::probe_postcondition_coverage). A state-changing (W/I/X)
+# verb belongs here ONLY when it genuinely produces no verifiable artifact, and
+# the entry must carry a rationale. This is the "visible, not silent" valve:
+# anything NOT here and NOT in _TOOL_MAP shows up as a loud coverage gap, never
+# a quiet hole. Empty by design — every write SHOULD prove it landed; shrink the
+# probe's gap list by adding an anchor above, not by waiving here.
+POSTCONDITION_WAIVERS: frozenset[str] = frozenset()
+
+
 _CACHE_TTL_SEC = 60.0
 # Write/irreversible anchors must not be cached — every call is a side-effect
 # verification of a unique intent. Only READ anchors get pooled.
