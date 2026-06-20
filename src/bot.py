@@ -2034,17 +2034,23 @@ async def _notify_user_buzz(content: str) -> bool:
         return False
 
 
-# The ONE attention policy: a watched thread buzzes the user every time it STOPS
-# — a question it stopped to ask, a completion, an error, or a 15-min stall —
-# each carrying a factual little summary of what it actually did
-# (`_format_registry_dm` reads the thread's own last words / the question / the
-# error; it never invents one). Routine 'progress', a 'started', and a
-# user-initiated 'cancelled' stay silent-audit-only. The fabrication sources are
-# gone (2026-06-19): a `question` comes ONLY from an explicit AskQuestion/
-# askFollowup tool call (never a trailing '?'), and a completion is summarized
-# from real output (never a Claude-invented "next step"). So every stop pings,
-# but no stop is manufactured into a decision the agent never posed.
-_BUZZ_KINDS: tuple[str, ...] = ("question", "finished", "completed", "errored", "stalled")
+# The ONE attention policy: a watched thread buzzes the user ONLY when it needs
+# him or is stuck — a question it stopped to ask, an error, or a 15-min stall —
+# each carrying a factual little summary (`_format_registry_dm` reads the
+# thread's own last words / the question / the error; it never invents one).
+#
+# A plain COMPLETION does NOT buzz (Corbin's rule 2026-06-20): a thread merely
+# FINISHING is not a reason to interrupt him. He asked to hear when something
+# needs a decision (a question) or has gone quiet/stuck for 15+ minutes — not a
+# running tally of "done". A finished/completed thread is still recorded to the
+# silent #ucs-alerts trail and held in Aria's context (she can answer "is X
+# done?" on request), it just never pings. Routine 'progress'/'started'/
+# 'cancelled' likewise stay silent-audit-only.
+#
+# A `question` comes ONLY from an explicit AskQuestion/askFollowup tool call
+# (never a trailing '?'); no stop is manufactured into a decision the agent
+# never posed.
+_BUZZ_KINDS: tuple[str, ...] = ("question", "errored", "stalled")
 
 
 async def _task_done_gate(goal: str, result: str, session_key: str) -> tuple[bool, list[str]]:
@@ -2104,15 +2110,17 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     2. Silent audit to `#ucs-alerts` (always — it's a glanceable, no-buzz
        stream, never a notification).
     3. On voice + idle gate: structured context inject for EVERY event (so Aria
-       holds what's happening), plus a spoken heads-up for every STOP
-       (question / finished / errored / stalled) with a factual summary. The
-       wait_until_idle gate prevents the narration from being batched into
-       Aria's in-flight turn.
-    4. Not on voice: every STOP reaches the phone (via `_notify_user_buzz` — DM,
-       else a non-silent `#ucs` @mention), carrying a factual little summary
-       (`_format_registry_dm`). Routine progress / started / cancelled stay
-       silent-audit-only. No stop is ever manufactured into a question or a
-       "next step" the agent never posed.
+       holds what's happening), plus a spoken heads-up only for an
+       attention-worthy STOP (question / errored / stalled) with a factual
+       summary. A plain finished/completed thread is held as silent context but
+       NOT spoken. The wait_until_idle gate prevents the narration from being
+       batched into Aria's in-flight turn.
+    4. Not on voice: an attention-worthy STOP reaches the phone (via
+       `_notify_user_buzz` — DM, else a non-silent `#ucs` @mention), carrying a
+       factual little summary (`_format_registry_dm`). A plain completion, plus
+       routine progress / started / cancelled, stay silent-audit-only. No stop
+       is ever manufactured into a question or a "next step" the agent never
+       posed.
     5. Mark `agent.last_delivered_at` only when Aria SPOKE it aloud (step 3),
        so a phone-only ping still surfaces on the next voice-join briefing.
     """
@@ -2162,11 +2170,11 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
                     "continuing to the heads-up trigger anyway"
                 )
             spoke_aloud = False
-            # Speak up for every STOP (question / finished / errored / stalled):
-            # a watched thread that asked, completed, errored, or went quiet is
-            # exactly what Corbin asked to hear about — with a factual summary,
-            # never an invented decision. Routine progress/started stay silent
-            # context above and don't interrupt.
+            # Speak up only for an attention-worthy STOP (question / errored /
+            # stalled): a watched thread that asked a decision, errored, or went
+            # quiet for 15+ min is what Corbin asked to hear — with a factual
+            # summary, never an invented decision. A plain completion and routine
+            # progress/started stay silent context above and don't interrupt.
             if evt.kind in _BUZZ_KINDS:
                 speech = _format_registry_speech(evt)
                 await gemini.inject_text(
@@ -2192,11 +2200,12 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
             )
 
     # Not on voice. #ucs-alerts is a forced-silent stream (the glanceable trail),
-    # so record the audit line there, then buzz the phone for every STOP — a
-    # question, a completion, an error, or a stall — each carrying a factual
-    # little summary (`_format_registry_dm` reads the thread's own last words /
-    # the question / the error). Routine progress/started/cancelled return here
-    # silently. No stop is manufactured into a decision the agent never posed.
+    # so record the audit line there, then buzz the phone only for an
+    # attention-worthy STOP — a question, an error, or a 15-min stall — each
+    # carrying a factual little summary (`_format_registry_dm` reads the thread's
+    # own last words / the question / the error). A plain completion, plus
+    # routine progress/started/cancelled, return here silently. No stop is
+    # manufactured into a decision the agent never posed.
     await _safe_post(audit_line, silent=True)
 
     if evt.kind not in _BUZZ_KINDS:

@@ -46,14 +46,16 @@ class ClassifyHook(unittest.TestCase):
             self.assertEqual(kind, "cancelled", status)
             self.assertNotIn(kind, _BUZZ_KINDS, status)
 
-    def test_completed_and_error_buzz(self):
-        # Every STOP notifies: a completion and an error are both classified and
-        # both in the buzz set (each carries a factual summary).
+    def test_completion_is_silent_but_error_buzzes(self):
+        # A completion is still classified as `finished` but no longer buzzes
+        # (Corbin's rule 2026-06-20: a thread merely finishing is silent-audit
+        # only — notify on a question or a 15-min stall, not "done"). An error
+        # is a loud STOP and still buzzes.
         from src.cursor_registry import _classify_hook
         from src.bot import _BUZZ_KINDS
         kind, _s, _r = _classify_hook("stop", {"status": "completed"}, _agent())
         self.assertEqual(kind, "finished")
-        self.assertIn(kind, _BUZZ_KINDS)
+        self.assertNotIn(kind, _BUZZ_KINDS)
         kind, _s, _r = _classify_hook("stop", {"status": "error"}, _agent())
         self.assertEqual(kind, "errored")
         self.assertIn(kind, _BUZZ_KINDS)

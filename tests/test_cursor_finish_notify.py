@@ -1,16 +1,20 @@
 """Regression: the cursor-watch off-voice delivery contract.
 
-A watched thread buzzes the user OFF-VOICE on every STOP — a `question`, a
-`finished`/`completed`, an `errored`, or a `stalled` — each carrying a factual
-little summary (`_format_registry_dm` reads the thread's own last words / the
-question / the error). Routine progress/started stay on the forced-silent
-`#ucs-alerts` audit stream. Crucially, a completion/error is summarized from
-REAL output — never manufactured into a fabricated question or a Claude-invented
+A watched thread buzzes the user OFF-VOICE ONLY when it needs him or is stuck —
+a `question`, an `errored`, or a `stalled` (running + quiet 15+ min) — each
+carrying a factual little summary (`_format_registry_dm` reads the thread's own
+last words / the question / the error). A plain `finished`/`completed`, plus
+routine progress/started, stay on the forced-silent `#ucs-alerts` audit stream:
+a thread merely COMPLETING is not a reason to interrupt (Corbin's rule
+2026-06-20 — "tell me when there's a question or something paused 15+ min, NOT
+when threads are done"). Crucially, a question/error is summarized from REAL
+output — never manufactured into a fabricated question or a Claude-invented
 "next step" (the 2026-06-19 collapse deleted both the trailing-'?' prose
 heuristic and the "finished -> invent a next step" auto-proposal).
 
-These tests isolate `_narrate_registry_event`'s off-voice path: every stop
-buzzes with a summary; progress/started stay silent.
+These tests isolate `_narrate_registry_event`'s off-voice path: a question /
+error / stall buzzes with a summary; a completion and progress/started stay
+silent.
 
 Run with:
     .venv/bin/python -m unittest tests.test_cursor_finish_notify -v
@@ -112,14 +116,16 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
         await self._run(_make_event("question", "high", question="Which approach?"))
         self._buzz.assert_awaited_once()
 
-    async def test_finished_buzzes(self):
+    async def test_finished_does_not_buzz(self):
+        # A thread merely FINISHING is not a reason to interrupt — silent-audit
+        # only (Corbin's rule 2026-06-20: notify on a question or a 15-min
+        # stall, never just "done").
         await self._run(_make_event("finished", "high"))
-        self._buzz.assert_awaited_once()
+        self._buzz.assert_not_awaited()
 
-    async def test_finished_low_severity_buzzes(self):
-        # A status-less finish still notifies (a stop is a stop).
+    async def test_finished_low_severity_does_not_buzz(self):
         await self._run(_make_event("finished", "low"))
-        self._buzz.assert_awaited_once()
+        self._buzz.assert_not_awaited()
 
     async def test_errored_buzzes(self):
         await self._run(_make_event("errored", "high"))
