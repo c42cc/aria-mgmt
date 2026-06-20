@@ -93,6 +93,16 @@ Every persona and every reusable instruction is a markdown template in
 own system prompt, or any other persona; the bot edits the file, reloads,
 reconnects. Behavior is data, not code.
 
+The engineering doctrine has exactly one home, `prompts/_principles.md`
+(operate on the primitive; fewest moving parts; reuse over rebuild; no legacy;
+all failures observable; halt don't heal; state what you checked; done means
+verified). Every reasoning/build persona **references** it with a
+`{{include:_principles}}` directive that `src/prompts.py::load_template`
+resolves at load time (recursively, cycle-guarded; a missing include or a cycle
+raises loudly) — so the rigor is part of every plan/build/verify call by
+construction and cannot drift. `scripts/lint_principles_include.sh` reds the
+gate if a persona drops the include.
+
 ### State as Three Flat Stores
 
 There is no general-purpose data layer. State lives in three concrete places:
@@ -145,6 +155,19 @@ judge** (`src/judge.py` + `src/judge_calibration.py`) earns the right to gate a
 Task's done claim only after agreeing with a labeled good/bad corpus
 (agreement ≥ 0.9 and good/bad separation) — an uncalibrated judge advises, it
 never decides. A mechanism failure is a loud `JudgeError`, never a silent verdict.
+
+The deterministic anchor floor also runs at the **producer**, not only in the
+async judge. `src/anchors/postcondition.py`, called from the MCP dispatch
+chokepoint (`src/mcp.py::call_tool`), re-consults the source of truth the moment
+a state-changing (W/I/X) verb returns: a lag-free HARD failure (a file that
+isn't there, a created event id that won't resolve) becomes a typed
+`unverified` error that `src/outcomes.py` maps to BLOCKED, so the loop never
+narrates a success that did not happen; an unconfirmable result (verifier
+unreachable, a lag-prone source, a timeout) is a loud `POST-CONDITION
+UNCONFIRMED` annotation — never a silent pass, never a false wall. A preflight
+probe (`probe_postcondition_coverage`) asserts every discovered state-changing
+verb carries a post-condition (or a documented waiver), so coverage cannot
+silently regress.
 
 ### Preflight as the Gate
 
@@ -454,6 +477,7 @@ points; cross-references inside the code are reliable.
 | Cursor IDE actuator (drives the real IDE over CDP; success only on a verified transcript advance, else a typed blocker) | `src/cursor_ide_driver.py` |
 | Enable Cursor IDE driving (one-time relaunch with the CDP debug port) | `ops/cursor_ide_debug.sh` |
 | Claimed-delivery judge anchor (floors a fabricated "Sent/Delivered" to FAILED) | `src/anchors/claimed_delivery.py` |
+| Verified-done floor at dispatch (post-condition per state-changing verb; blocks/annotates at the producer) | `src/anchors/postcondition.py` (wired in `src/mcp.py::call_tool`; coverage probe in `src/preflight.py`) |
 | Cursor hooks forwarder | `hooks/cursor-event.py` (+ `hooks/install.py`) |
 | Claude Agent SDK (Claude Code) driver | `src/claude_code.py` |
 | Durable conversation buffer (voice + text + cursor events) | `src/conversation.py` |
@@ -469,6 +493,7 @@ points; cross-references inside the code are reliable.
 | What | Where |
 |---|---|
 | Aria's system prompt | `prompts/gemini_system.md` |
+| Shared engineering doctrine (one home; `{{include:_principles}}` into every reasoning/build persona) | `prompts/_principles.md` |
 | Claude planning personas | `prompts/{planning,architecture,refactor,bug-analysis}.md` |
 | Claude implementation persona | `prompts/implementation.md` |
 | Claude general-agent persona | `prompts/do_with_claude_system.md` |

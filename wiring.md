@@ -332,7 +332,12 @@ Gemini speaks the user-facing summary
 
 The tool dispatcher is the single chokepoint for cost tracking and per-tool
 auditing of the local catalog. The MCP dispatcher is the analogous
-chokepoint for MCP-backed actions and writes to `data/audit.jsonl`.
+chokepoint for MCP-backed actions and writes to `data/audit.jsonl`. It is also
+where universal verified-done lives: after a state-changing (W/I/X) verb
+returns, `src/anchors/postcondition.py` re-consults the source of truth — a
+provably-absent artifact becomes a typed `unverified` error (BLOCKED by
+`src/outcomes.py`), an unconfirmable one a loud annotation — so a write is
+verified where and when it fires, not minutes later in the async judge.
 
 ---
 
