@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 from .config import config
@@ -18,11 +19,19 @@ log = logging.getLogger(__name__)
 
 _cache: dict[str, str] = {}
 
+# Behavior-as-data composition: a persona references a shared fragment with
+# `{{include:_principles}}` instead of pasting it, so the doctrine has exactly
+# one home (prompts/_principles.md) and cannot drift.
+_INCLUDE_RE = re.compile(r"\{\{include:([A-Za-z0-9_\-]+)\}\}")
+
 
 def load_template(name: str) -> str:
     """Load a prompt template by name (without .md extension).
 
-    Templates are cached after first read.
+    `{{include:NAME}}` directives are resolved (recursively, cycle-guarded) at
+    load time; the resolved text is cached. A missing include or an include
+    cycle raises LOUDLY — a broken template must never silently render half its
+    instructions.
     """
     if name in _cache:
         return _cache[name]
@@ -34,8 +43,28 @@ def load_template(name: str) -> str:
     with open(path) as f:
         content = f.read()
 
+    content = _resolve_includes(name, content)
     _cache[name] = content
     return content
+
+
+def _resolve_includes(name: str, content: str, _seen: tuple[str, ...] = ()) -> str:
+    """Replace every `{{include:NAME}}` with NAME's (recursively resolved) text."""
+    def _sub(m: re.Match) -> str:
+        inc = m.group(1)
+        if inc == name or inc in _seen:
+            raise ValueError(
+                f"prompt include cycle: {' -> '.join((*_seen, name, inc))}"
+            )
+        inc_path = get_path(inc)
+        if not os.path.exists(inc_path):
+            raise FileNotFoundError(
+                f"Prompt '{name}' includes '{inc}' but {inc_path} does not exist"
+            )
+        with open(inc_path) as f:
+            return _resolve_includes(inc, f.read(), (*_seen, name))
+
+    return _INCLUDE_RE.sub(_sub, content)
 
 
 def list_templates() -> list[str]:
