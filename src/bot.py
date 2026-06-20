@@ -2396,6 +2396,11 @@ async def on_ready():
             transcript_callback=_on_voice_transcript,
             orphan_callback=_on_orphan_tool_result,
         )
+        # Barge-in: when Gemini reports the user interrupted, the session clears
+        # its own outbound audio queue and calls this so the voice sidecar drops
+        # its buffered playback too — Aria stops talking the instant Corbin
+        # speaks over her instead of draining seconds of buffered speech.
+        gemini.interrupt_callback = voice_bridge.flush_playback
 
         from .tools import set_transcript_provider
         set_transcript_provider(lambda: gemini.get_recent_transcript(3) if gemini else [])

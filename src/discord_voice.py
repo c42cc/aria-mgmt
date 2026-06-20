@@ -187,6 +187,15 @@ class VoiceBridge:
                 log.debug("voice send tap raised (non-fatal)", exc_info=True)
         await self._send({"action": "play", "pcm_b64": base64.b64encode(pcm).decode()})
 
+    async def flush_playback(self) -> None:
+        """Barge-in: drop all buffered/in-flight playback audio immediately so
+        Aria goes silent the instant the user interrupts, instead of draining
+        out seconds of already-generated speech over him. No-op if the sidecar
+        is not alive (nothing is playing)."""
+        if not self.alive:
+            return
+        await self._send({"action": "flush"})
+
     async def close(self) -> None:
         if self._proc and self._proc.returncode is None:
             try:

@@ -12,6 +12,7 @@
  *     {"action": "join",  "channel_id": "..."}
  *     {"action": "leave"}
  *     {"action": "play",  "pcm_b64": "..."}     // 24kHz mono PCM s16le (Gemini -> Discord)
+ *     {"action": "flush"}                        // barge-in: drop all buffered playback NOW
  *     {"action": "shutdown"}
  *
  *   stdout (events to Python):
@@ -422,6 +423,20 @@ function doPlay({ pcm_b64 }) {
   stream.push(buf);
 }
 
+// Barge-in. The user interrupted Aria mid-utterance. Gemini stops generating,
+// but seconds of her speech are already buffered downstream — the Python queue,
+// this process's FFmpeg upsampler, and the AudioResource. Drop ALL of it NOW so
+// she falls silent on the beat instead of talking over him. The player itself
+// stays alive for the voice connection; the next doPlay rebuilds the stream via
+// ensurePlaybackStream(). Same teardown doLeave already uses, so it is proven.
+function doFlush() {
+  teardownPlaybackStream("barge-in");
+  if (player) {
+    try { player.stop(true); } catch {}
+  }
+  diag("barge-in flush — buffered playback dropped");
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", async (line) => {
   let cmd;
@@ -433,6 +448,7 @@ rl.on("line", async (line) => {
       case "join":           await doJoin(cmd); break;
       case "leave":          doLeave(); break;
       case "play":           doPlay(cmd); break;
+      case "flush":          doFlush(); break;
       case "query_presence": doQueryPresence(); break;
       case "shutdown":       process.exit(0);
       default:               fail(`unknown action: ${cmd.action}`);

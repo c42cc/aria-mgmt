@@ -803,6 +803,12 @@ class GeminiSession:
         self.tool_handler = tool_handler
         self.transcript_callback = transcript_callback
         self.orphan_callback = orphan_callback
+        # Barge-in sink. bot.py sets this to voice_bridge.flush_playback so the
+        # instant Gemini reports `interrupted`, the sidecar drops its buffered
+        # audio in lockstep with us clearing _audio_out_queue — the two halves
+        # of "stop talking NOW". None on the local-mic path (SpeakerOutput owns
+        # playback there).
+        self.interrupt_callback: Callable[[], Coroutine] | None = None
         self._client: genai.Client | None = None
         self._session: Any = None
         self._session_ctx: Any = None
@@ -971,6 +977,23 @@ class GeminiSession:
         """Get the next audio chunk from the output queue."""
         return await self._audio_out_queue.get()
 
+    def _drain_audio_out_queue(self) -> int:
+        """Drop every buffered outbound audio chunk; return how many.
+
+        Barge-in: Gemini emits a whole turn's audio faster than realtime, so up
+        to maxsize chunks of Aria's speech sit queued here when the user cuts in.
+        Left in place they keep flowing to the sidecar and she talks over him for
+        seconds. Synchronous + non-blocking so the receive loop empties it inline,
+        before the next chunk can reach the pump."""
+        dropped = 0
+        while True:
+            try:
+                self._audio_out_queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        return dropped
+
     def get_transcript_context(self, max_turns: int = 5) -> str:
         """Get recent transcript for session reconnect context."""
         recent = list(self._transcript_buffer)[-max_turns:]
@@ -1115,7 +1138,22 @@ class GeminiSession:
                             )
                             self._aria_turn_acc += sc.output_transcription.text
 
-                        if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
+                        interrupted = getattr(sc, "interrupted", False)
+                        if interrupted:
+                            # Barge-in: the user spoke over Aria. Silence her on
+                            # the beat — drop OUR buffered audio AND tell the
+                            # sidecar to drop its FFmpeg/AudioResource buffer.
+                            # Either half alone still leaves seconds of speech
+                            # draining out while he says "stop".
+                            dropped = self._drain_audio_out_queue()
+                            if dropped:
+                                log.info("barge-in: dropped %d buffered audio chunk(s)", dropped)
+                            if self.interrupt_callback:
+                                try:
+                                    await self.interrupt_callback()
+                                except Exception:
+                                    log.exception("interrupt_callback (sidecar flush) failed")
+                        if getattr(sc, "turn_complete", False) or interrupted:
                             await self._flush_turn_accumulators()
                             self._idle_event.set()
 
