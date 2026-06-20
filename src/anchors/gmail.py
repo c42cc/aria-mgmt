@@ -119,6 +119,13 @@ class GmailReadAnchor:
 class GmailSendAnchor:
     """Write anchor: poll Sent folder to verify the email was actually sent."""
     spec_version = 1
+    # The Sent index is eventually consistent: a just-sent message may not yet
+    # be searchable at the instant of dispatch. So a found==0 at the producer is
+    # UNCONFIRMED (loud, but not a false wall) rather than a hard BLOCK; the
+    # async correctness judge re-checks once Sent settles. (See
+    # anchors/postcondition.py — `immediate=False` routes a HARD failure to an
+    # annotation instead of a block.)
+    immediate = False
 
     async def check(self, tool_call: dict, aria_result: str) -> AnchorReport:
         report = AnchorReport(tool="gmail.send_email")

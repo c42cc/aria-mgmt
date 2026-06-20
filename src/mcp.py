@@ -134,6 +134,11 @@ ERR_TRANSIENT = "transient"
 ERR_DECLINED = "declined"
 ERR_SCHEMA = "schema"
 ERR_UNKNOWN = "unknown"
+# Universal verified-done (Operation A): a state-changing verb whose
+# post-condition proved the artifact ABSENT at dispatch. Mapped to BLOCKED by
+# src/outcomes.py so the loop halts instead of narrating a success that did not
+# happen.
+ERR_UNVERIFIED = "unverified"
 
 # Substring patterns (lowercased) per error class. Order matters — we test
 # permission first because "permission denied" must beat the broader
@@ -306,6 +311,11 @@ def _typed_error(cls: str, message: str, raw: str) -> str:
         ),
         ERR_UNKNOWN: (
             "Report the failure to the user; do not invent a result."
+        ),
+        ERR_UNVERIFIED: (
+            "The action's post-condition did not confirm the change landed. Do NOT "
+            "report it as done. Re-check the target (the message id / event / file), "
+            "or surface to the user that it could not be verified."
         ),
     }
     return json.dumps({
@@ -706,6 +716,26 @@ class MCPClient:
             err_class = _classify_error_text(result_text, tool_name=tool_name, server_name=server_name)
             if err_class is not None:
                 return _typed_error(err_class, _permission_message(tool_name, server_name, err_class), result_text)
+
+            # Universal verified-done (Operation A): the producer-side post-condition
+            # floor. A state-changing verb proves its artifact landed at the moment it
+            # fires. A lag-free absence BLOCKS loudly (the loop never reports done); an
+            # unconfirmable result is annotated so Aria narrates the caveat — never a
+            # silent "done", never a false wall. The async judge keeps the
+            # narration-faithfulness half; the deterministic "did it land?" half lives
+            # at the source.
+            if tier in ("W", "I", "X"):
+                from .anchors import postcondition
+                verdict = await postcondition.evaluate(tool_name, tier, args, result_text)
+                if verdict.decision != postcondition.PASS:
+                    _audit_log(
+                        server_name, f"{tool_name}\u00b7postcondition", args,
+                        verdict.audit_summary, tier, confirmed, session_key,
+                    )
+                if verdict.decision == postcondition.BLOCK:
+                    return _typed_error(ERR_UNVERIFIED, verdict.message, verdict.detail)
+                if verdict.decision == postcondition.ANNOTATE:
+                    result_text = f"{result_text}\n\n{verdict.annotation}"
 
             return result_text[:50_000]
         except Exception as e:

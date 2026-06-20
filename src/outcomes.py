@@ -57,6 +57,12 @@ _LONG_JOB_NEED = (
     "say the word and I'll run it as a background job (the durable runner), not "
     "through the timeout-bounded shell"
 )
+_UNVERIFIED_NEED = (
+    "confirmation that the change actually landed — the post-condition check "
+    "could not find the artifact (the message id / event / file). I stopped "
+    "instead of reporting a success I couldn't verify; re-check the target or "
+    "tell me how to proceed"
+)
 
 # A macOS app-scripting send (osascript/AppleScript to Messages/Contacts/Notes)
 # that HANGS is an Automation permission wall, not a transient blip — even when
@@ -356,6 +362,15 @@ def classify_outcome(tool_name: str, args: dict | None, result_str: str) -> Outc
             return Outcome(BLOCKED, message or "the action was declined", _DECLINE_NEED, family)
         if cls == "permission":
             return Outcome(BLOCKED, message or "permission denied", _PERMISSION_NEED, family)
+        # Operation A: a state-changing verb whose post-condition proved the
+        # artifact ABSENT at dispatch. A wall the loop must not grind past — the
+        # change did not happen.
+        if cls == "unverified":
+            return Outcome(
+                BLOCKED,
+                message or "the action's post-condition could not be verified",
+                _UNVERIFIED_NEED, family,
+            )
         if cls in (TRANSIENT, "rate_limit"):
             return Outcome(TRANSIENT, message or cls, "", family)
         # schema / unknown: the model can re-read the schema or surface it.
