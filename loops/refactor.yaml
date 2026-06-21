@@ -1,0 +1,32 @@
+id: refactor
+name: Refactor
+description: >
+  Restructure code in a project WITHOUT changing behavior, preserving a stated
+  invariant. Use for "clean up / restructure / rename / extract / simplify"
+  requests where behavior must stay identical.
+endpoint: mac-claude-code
+loop: >
+  Refactor the target while preserving the invariant, keep the existing tests
+  green unchanged, produce a diff. No behavior change, no push.
+required_slots:
+  - key: repo
+    ask: "Which project?"
+  - key: target
+    ask: "What should be refactored -- which file, function, or pattern?"
+  - key: invariant
+    ask: "What must stay exactly the same -- which behavior or test must still pass?"
+optional_slots:
+  - key: constraints
+    ask: "Anything to avoid?"
+dispatch: |
+  You are the build engine for a Refactor. Working directory: {repo}.
+  1. Create a fresh git branch off the current HEAD.
+  2. Refactor this target: {target}
+  3. PRESERVE this invariant exactly -- no behavior change: {invariant}
+  4. Honor these constraints (if any): {constraints}
+  5. The existing tests MUST still pass unchanged; add a test only if it pins the
+     invariant. Run the full suite, leave a diff, do NOT push.
+  Confirm in one line that behavior is unchanged and the suite is green.
+done: "The target is refactored AND the invariant's tests still pass AND a diff exists."
+gates: [spend_cap]
+report: text

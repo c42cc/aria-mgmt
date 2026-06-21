@@ -52,3 +52,20 @@ def test_render_loops_lists_required():
 
 def test_loop_phases_contract():
     assert conductor.PHASES == ("CHITCHAT", "INTERVIEW", "CONFIRM", "DISPATCH", "REPORT")
+
+
+def test_loop_library_loads_and_validates():
+    lp = loops.load_loops()
+    assert {"feature-build", "bug-investigation", "refactor", "research-brief"} <= set(lp)
+    for loop in lp.values():
+        assert loop.required_slots and loop.dispatch and loop.done and loop.endpoint
+
+
+def test_research_endpoint_has_no_shell():
+    # the untrusted-content boundary: the research whitelist must never include a
+    # tool that can execute (review 3.8)
+    from src import dispatcher
+
+    assert "WebSearch" in dispatcher._RESEARCH_TOOLS
+    for forbidden in ("Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"):
+        assert forbidden not in dispatcher._RESEARCH_TOOLS

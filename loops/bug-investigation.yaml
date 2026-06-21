@@ -1,0 +1,34 @@
+id: bug-investigation
+name: Bug Investigation
+description: >
+  Find the ROOT CAUSE of a bug in a project, fix it at the primitive, and prove
+  the fix with a regression test. Use for "X is broken / failing / wrong /
+  crashing" requests where a symptom is known.
+endpoint: mac-claude-code
+loop: >
+  Reproduce the symptom, find the root cause, fix it at the root, add a
+  regression test that fails before and passes after, run the suite, diff. No push.
+required_slots:
+  - key: repo
+    ask: "Which project?"
+  - key: symptom
+    ask: "What's going wrong -- what do you see?"
+  - key: repro
+    ask: "How do I reproduce it -- a command, a failing test, or the steps?"
+optional_slots:
+  - key: constraints
+    ask: "Anything I should avoid touching?"
+dispatch: |
+  You are the build engine for a Bug Investigation. Working directory: {repo}.
+  1. Create a fresh git branch off the current HEAD.
+  2. Reproduce this symptom: {symptom}
+  3. Reproduction guidance: {repro}
+  4. Find the ROOT CAUSE -- operate on the dysfunctional primitive, not the
+     symptom -- and fix it there.
+  5. Add a regression test that FAILS before your fix and PASSES after it.
+  6. Honor these constraints (if any): {constraints}
+  7. Run the full test suite and make it green. Leave a diff. Do NOT push.
+  State the root cause in one line and confirm the regression test.
+done: "Root cause fixed AND a regression test exists AND the suite passes AND a diff exists."
+gates: [spend_cap]
+report: text

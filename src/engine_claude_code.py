@@ -56,12 +56,21 @@ def _prepare_billing() -> None:
         raise RuntimeError(f"unknown ARIA_CLAUDE_CODE_BILLING={mode!r} (expected 'subscription' or 'api')")
 
 
-async def _run_async(workspace_root: str, instruction: str) -> EngineResult:
-    opts = ClaudeAgentOptions(
+async def _run_async(
+    workspace_root: str, instruction: str, allowed_tools: list[str] | None
+) -> EngineResult:
+    kwargs: dict = dict(
         cwd=workspace_root,
         permission_mode=config.claude_code_permission_mode,
         max_budget_usd=config.claude_code_max_budget_usd,
     )
+    if allowed_tools is not None:
+        # A whitelist is the untrusted-content boundary (review 3.8): a loop that
+        # ingests external content runs with NO Bash/Edit, so a hostile page that
+        # tries to prompt-inject the executor into running a command simply has no
+        # such tool to call. Deny by default.
+        kwargs["allowed_tools"] = allowed_tools
+    opts = ClaudeAgentOptions(**kwargs)
     texts: list[str] = []
     sid = ""
     cost = 0.0
@@ -97,10 +106,17 @@ async def _run_async(workspace_root: str, instruction: str) -> EngineResult:
     )
 
 
-def run(workspace_root: str, instruction: str) -> EngineResult:
+def run(workspace_root: str, instruction: str, allowed_tools: list[str] | None = None) -> EngineResult:
     """Run one instruction to completion in `workspace_root`. Synchronous wrapper
-    over the async SDK (one dispatch at a time in Phase 0)."""
+    over the async SDK (one dispatch at a time in Phase 0). `allowed_tools`, when
+    given, is a whitelist — the executor can ONLY use those tools (the
+    untrusted-content boundary for loops that ingest external data)."""
     if not os.path.isdir(workspace_root):
         raise RuntimeError(f"engine workspace does not exist: {workspace_root!r}")
     _prepare_billing()
-    return asyncio.run(asyncio.wait_for(_run_async(workspace_root, instruction), timeout=config.claude_code_timeout_sec))
+    return asyncio.run(
+        asyncio.wait_for(
+            _run_async(workspace_root, instruction, allowed_tools),
+            timeout=config.claude_code_timeout_sec,
+        )
+    )

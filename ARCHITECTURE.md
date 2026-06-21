@@ -88,6 +88,7 @@ the build-time IDE agent only; they are inert to Aria's runtime engine.
 | Engine (Claude Code) | `src/engine_claude_code.py` |
 | Dispatcher (ground-truth verify) | `src/dispatcher.py` |
 | Memory / outcome log / telemetry | `src/memory.py` · `src/outcome_log.py` · `src/telemetry.py` |
+| The measurement loop (the review) | `src/review.py` (`python -m src.review`) |
 | Config (one home) | `src/config.py` + `.env` |
 | Boot preflight | `src/preflight.py` |
 | Section-3 decisions + Phase-1 setup | `docs/aria-v2/` |
@@ -96,5 +97,14 @@ the build-time IDE agent only; they are inert to Aria's runtime engine.
 ## Phases
 
 0 text spine (done) · 1 the phone call (bridge done; audio/telephony needs
-LiveKit provisioning) · 2 loop library + measurement · 3 mesh relocation +
-trust boundary · 4 the house · 5 proactivity · 6 cloud + fan-out.
+LiveKit provisioning) · 2 loop library + measurement (done — 4 loops across 2
+endpoints; research-brief carries the untrusted-content boundary) · 3 mesh
+relocation + trust boundary · 4 the house · 5 proactivity · 6 cloud + fan-out.
+
+## Endpoints & the untrusted-content boundary
+
+`mac-claude-code` has full build power (shell, edit). `research` is web/read
+tools ONLY (a whitelist in `src/dispatcher.py::_RESEARCH_TOOLS` — no Bash, no
+Edit), so a loop that ingests external web content can never be prompt-injected
+into running a command. Verified adversarially: the engine both refuses the
+injection AND has no shell tool to misuse.
