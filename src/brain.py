@@ -1,9 +1,13 @@
-"""AriaBrain — one brain, every transport.
+"""AriaBrain — one brain, every transport, over the DURABLE conversation.
 
-The conductor-driving logic + the mechanical go-gate + dispatch + outcome
-logging live HERE, once, so text and voice are two thin transports over the
-SAME brain (no second home for the go-gate — operate on the primitive). A
-transport feeds a user utterance and gets back the turn(s) to speak; it decides
+The conductor-driving logic + the mechanical go-gate + dispatch live here, once.
+The conversation itself is NOT held in RAM — it lives in src/conversation.py, so
+Aria's context survives the session: every turn she loads the recent history of
+this thread (plus a glance at her other threads) and the model sees it. That is
+the fix for "she never has the right context": the transcript is durable and
+fed back in as data each turn (Software 2.0), not a per-process scratchpad.
+
+A transport feeds a user utterance and gets back the turn(s) to speak; it decides
 only the TIMING of a dispatch (text blocks and reports inline; voice speaks a
 filler and builds in the background).
 """
@@ -11,47 +15,57 @@ filler and builds in the background).
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field
 
-from . import conductor, dispatcher, outcome_log, spend
+from . import conductor, conversation, dispatcher, outcome_log, spend
 from .conductor import ConductorTurn
 from .config import config
 from .dispatcher import DispatchResult
 from .loops import Loop
-from .telemetry import Trace
+
+
+def _new_session() -> str:
+    return time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
 
 
 @dataclass
 class AriaBrain:
     loops: dict[str, Loop]
-    trace: Trace = field(default_factory=Trace)
-    transcript: list[dict] = field(default_factory=list)
-    pending: tuple[str, dict] | None = None  # (loop_id, slots) awaiting an explicit go
+    thread: str = field(default_factory=lambda: config.default_thread)
+    session: str = field(default_factory=_new_session)
+    channel: str = "text"
+    pending: tuple[str, dict] | None = None
     session_cost: float = 0.0
 
     @property
     def _routine_model(self) -> str:
-        # Routine/interview turns: the fast tier (review 2.2). Routing + the guards
-        # are verified to hold on it. The nuanced REPORT stays on Opus.
         return config.fast_model if config.conductor_tier_routine else config.reasoning_model
 
+    def _append(self, role: str, content: str, **metrics) -> None:
+        conversation.append(
+            thread=self.thread, session=self.session, channel=self.channel,
+            role=role, content=content, **metrics,
+        )
+
     def _decide(self, model: str | None = None) -> ConductorTurn:
+        messages = conversation.thread_messages(self.thread)
+        others = conversation.other_threads_context(self.thread)
         t0 = time.time()
-        turn = conductor.decide(self.transcript, self.loops, model=model)
+        turn = conductor.decide(messages, self.loops, model=model, other_threads=others)
         latency_ms = int((time.time() - t0) * 1000)
-        self.transcript.append({"role": "assistant", "content": turn.speak})
-        self.trace.aria(turn.speak, turn.phase, latency_ms, turn.loop_id)
+        self._append(
+            "aria", turn.speak, phase=turn.phase, latency_ms=latency_ms,
+            loop_id=turn.loop_id, cost_usd=turn.cost_usd,
+        )
         self.session_cost += turn.cost_usd
         return turn
 
     def user_turn(self, text: str) -> ConductorTurn:
         """Record the user's utterance and get Aria's next turn (decide + gate)."""
-        self.transcript.append({"role": "user", "content": text})
-        self.trace.user(text)
+        self._append("user", text)
         turn = self._decide(self._routine_model)
         # A confirmed plan survives ONLY into the immediately-following DISPATCH.
-        # Anything else — a fresh interview, a cancellation ("forget it" -> CHITCHAT),
-        # a topic change — clears it, so a later stray "go" can't fire a stale plan.
         if turn.phase == "CONFIRM":
             self.pending = (turn.loop_id, turn.slots)
         elif turn.phase in ("INTERVIEW", "CHITCHAT", "REPORT"):
@@ -71,43 +85,33 @@ class AriaBrain:
         return loop, slots
 
     def dispatch_violation(self) -> ConductorTurn:
-        """Conductor tried to DISPATCH with no confirmed plan — correct it loudly."""
-        obs = "[system] You moved to DISPATCH without a confirmed plan and an explicit go. Confirm first."
-        self.transcript.append({"role": "user", "content": obs})
-        self.trace.observation(obs)
+        self._append("observation", "[system] You moved to DISPATCH without a confirmed plan and an explicit go. Confirm first.")
         self.pending = None
         return self._decide(self._routine_model)
 
     def dispatch(self, loop: Loop, slots: dict) -> DispatchResult:
         """Run the engine, verify against ground truth, log the outcome, and fold
-        the result back into the transcript so the next turn can report it."""
+        the result back into the conversation so the next turn can report it."""
         if spend.at_cap():
             broke = (
                 f"today's spend cap (${config.daily_spend_cap_usd:.0f}) is reached — "
                 "held the build; ask Corbin whether to continue today or pick it up tomorrow"
             )
-            obs = f"[engine result] delivered=False. {broke}"
-            self.transcript.append({"role": "user", "content": obs})
-            self.trace.observation(obs)
+            self._append("observation", f"[engine result] delivered=False. {broke}")
             outcome_log.record(
                 request=str(slots.get("change") or slots.get("repo") or loop.id),
                 loop_id=loop.id, slots=slots, delivered=False, summary=broke,
                 broke=broke, cost_usd=0.0, extra={"held": "spend_cap"},
             )
             return DispatchResult(False, broke, broke, "", None, 0.0, "")
+
         result = dispatcher.run(loop, slots)
         self.session_cost += result.cost_usd
-        obs = f"[engine result] delivered={result.delivered}. {result.broke or result.summary}"
-        self.transcript.append({"role": "user", "content": obs})
-        self.trace.observation(obs)
+        self._append("observation", f"[engine result] delivered={result.delivered}. {result.broke or result.summary}")
         outcome_log.record(
             request=str(slots.get("change") or slots.get("repo") or loop.id),
-            loop_id=loop.id,
-            slots=slots,
-            delivered=result.delivered,
-            summary=result.summary,
-            broke=result.broke,
-            cost_usd=result.cost_usd,
+            loop_id=loop.id, slots=slots, delivered=result.delivered, summary=result.summary,
+            broke=result.broke, cost_usd=result.cost_usd,
             extra={"session_id": result.session_id, "tests_passed": result.tests_passed},
         )
         return result

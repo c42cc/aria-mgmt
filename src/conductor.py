@@ -78,12 +78,18 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=config.anthropic_api_key, timeout=config.anthropic_timeout_sec)
 
 
-def decide(transcript: list[dict], loops: dict[str, Loop], model: str | None = None) -> ConductorTurn:
-    """One conductor turn. `transcript` is alternating user/assistant messages
-    (observations are injected as user turns). `model` overrides the reasoning
-    model (the tiering seam — a fast model for routine turns; review 2.2). Raises
-    loudly on API/contract failure — a broken conductor must never read as a
-    confident empty turn."""
+def decide(
+    transcript: list[dict],
+    loops: dict[str, Loop],
+    model: str | None = None,
+    other_threads: str = "",
+) -> ConductorTurn:
+    """One conductor turn. `transcript` is the durable conversation as alternating
+    user/assistant messages — Aria's real memory, loaded fresh each turn.
+    `other_threads`, when set, is raw recent activity from her other threads
+    (multi-thread context). `model` overrides the reasoning model (the tiering
+    seam — review 2.2). Raises loudly on API/contract failure — a broken conductor
+    must never read as a confident empty turn."""
     known = ", ".join(sorted(projects.registry())) or "(none registered)"
     system = (
         prompts.load("conductor")
@@ -94,11 +100,19 @@ def decide(transcript: list[dict], loops: dict[str, Loop], model: str | None = N
         + "\n\n## Durable facts known about Corbin (pre-fill slots from these)\n"
         + memory.render_for_prompt()
     )
+    if other_threads.strip():
+        system += (
+            "\n\n## Recent activity in your OTHER threads (for context; the messages "
+            "below are THIS thread)\n" + other_threads
+        )
     model_id = model or config.reasoning_model
     resp = _client().messages.create(
         model=model_id,
         max_tokens=config.conductor_max_tokens,
-        system=system,
+        # Cache the static prompt prefix (persona + loops + facts) so re-sending it
+        # with the growing history each turn is cheap (Software 2.0 leans on the
+        # model + caching, not a hand-built context manager).
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         tools=[_ARIA_TURN_TOOL],
         tool_choice={"type": "tool", "name": "aria_turn"},
         messages=transcript,

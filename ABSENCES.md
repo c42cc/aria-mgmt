@@ -24,6 +24,14 @@ the absence so it can't quietly creep back.)
   anchors, tasks/playbooks. They return, if ever, as loops or endpoints — never
   as core.
 
+- **The ephemeral transcript + the per-session telemetry trace** (`src/telemetry.py`,
+  `data/traces/*.json`). Both were duplicate, lossy homes for the conversation:
+  the transcript died with the process (so Aria never had context across
+  sessions) and the trace re-stored the same text only for latency. They are
+  collapsed into the ONE durable conversation store (`src/conversation.py`,
+  `data/aria.db`), which the conductor loads each turn. Memory is the transcript,
+  fed to the model as data (Software 2.0) — never a RAG/vector/summarizer pipeline.
+
 Doctrine note (review 3.6): `.cursor/rules/*.mdc` govern the build-time IDE
 agent only; they are inert to Aria's runtime engine. Runtime doctrine reaches
 Claude Code via the `{{include:_principles}}` dispatch instruction (see

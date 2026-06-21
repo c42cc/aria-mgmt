@@ -56,6 +56,12 @@ class Config:
     daily_spend_cap_usd: float = float(os.getenv("DAILY_SPEND_CAP_USD", "20"))
     anthropic_timeout_sec: float = float(os.getenv("ANTHROPIC_TIMEOUT_SEC", "120"))
     conductor_max_tokens: int = int(os.getenv("ARIA_CONDUCTOR_MAX_TOKENS", "1500"))
+    # Conversation memory (the durable transcript fed to the conductor each turn).
+    # How many recent turns of the current thread to load as context (the model's
+    # long context + caching carry it; compaction is the future lever if a single
+    # thread ever outgrows this). And the default thread name.
+    context_window_turns: int = int(os.getenv("ARIA_CONTEXT_TURNS", "200"))
+    default_thread: str = os.getenv("ARIA_THREAD", "main").strip() or "main"
     # Tiering (review 2.2): routine/interview turns use the fast model; the
     # nuanced post-build REPORT stays on Opus. ~1.8x faster turns, routing + the
     # guards verified to hold on the fast model. Set false to force all-Opus.
@@ -78,6 +84,10 @@ class Config:
     @property
     def memory_path(self) -> Path:
         return self.data_dir / "memory.json"
+
+    @property
+    def conversation_db_path(self) -> Path:
+        return self.data_dir / "aria.db"
 
 
 config = Config()

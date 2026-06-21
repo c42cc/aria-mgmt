@@ -46,11 +46,17 @@ This replaces v1, whose defect was a non-reasoning front door deciding intent
 - **Dispatcher** (`src/dispatcher.py`) — fills the loop's `dispatch` template +
   the doctrine, runs the engine, and verifies "done" against **ground truth**
   (git diff + an independent test run), never the engine's narration.
-- **Memory** (`src/memory.py`) — durable facts that pre-fill loop slots and skip
-  settled questions. A UX lever, not storage.
-- **Outcome log + telemetry** (`src/outcome_log.py`, `src/telemetry.py`) — one
-  append-only row per request (did it deliver) + per-turn latency and full
-  conversation traces (so we can debug *feel*).
+- **Conversation** (`src/conversation.py`) — the durable transcript. Every turn
+  (the user's, Aria's, an engine observation) is persisted in one SQLite table
+  and loaded back into the conductor each turn, so Aria has the right context
+  across sessions AND threads: her last messages, the full history, a glance at
+  her other threads. The model gets raw history as data — no retrieval pipeline,
+  no summarizer (Software 2.0). It is the one home for "what was said" and its
+  per-turn metrics (latency, phase, cost).
+- **Memory** (`src/memory.py`) — durable *facts* that pre-fill loop slots and
+  skip settled questions. A UX lever, not storage.
+- **Outcome log** (`src/outcome_log.py`) — one append-only row per request (did
+  it deliver) — the measurement loop's signal.
 
 ## Transports
 
@@ -87,7 +93,8 @@ the build-time IDE agent only; they are inert to Aria's runtime engine.
 | Loops (capability as data) | `loops/*.yaml` + `src/loops.py` |
 | Engine (Claude Code) | `src/engine_claude_code.py` |
 | Dispatcher (ground-truth verify) | `src/dispatcher.py` |
-| Memory / outcome log / telemetry | `src/memory.py` · `src/outcome_log.py` · `src/telemetry.py` |
+| Durable conversation (memory + per-turn metrics) | `src/conversation.py` (`data/aria.db`) |
+| Durable facts / outcome log | `src/memory.py` · `src/outcome_log.py` |
 | The measurement loop (the review) | `src/review.py` (`python -m src.review`) |
 | Config (one home) | `src/config.py` + `.env` |
 | Boot preflight | `src/preflight.py` |

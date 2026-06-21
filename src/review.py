@@ -7,12 +7,9 @@ Reads the outcome log (did real requests deliver) and the experience traces
 
 from __future__ import annotations
 
-import glob
-import json
 from collections import defaultdict
 
-from . import outcome_log
-from .config import config
+from . import conversation, outcome_log
 
 
 def summarize() -> str:
@@ -35,16 +32,7 @@ def summarize() -> str:
         for r in fails:
             out.append(f"  - {str(r.get('request'))[:55]} :: {r.get('broke')}")
 
-    latencies: list[int] = []
-    for path in glob.glob(str(config.trace_dir / "*.json")):
-        try:
-            trace = json.loads(open(path).read())
-        except (OSError, json.JSONDecodeError):
-            continue
-        latencies += [
-            t["latency_ms"] for t in trace.get("turns", [])
-            if t.get("role") == "aria" and "latency_ms" in t
-        ]
+    latencies = conversation.latencies()
     if latencies:
         latencies.sort()
         pick = lambda q: latencies[min(len(latencies) - 1, int(q * len(latencies)))]

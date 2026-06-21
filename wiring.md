@@ -19,8 +19,10 @@ v1 is gone (`ABSENCES.md`).
 user utterance
   → transport (text REPL / LiveKit STT)         # renders + turn-taking only
   → AriaBrain.user_turn(text)
-       → conductor.decide(transcript, loops)     # Anthropic API: Claude owns content
-       → returns {phase, speak, loop_id, slots}
+       → conversation.append(user turn)          # persisted to data/aria.db
+       → conductor.decide(recent durable history + other-thread context, loops)
+       → returns {phase, speak, loop_id, slots}  # Anthropic API: Claude owns content
+       → conversation.append(aria turn + latency/phase/cost)
   → transport speaks `speak`                      # text print / LiveKit TTS
   → if phase==DISPATCH and the go-gate holds:
        → dispatcher.run(loop, slots)
@@ -35,10 +37,14 @@ Text **blocks** on the build and reports inline; voice speaks a filler and runs
 the build in the **background**, reporting via the loop's channel — so a
 multi-second engine run never freezes the call.
 
-## State (three flat files under `data/`, gitignored)
+## State (under `data/`, gitignored)
 
+- `data/aria.db` — the durable **conversation** (SQLite): every turn tagged by
+  thread/session/channel, with per-turn latency/phase/cost. This is Aria's
+  memory — the conductor loads recent turns from it each turn, so context
+  survives a restart and spans threads. One home for "what was said" + its
+  metrics (the old per-session trace files are gone).
 - `data/outcomes.jsonl` — one row per request (did it deliver).
-- `data/traces/<session>.json` — per-turn latency + full conversation trace.
 - `data/memory.json` — durable facts that pre-fill slots.
 
 ## Config & secrets

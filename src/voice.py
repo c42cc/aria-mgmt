@@ -31,7 +31,6 @@ from livekit.agents import (
 from .brain import AriaBrain
 from .config import config
 from .loops import load_loops
-from .telemetry import Trace
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +111,9 @@ def _build_server():
 
     @server.rtc_session()
     async def entrypoint(ctx: JobContext) -> None:
-        brain = AriaBrain(loops=load_loops(), trace=Trace())
+        # channel='voice', default thread -> the call continues the same durable
+        # memory as text. Aria has the right context across modalities.
+        brain = AriaBrain(loops=load_loops(), channel="voice")
         session = AgentSession(
             vad=silero.VAD.load(),
             # LiveKit Inference (needs a LiveKit Cloud key). Swap for plugin
