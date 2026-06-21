@@ -26,3 +26,4 @@ them out loud.
 - live_visuals_3 → /Users/corbin/PycharmProjects/agi_env_v1/live_visuals_3
 - alive_river → /Users/corbin/PycharmProjects/agi_env_v1/alive_river
 - spicylit → /Users/corbin/PycharmProjects/spicylit
+- scratch → /Users/corbin/PycharmProjects/agi_env_v1/aria-scratch

@@ -1,0 +1,32 @@
+id: feature-build
+name: Feature Build
+description: >
+  Implement a scoped code change in a project on a fresh branch, run the tests,
+  and return a diff. Use this for any "build / add / change / fix the code"
+  request that names (or implies) a project and a concrete change.
+endpoint: mac-claude-code
+loop: >
+  Branch from the current state, implement the change, run the test suite,
+  produce a diff, and report back. No push.
+required_slots:
+  - key: repo
+    ask: "Which project?"
+  - key: change
+    ask: "What should change, in a sentence or two?"
+  - key: acceptance
+    ask: "How will we know it's right -- a specific test, a behavior, or your judgment?"
+optional_slots:
+  - key: constraints
+    ask: "Anything to avoid or watch out for?"
+dispatch: |
+  You are the build engine for a Feature Build. Working directory: {repo}.
+  1. Create a fresh git branch off the current HEAD.
+  2. Implement this change: {change}
+  3. Honor these constraints (if any): {constraints}
+  4. Run the project's test suite and make it pass.
+  5. Satisfy this acceptance criterion: {acceptance}
+  6. Leave the work as a diff on the branch. Do NOT push and do NOT open a PR.
+  When done, state in one line whether the tests pass and what the diff contains.
+done: "A diff exists on a fresh branch AND the project's tests pass."
+gates: [spend_cap]
+report: text

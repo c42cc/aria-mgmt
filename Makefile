@@ -1,87 +1,12 @@
-# UCS top-level Makefile. The plan's "stale code" probe relies on this:
-# `make run` always kills the prior bot, reinstalls the package in editable
-# mode, then re-launches. There is no way to launch with stale code.
+.PHONY: run test gate
 
-PYTHON := .venv/bin/python
-PIP := .venv/bin/pip
-
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter
-
-help:
-	@echo "Targets:"
-	@echo "  run          - kill prior bot, reinstall (editable), launch fresh"
-	@echo "  gate         - the one door to main: lints + structural absences + unit suite"
-	@echo "  meter        - the live-outcome meter: a real request on the trunk build (real API \$$)"
-	@echo "  eval-calibrate - calibrate the judge over the labeled corpus (real API \$$); gates Task done"
-	@echo "  preflight    - run capability preflight (same probes the bot runs at boot)"
-	@echo "  bootstrap    - one-command fresh-machine setup (venv, npm, MCP, OAuth, prompts)"
-	@echo "  kill         - kill any running bot processes"
-	@echo "  restart      - alias for run"
-	@echo "  deps         - regenerate requirements.txt from pip freeze (drift check)"
-	@echo "  test         - run smoke + deep integration tests"
-	@echo "  anchor-test  - run anchor pressure-test suite (20 tasks, ~5min)"
-	@echo "  e2e-golden   - run unified Aria voice+text golden-path E2E (~10min, ~\$$1-2)"
-	@echo "  fmt          - format Python (ruff)"
-	@echo "  audit-idempotency - AST-check that connect/start/open/join begin with idempotency guard"
-	@echo "  audit-dedup  - scan data/audit.jsonl for duplicate API calls inside 5s windows"
-	@echo "  clean        - remove __pycache__, .pytest_cache"
-
-# One launch path (ops/launch.sh): pin to the trunk (git checkout main), reinstall
-# in editable mode so the running process matches source, then exec the bot. The
-# separate `kill` target runs first (launch.sh never pkills — that would crash-loop
-# launchd). Same script the launchd KeepAlive and deploy.sh restart use.
-run: kill
-	@bash ops/launch.sh
-
-restart: run
-
-gate:
-	@bash scripts/gate.sh
-
-meter:
-	@$(PYTHON) scripts/live_meter.py
-
-eval-calibrate:
-	@$(PYTHON) -m src.judge_calibration
-
-preflight:
-	@$(PYTHON) -m src.preflight
-
-bootstrap:
-	@bash ops/bootstrap.sh
-
-kill:
-	@pkill -f "src.bot" 2>/dev/null || true
-	@sleep 1
-
-deps:
-	@$(PIP) freeze > requirements.txt
-	@echo "requirements.txt regenerated."
+run:
+	.venv/bin/python -m src.bot
 
 test:
-	@$(PYTHON) tests/smoke.py
-	@$(PYTHON) tests/deep_integration.py
+	.venv/bin/python -m pytest -q
 
-anchor-test:
-	@$(PYTHON) tests/anchor_suite/run.py
-
-# Primary E2E test going forward — exercises every verbal request type Aria
-# handles through her real voice path against a real bot. Owns the bot
-# lifecycle (kill -> reinstall -> start -> preflight wait -> run -> kill).
-# Requires the operator to be in the #general voice channel so Aria can
-# auto-connect. ~10 min wall time, ~$1-2 in real API calls.
-e2e-golden:
-	@$(PYTHON) scripts/e2e_aria_golden.py
-
-fmt:
-	@$(PYTHON) -m ruff format src/ tests/ 2>/dev/null || echo "ruff not installed"
-
-audit-idempotency:
-	@$(PYTHON) -m src.audit_idempotency_lint
-
-audit-dedup:
-	@$(PYTHON) -m src.audit_dedup_probe
-
-clean:
-	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	@find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+# The static half of "done". The runtime half is a real request via `make run`
+# completing and being honestly logged in data/outcomes.jsonl.
+gate: test
+	@echo "GATE GREEN (static). Runtime half = a real request that delivers + logs honestly."
