@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from . import conductor, dispatcher, outcome_log
+from . import conductor, dispatcher, outcome_log, spend
 from .conductor import ConductorTurn
 from .config import config
 from .dispatcher import DispatchResult
@@ -49,10 +49,13 @@ class AriaBrain:
         self.transcript.append({"role": "user", "content": text})
         self.trace.user(text)
         turn = self._decide(self._routine_model)
+        # A confirmed plan survives ONLY into the immediately-following DISPATCH.
+        # Anything else — a fresh interview, a cancellation ("forget it" -> CHITCHAT),
+        # a topic change — clears it, so a later stray "go" can't fire a stale plan.
         if turn.phase == "CONFIRM":
             self.pending = (turn.loop_id, turn.slots)
-        elif turn.phase == "INTERVIEW":
-            self.pending = None  # a fresh interview invalidates a stale confirm
+        elif turn.phase in ("INTERVIEW", "CHITCHAT", "REPORT"):
+            self.pending = None
         return turn
 
     def ready_to_dispatch(self, turn: ConductorTurn) -> tuple[Loop, dict] | None:
@@ -78,6 +81,20 @@ class AriaBrain:
     def dispatch(self, loop: Loop, slots: dict) -> DispatchResult:
         """Run the engine, verify against ground truth, log the outcome, and fold
         the result back into the transcript so the next turn can report it."""
+        if spend.at_cap():
+            broke = (
+                f"today's spend cap (${config.daily_spend_cap_usd:.0f}) is reached — "
+                "held the build; ask Corbin whether to continue today or pick it up tomorrow"
+            )
+            obs = f"[engine result] delivered=False. {broke}"
+            self.transcript.append({"role": "user", "content": obs})
+            self.trace.observation(obs)
+            outcome_log.record(
+                request=str(slots.get("change") or slots.get("repo") or loop.id),
+                loop_id=loop.id, slots=slots, delivered=False, summary=broke,
+                broke=broke, cost_usd=0.0, extra={"held": "spend_cap"},
+            )
+            return DispatchResult(False, broke, broke, "", None, 0.0, "")
         result = dispatcher.run(loop, slots)
         self.session_cost += result.cost_usd
         obs = f"[engine result] delivered={result.delivered}. {result.broke or result.summary}"

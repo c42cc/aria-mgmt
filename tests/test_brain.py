@@ -67,6 +67,28 @@ def test_tiering_routine_fast_report_opus(monkeypatch):
         assert seen[0] == config.fast_model
 
 
+def test_cancellation_after_confirm_clears_pending(monkeypatch):
+    b = brain_mod.AriaBrain(loops=load_loops(), trace=Trace())
+    seq = iter([_turn("CONFIRM", {"repo": "scratch"}), _turn("CHITCHAT")])
+    monkeypatch.setattr(brain_mod.conductor, "decide", lambda *a, **k: next(seq))
+    b.user_turn("build x")
+    assert b.pending is not None
+    b.user_turn("forget it")
+    assert b.pending is None  # a confirmed plan cannot survive a cancellation
+
+
+def test_spend_cap_holds_build_gracefully(monkeypatch):
+    b = brain_mod.AriaBrain(loops=load_loops(), trace=Trace())
+    monkeypatch.setattr(brain_mod.spend, "at_cap", lambda: True)
+    monkeypatch.setattr(brain_mod.outcome_log, "record", lambda **k: None)
+    ran = {"v": False}
+    monkeypatch.setattr(brain_mod.dispatcher, "run", lambda *a, **k: ran.update(v=True))
+    res = b.dispatch(load_loops()["feature-build"], {"repo": "scratch", "change": "x", "acceptance": "y"})
+    assert res.delivered is False
+    assert not ran["v"]  # never even calls the engine — no detonation
+    assert "cap" in (res.broke or "").lower()
+
+
 def test_voice_latest_user_text():
     from livekit.agents import llm
 
