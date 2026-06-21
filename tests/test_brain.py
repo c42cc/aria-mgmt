@@ -6,6 +6,8 @@ isolation (the gate must hold regardless of what the model says).
 
 from __future__ import annotations
 
+import pytest
+
 from src import brain as brain_mod
 from src import conversation
 from src.conductor import ConductorTurn
@@ -108,6 +110,7 @@ def test_brain_feeds_prior_session_history_to_conductor(monkeypatch):
 
 
 def test_voice_latest_user_text():
+    pytest.importorskip("livekit.agents")  # the voice extra is optional
     from livekit.agents import llm
 
     from src.voice import _latest_user_text
