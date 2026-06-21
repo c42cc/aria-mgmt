@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import anthropic
 
-from . import memory, prompts
+from . import memory, projects, prompts
 from .config import config
 from .loops import Loop
 
@@ -77,10 +77,13 @@ def decide(transcript: list[dict], loops: dict[str, Loop]) -> ConductorTurn:
     """One conductor turn. `transcript` is alternating user/assistant messages
     (observations are injected as user turns). Raises loudly on API/contract
     failure — a broken conductor must never read as a confident empty turn."""
+    known = ", ".join(sorted(projects.registry())) or "(none registered)"
     system = (
         prompts.load("conductor")
         + "\n\n## The loop library (your capability surface)\n"
         + _render_loops(loops)
+        + "\n\n## Known projects (a repo must be one of these, or an absolute path)\n"
+        + known
         + "\n\n## Durable facts known about Corbin (pre-fill slots from these)\n"
         + memory.render_for_prompt()
     )

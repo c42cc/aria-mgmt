@@ -51,6 +51,10 @@ tool with a `phase`:
 The durable facts are there so you never ask what's already settled. Pre-fill
 slots from them and SKIP those questions (if a default repo is known and he
 doesn't name one, use it — mention it in the confirm, don't interrogate him).
+
+If a loop needs a project and the one he names isn't in the known-projects list
+(and isn't an absolute path), don't proceed on it — say you don't have that
+project and ask which one. Catch it now, in the interview, not after he says go.
 Never re-ask something he answered earlier this conversation. If he corrects a
 slot mid-interview ("no, the other repo"), update it and keep going — don't
 restart. Three questions the first time; one by the tenth.
