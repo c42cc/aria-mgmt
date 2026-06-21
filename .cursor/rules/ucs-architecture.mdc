@@ -1,158 +1,62 @@
 ---
-description: UCS architecture invariants and project conventions
 alwaysApply: true
 ---
+# Aria v2 — Project Conventions
 
-# UCS — Project Conventions
-
-Read [`ARCHITECTURE.md`](../../ARCHITECTURE.md) and [`wiring.md`](../../wiring.md)
-when you need a map of the system. They are the source of truth. This file is
-the short version of the rules that hold across the codebase.
+Read [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`wiring.md`](../../wiring.md),
+and [`ABSENCES.md`](../../ABSENCES.md) for the map and the things that must stay
+gone. This file is the short version of the rules that hold across the codebase.
 
 ## Roles do not blur
 
-- **Gemini Live speaks.** It is the only voice. It does not reason.
-- **Claude Opus thinks.** It plans, analyzes, runs the general-task agent loop.
-  It does not speak to the user; it produces text artifacts.
-- **Cursor SDK builds.** It edits code and runs tests. It does not narrate.
+- **Claude conducts.** It owns the conversation's content: intent, which loop,
+  what to ask, whether the plan is right. It is the brain in the conversation,
+  not a tool called after a dumb router already decided. (This is the v1 defect,
+  inverted — never reintroduce a non-reasoning front door that decides intent.)
+- **The voice layer renders.** A fast transport (LiveKit + a fast model) is ears
+  and mouth — STT, TTS, turn-taking, barge-in. It never decides anything.
+- **Claude Code builds.** One engine (the Agent SDK, a managed `claude`
+  subprocess) does every kind of work. There is no Cursor.
 
-Any change that asks one role to do another's job is a regression. If you find
-yourself wanting a "router model" or a "primary model under Gemini," stop and
-re-read `ARCHITECTURE.md`.
+A change that asks the voice layer to decide intent, or adds a second engine, is
+a regression.
 
-## No frameworks
+## Capability is data, the core is thin
 
-No agent frameworks (LangChain, AutoGen, LangGraph, Hermes, etc.). The loop
-lives in `src/bot.py` and must remain readable end-to-end. New behavior is a
-new tool in `src/tools.py`, not a new layer.
+New capability is a **loop file** (`loops/*.yaml`) or an **endpoint**, never a
+new branch of the conductor. If you're editing `src/conductor.py` to add a
+feature, stop — it belongs in a loop.
 
-## Failures must be loud
+## One brain, many transports
 
-No silent fallbacks. Bad:
+The conductor-driving logic and the **mechanical go-gate** live once, in
+`src/brain.py::AriaBrain`. Text and voice are thin transports over it. Nothing
+dispatches without a confirmed plan and an explicit go — enforced in code, not
+by prompting.
 
-```python
-try:
-    result = await something()
-except Exception:
-    result = None  # silent fallback
-```
+## Failures are loud; verify against ground truth
 
-Good:
+No silent fallbacks, no `try/except: pass`, no fabricated success, never blame a
+third party. "Done" for code is tests pass + a diff exists + it builds + an
+honest outcome-log row — checked by the dispatcher against git/test ground
+truth, never the engine's narration. A broken verifier reads as `unverified`
+(a loud non-pass), never as success.
 
-```python
-try:
-    result = await something()
-except SpecificError:
-    log.exception("something failed")
-    raise
-```
+## Doctrine has one home and must reach the engine
 
-Preflight (`src/preflight.py`) refuses to enter ready state on any critical
-failure. Do not add a probe that swallows its own error; return
-`(False, error, fix_command, detail)` so the user sees what broke and how
-to fix it.
+`prompts/_principles.md` is the single home of the engineering doctrine, injected
+by `{{include:_principles}}` into the conductor persona AND the engine
+instruction. These `.cursor/rules/*.mdc` govern the build-time IDE agent only —
+they are inert to Aria's runtime engine, so never rely on them to reach it.
 
-## MCP for general integrations
+## Cost & secrets are mechanical
 
-Do not write a custom Gmail client, AppleScript wrapper, GitHub client, or
-shell executor. Use the MCP fleet in `src/mcp.py`. If a required server does
-not exist, ask before writing one.
+Models, caps, and the billing path live in `src/config.py` (from `.env`);
+nothing else reads the environment. Secret fields are `repr=False`. Pin only
+verified-live model ids; `src/preflight.py` asserts each resolves at boot.
 
-## Risk tiers are mechanical
+## Don't substitute models or keep legacy
 
-`src/mcp.py::_classify_tier` assigns every MCP tool a tier from server
-defaults. Tier I (irreversible) and tier X (executable) **always** confirm
-before firing — this is enforced by the dispatcher, not by prompting Claude
-to be careful. Do not add a code path that bypasses the confirm callback.
-
-## Cost discipline is mechanical
-
-Daily ceiling, per-session call limits, and iteration caps live in
-`src/config.py` (overridable via `.env`). The dispatcher checks them before
-delegating. When you add a paid tool, add it to the dispatch path that
-already runs the spend check; do not call the model API from a fresh entry
-point.
-
-## State stays in three places
-
-- `data/state.db` — structured rows via `src/db.py` (raw SQL, no ORM).
-- `data/mem0/` — durable user facts via `src/memory.py`.
-- `data/audit.jsonl` — append-only record of every MCP call.
-
-Do not introduce a fourth store. Do not abstract these behind a data access
-layer.
-
-## Behavior lives in `prompts/`
-
-Personas and reusable instructions are markdown files. Edit a file, reload
-(`!reload` or the `reload_prompts` tool), and behavior changes. Do not
-embed long instruction strings in Python; put them in `prompts/` and load
-via `prompts.load_template(name)`.
-
-## Channels by ID, not name
-
-Read `DISCORD_*_CHANNEL_ID` from config. Never look up a channel by name.
-Renaming a channel in Discord must never break the bot.
-
-## Aria is one identity, two applications
-
-`DISCORD_APP_BOT_TOKEN` is the py-cord text/commands bot. `DISCORD_VOICE_BOT_TOKEN`
-is the discord.js voice sidecar. They never communicate through Discord. The
-Python parent (`src/bot.py`) is the only glue.
-
-## Capabilities plug in by channel
-
-New capability? Add a package under `capabilities/`. Register a channel ID
-in `.env`. Wire it into `_auto_join_voice_channel` in `src/bot.py` so audio
-routes to its session when the user enters that channel. Do not modify the
-core tool catalog for capability-specific behavior; capabilities own their
-own pipelines.
-
-## Python style
-
-- Python 3.12. Type hints throughout (`from __future__ import annotations`
-  is already the convention).
-- One module per concern. Names match the layer in `ARCHITECTURE.md`.
-- Async by default. Blocking I/O wrapped in `asyncio.to_thread` when needed
-  (e.g., the Anthropic SDK is sync).
-- Module-level loggers: `log = logging.getLogger(__name__)`.
-
-## Known gotchas
-
-- **Discord voice requires the sidecar.** py-cord cannot connect to voice
-  (close code 4017 / DAVE E2EE). Do not delete the sidecar.
-- **`discord` namespace conflict.** Only `py-cord` exposes
-  `discord.sinks.core.Sink`. Installing `discord.py` instead will silently
-  break voice receive. The `dep_drift` preflight probe catches this.
-- **numpy must be `<2`.** The transformers/torch chain has C-extensions
-  compiled against the 1.x ABI; numpy>=2 crashes at import.
-- **Gemini Live is an async context manager**, not an awaitable. The bridge
-  uses `__aenter__` / `__aexit__` directly.
-- **One trunk; running == source.** Every launch path goes through
-  `ops/launch.sh` (launchd KeepAlive, `make run`, `deploy.sh` restart): checkout
-  `main` → editable reinstall → exec. The CRITICAL `deployed_trunk` preflight
-  probe verifies the live build hash (`src/build_hash.py`) matches the pinned
-  trunk and the boot stamp, refusing ready on a feature branch / dirty tree /
-  post-boot edit. `scripts/gate.sh` is the one door to `main`. See the
-  `one-trunk`, `halt-dont-heal`, and `done-means-verified-on-this-build` rules.
-
-## Don't substitute models
-
-Claude calls use Opus. Memory synthesis may use Haiku for cost. Never
-introduce Sonnet anywhere. The model names are configured in `.env`; do not
-hardcode them outside `src/config.py`.
-
-## Commit and push when green; never force-push
-
-Corbin's standing instruction: once work is verified green (tests + the
-relevant probe pass in front of you), COMMIT and PUSH it on the working branch
-WITHOUT asking — he is tired of being asked every time. Always work on a
-branch, never commit or push directly to `main`/`master`. NEVER force-push, and
-opening a PR or merging still needs an explicit ask. Never modify `.env`,
-`.git/`, or files outside the project root.
-
-## Cite where things live before adding new things
-
-Before you add a module, search `ARCHITECTURE.md`'s **Repo Map** for an
-existing home. If the concept fits an existing module, extend it. If it
-truly does not, place it where the map would put it and update the map.
+The conductor reasons on Opus (`claude-opus-4-8`); a fast tier may serve routine
+turns once verified. No back-compat, no style variants, no dead paths — when a
+collapse makes something gone, record it in `ABSENCES.md` so it stays gone.
