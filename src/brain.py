@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from . import conductor, dispatcher, outcome_log
 from .conductor import ConductorTurn
+from .config import config
 from .dispatcher import DispatchResult
 from .loops import Loop
 from .telemetry import Trace
@@ -28,9 +29,15 @@ class AriaBrain:
     pending: tuple[str, dict] | None = None  # (loop_id, slots) awaiting an explicit go
     session_cost: float = 0.0
 
-    def _decide(self) -> ConductorTurn:
+    @property
+    def _routine_model(self) -> str:
+        # Routine/interview turns: the fast tier (review 2.2). Routing + the guards
+        # are verified to hold on it. The nuanced REPORT stays on Opus.
+        return config.fast_model if config.conductor_tier_routine else config.reasoning_model
+
+    def _decide(self, model: str | None = None) -> ConductorTurn:
         t0 = time.time()
-        turn = conductor.decide(self.transcript, self.loops)
+        turn = conductor.decide(self.transcript, self.loops, model=model)
         latency_ms = int((time.time() - t0) * 1000)
         self.transcript.append({"role": "assistant", "content": turn.speak})
         self.trace.aria(turn.speak, turn.phase, latency_ms, turn.loop_id)
@@ -41,7 +48,7 @@ class AriaBrain:
         """Record the user's utterance and get Aria's next turn (decide + gate)."""
         self.transcript.append({"role": "user", "content": text})
         self.trace.user(text)
-        turn = self._decide()
+        turn = self._decide(self._routine_model)
         if turn.phase == "CONFIRM":
             self.pending = (turn.loop_id, turn.slots)
         elif turn.phase == "INTERVIEW":
@@ -66,7 +73,7 @@ class AriaBrain:
         self.transcript.append({"role": "user", "content": obs})
         self.trace.observation(obs)
         self.pending = None
-        return self._decide()
+        return self._decide(self._routine_model)
 
     def dispatch(self, loop: Loop, slots: dict) -> DispatchResult:
         """Run the engine, verify against ground truth, log the outcome, and fold
@@ -89,5 +96,6 @@ class AriaBrain:
         return result
 
     def report_turn(self) -> ConductorTurn:
-        """After a dispatch, the conductor's honest REPORT line."""
-        return self._decide()
+        """After a dispatch, the conductor's honest REPORT line — on Opus, where
+        'name the blocker, never fabricate' matters most."""
+        return self._decide(config.reasoning_model)

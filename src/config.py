@@ -56,6 +56,10 @@ class Config:
     daily_spend_cap_usd: float = float(os.getenv("DAILY_SPEND_CAP_USD", "20"))
     anthropic_timeout_sec: float = float(os.getenv("ANTHROPIC_TIMEOUT_SEC", "120"))
     conductor_max_tokens: int = int(os.getenv("ARIA_CONDUCTOR_MAX_TOKENS", "1500"))
+    # Tiering (review 2.2): routine/interview turns use the fast model; the
+    # nuanced post-build REPORT stays on Opus. ~1.8x faster turns, routing + the
+    # guards verified to hold on the fast model. Set false to force all-Opus.
+    conductor_tier_routine: bool = os.getenv("ARIA_CONDUCTOR_TIER", "true").lower() == "true"
 
     # ── Paths ──────────────────────────────────────────────────────────────
     prompts_dir: Path = _REPO / "prompts"

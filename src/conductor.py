@@ -21,9 +21,14 @@ from . import memory, projects, prompts
 from .config import config
 from .loops import Loop
 
-# Opus 4.8 pricing (verified 2026-06-21): $5 / $25 per MTok in/out.
-_IN_PER_TOK = 5.0 / 1_000_000
-_OUT_PER_TOK = 25.0 / 1_000_000
+# (input, output) USD per token. Opus 4.8 verified 2026-06-21 ($5/$25 per MTok);
+# haiku-4-5 is an approximate fast-tier estimate (cost is for observability, not
+# billing — the engine's max_budget is the real cap).
+_PRICING = {
+    "claude-opus-4-8": (5.0 / 1e6, 25.0 / 1e6),
+    "claude-haiku-4-5": (1.0 / 1e6, 5.0 / 1e6),
+}
+_DEFAULT_PRICE = (5.0 / 1e6, 25.0 / 1e6)
 
 PHASES = ("CHITCHAT", "INTERVIEW", "CONFIRM", "DISPATCH", "REPORT")
 
@@ -73,10 +78,12 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=config.anthropic_api_key, timeout=config.anthropic_timeout_sec)
 
 
-def decide(transcript: list[dict], loops: dict[str, Loop]) -> ConductorTurn:
+def decide(transcript: list[dict], loops: dict[str, Loop], model: str | None = None) -> ConductorTurn:
     """One conductor turn. `transcript` is alternating user/assistant messages
-    (observations are injected as user turns). Raises loudly on API/contract
-    failure — a broken conductor must never read as a confident empty turn."""
+    (observations are injected as user turns). `model` overrides the reasoning
+    model (the tiering seam — a fast model for routine turns; review 2.2). Raises
+    loudly on API/contract failure — a broken conductor must never read as a
+    confident empty turn."""
     known = ", ".join(sorted(projects.registry())) or "(none registered)"
     system = (
         prompts.load("conductor")
@@ -87,15 +94,17 @@ def decide(transcript: list[dict], loops: dict[str, Loop]) -> ConductorTurn:
         + "\n\n## Durable facts known about Corbin (pre-fill slots from these)\n"
         + memory.render_for_prompt()
     )
+    model_id = model or config.reasoning_model
     resp = _client().messages.create(
-        model=config.reasoning_model,
+        model=model_id,
         max_tokens=config.conductor_max_tokens,
         system=system,
         tools=[_ARIA_TURN_TOOL],
         tool_choice={"type": "tool", "name": "aria_turn"},
         messages=transcript,
     )
-    cost = resp.usage.input_tokens * _IN_PER_TOK + resp.usage.output_tokens * _OUT_PER_TOK
+    price_in, price_out = _PRICING.get(model_id, _DEFAULT_PRICE)
+    cost = resp.usage.input_tokens * price_in + resp.usage.output_tokens * price_out
     block = next((b for b in resp.content if getattr(b, "type", None) == "tool_use"), None)
     if block is None:
         raise RuntimeError(f"conductor returned no aria_turn tool call (stop_reason={resp.stop_reason})")

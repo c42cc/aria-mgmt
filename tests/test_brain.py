@@ -49,6 +49,24 @@ def test_fresh_interview_invalidates_stale_confirm(monkeypatch):
     assert b.pending is None
 
 
+def test_tiering_routine_fast_report_opus(monkeypatch):
+    from src.config import config
+
+    seen: list[str | None] = []
+
+    def fake_decide(transcript, loops, model=None):
+        seen.append(model)
+        return _turn("CONFIRM")
+
+    monkeypatch.setattr(brain_mod.conductor, "decide", fake_decide)
+    b = brain_mod.AriaBrain(loops=load_loops(), trace=Trace())
+    b.user_turn("x")     # routine -> fast tier (when tiering on)
+    b.report_turn()      # nuanced -> always Opus
+    assert seen[-1] == config.reasoning_model
+    if config.conductor_tier_routine:
+        assert seen[0] == config.fast_model
+
+
 def test_voice_latest_user_text():
     from livekit.agents import llm
 

@@ -44,11 +44,14 @@ Defaults use LiveKit Inference (Deepgram STT, Cartesia TTS — needs the LiveKit
 Cloud key). To keep audio fully on your own keys, swap `inference.STT/TTS` in
 `_build_server()` for plugin classes with provider keys.
 
-## The latency primitive (do this when wiring voice for real)
+## The latency primitive (partly built; finish at the console loop)
 
-Conductor turns measured ~3.6s p50 in text (Opus every turn). Above ~800ms voice
-feels dead. The fix is tiering — a fast model for routine interview turns, Opus
-reserved for genuine reasoning (intent match, plan synthesis) — plus streaming
-the conductor's tokens to TTS and a spoken filler while Opus thinks. The seam is
-ready: `config.fast_model` exists (verify its id first) and the conductor is one
-call per turn. Build this against the live console loop where latency is real.
+Above ~800ms, voice feels dead. **Tiering is implemented** (`ARIA_CONDUCTOR_TIER`,
+default on): routine/interview turns run on the fast tier (`claude-haiku-4-5`,
+verified to route across all loops and hold the guards), and the nuanced
+post-build REPORT stays on Opus. That dropped routine turns from ~3s to ~1.6s.
+
+The remaining levers to reach sub-800ms — best built against the live console
+loop, where audio latency is real — are: stream the conductor's tokens to TTS
+(don't wait for the full turn), a spoken filler while a turn is forming, and a
+leaner system prompt. LiveKit handles the rest (turn detection, barge-in).
