@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+voice = ["livekit-agents~=1.6", "livekit-plugins-silero>=1.0"]
 
 [build-system]
 requires = ["setuptools>=68"]
