@@ -29,6 +29,21 @@ def check(ping_models: bool = True) -> list[str]:
     loops = load_loops()
     ok.append(f"{len(loops)} loop(s) loaded: {', '.join(loops)}")
 
+    # Optional endpoints (Phase 4 house + the Spark local-model). Reported, not
+    # forced: an unconfigured endpoint is fine (a later phase), and the loud
+    # connectivity check lives at USE time (the endpoint returns the one fix),
+    # so a briefly-down hub never blocks the whole bot from booting.
+    ok.append(
+        "house endpoint: configured"
+        if (config.hass_url and config.hass_token)
+        else "house endpoint: not configured (set HASS_URL + HASS_TOKEN for Phase 4)"
+    )
+    ok.append(
+        f"spark endpoint: configured ({config.spark_model})"
+        if config.spark_base_url
+        else "spark endpoint: not configured (set SPARK_BASE_URL)"
+    )
+
     if ping_models:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key, timeout=30)
         try:

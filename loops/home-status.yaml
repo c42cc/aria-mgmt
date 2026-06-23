@@ -1,0 +1,16 @@
+id: home-status
+name: Home Status
+description: >
+  Check the current state of a smart-home device or room -- is the door locked,
+  are the lights on, is the garage closed, what is the thermostat set to. A
+  read-only query against Home Assistant.
+endpoint: home-assistant
+loop: Identify the device or room and report its current state from Home Assistant.
+required_slots:
+  - key: device
+    ask: "Which device or room do you want the status of?"
+dispatch: |
+  Read Home Assistant state for device/room = {device}.
+done: "The current state of the named entity is reported from Home Assistant."
+gates: []
+report: text

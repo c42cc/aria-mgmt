@@ -1,0 +1,17 @@
+id: local-ask
+name: Local (Spark) Draft
+description: >
+  Run a self-contained text task -- draft, summarize, rewrite, brainstorm, answer
+  -- on the LOCAL open-source model served on the DGX Spark, off the metered
+  cloud. Use when privacy or "keep it local and free" matters and the task is
+  plain text (no tools, no shell, no web).
+endpoint: spark
+loop: Send the request to the local Spark-served model and return its answer.
+required_slots:
+  - key: request
+    ask: "What should the local model draft or work on?"
+dispatch: |
+  {request}
+done: "The local Spark model returned a non-empty answer to the request."
+gates: []
+report: text

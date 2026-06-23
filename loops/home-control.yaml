@@ -1,0 +1,25 @@
+id: home-control
+name: Home Control
+description: >
+  Control a smart-home device or room through Home Assistant -- turn lights,
+  switches, or media on or off, lock or unlock a door, open or close blinds and
+  curtains, set a light's brightness or a thermostat, or activate a scene. Use
+  this for any "turn on / off / lock / unlock / open / close / set / activate"
+  request about a physical device or room.
+endpoint: home-assistant
+loop: >
+  Identify the device or room and the action (and a value if it is a level),
+  confirm, then actuate Home Assistant and verify the new state.
+required_slots:
+  - key: device
+    ask: "Which device or room? (e.g. living room lights, front door, bedroom blinds)"
+  - key: action
+    ask: "What should it do -- on, off, lock, unlock, open, close, set to a level, or activate?"
+optional_slots:
+  - key: value
+    ask: "To what level or value? (e.g. 50%, 21 degrees)"
+dispatch: |
+  Actuate Home Assistant. device/room = {device}; action = {action}; value = {value}.
+done: "The target entity's state in Home Assistant reflects the requested action, verified by re-reading it."
+gates: []
+report: text

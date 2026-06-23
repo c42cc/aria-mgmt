@@ -36,3 +36,26 @@ Doctrine note (review 3.6): `.cursor/rules/*.mdc` govern the build-time IDE
 agent only; they are inert to Aria's runtime engine. Runtime doctrine reaches
 Claude Code via the `{{include:_principles}}` dispatch instruction (see
 `src/dispatcher.py`).
+
+## The house (Phase 4) — what must NOT come back
+
+The house is here as the v2 shape promised: ONE substrate (Home Assistant)
+behind ONE `home-assistant` endpoint + `loops/home-*.yaml`, and the Spark as a
+`spark` endpoint + `loops/local-ask.yaml` (exactly "returns as loops or
+endpoints — never as core"). The following stay gone; re-adding any is a
+regression:
+
+- **Per-vendor home clients.** No Ring/Hue/Sonos/Lutron client, ever. Every
+  device is a Home Assistant integration reached through the one endpoint. HA is
+  the home's substrate the way Claude Code is the build engine.
+- **The LLM on the home actuation hot path.** The conductor turns speech into
+  `(device, action)`; actuation in `src/homeassistant.py` is deterministic
+  (a REST `call_service`) and verified against ground truth (a state re-read).
+  The model never decides the wire call, and a 200 that didn't change state is
+  reported NOT delivered — never a narrated success.
+- **A silent cloud/anything fallback when the hub is unreachable.** An
+  unconfigured or down hub returns the one-line fix (loud), never a quiet
+  substitute, and a connectivity failure is ours to surface — never blamed on HA.
+- **The capture+Gemini agreement gate as a universal code gate.** It returns
+  only at Phase 4 for genuine physical state (`src/home_verify.py`), exactly as
+  this ledger already requires.

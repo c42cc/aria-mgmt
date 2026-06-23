@@ -18,7 +18,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from . import engine_claude_code, projects, prompts
+from . import engine_claude_code, homeassistant, projects, prompts
 from .config import config
 from .loops import Loop
 
@@ -85,6 +85,10 @@ def run(loop: Loop, slots: dict) -> DispatchResult:
         return _run_build(loop, slots)
     if loop.endpoint == "research":
         return _run_research(loop, slots)
+    if loop.endpoint == "home-assistant":
+        return _run_home(loop, slots)
+    if loop.endpoint == "spark":
+        return _run_spark(loop, slots)
     return DispatchResult(False, "", f"endpoint {loop.endpoint!r} is not wired yet", "", None, 0.0, "")
 
 
@@ -151,3 +155,66 @@ def _run_research(loop: Loop, slots: dict) -> DispatchResult:
 
     summary = f"{elapsed:.0f}s; brief {len(brief)} chars. {brief[:400]}"
     return DispatchResult(delivered, summary, broke, "", None, result.cost_usd, result.session_id)
+
+
+def _run_home(loop: Loop, slots: dict) -> DispatchResult:
+    """The house endpoint. The conductor has turned speech into (device, action);
+    here we actuate Home Assistant DETERMINISTICALLY and verify against ground
+    truth (re-read the entity state) — never the model's narration, never a cloud
+    fallback. Free + fast (no model spend on the actuation hot path)."""
+    target = str(slots.get("device") or slots.get("entity") or slots.get("area") or "").strip()
+    if loop.id == "home-status":
+        r = homeassistant.read_status(target)
+    else:
+        r = homeassistant.actuate(target, str(slots.get("action") or ""), slots.get("value"))
+    return DispatchResult(r.delivered, r.summary, r.broke, "", None, 0.0, "")
+
+
+def _run_spark(loop: Loop, slots: dict) -> DispatchResult:
+    """The Spark endpoint — a local open-source model served on the DGX Spark runs
+    the work (the Spark returns 'as an endpoint, never as core', ABSENCES.md). vLLM
+    serves the Anthropic Messages API natively, so the SDK drives it unchanged via
+    base_url. Local + private; cost is 0 (off the metered cloud)."""
+    if not config.spark_base_url:
+        return DispatchResult(
+            False, "",
+            "the Spark endpoint isn't configured — serve a model on the Spark and set "
+            "SPARK_BASE_URL (and SPARK_MODEL) to its vLLM /v1 endpoint. No cloud fallback.",
+            "", None, 0.0, "",
+        )
+    import anthropic
+
+    # Plain filled dispatch — no engineering doctrine prefix (this is a general
+    # text model doing a draft, not the build engine).
+    keys = [s.key for s in (*loop.required_slots, *loop.optional_slots)]
+    filled = {k: (str(slots.get(k)).strip() if slots.get(k) else "") for k in keys}
+    instruction = loop.dispatch.format(**filled).strip()
+    client = anthropic.Anthropic(
+        base_url=config.spark_base_url,
+        api_key=config.anthropic_api_key or "local-brain",
+        timeout=config.anthropic_timeout_sec,
+    )
+    t0 = time.time()
+    try:
+        resp = client.messages.create(
+            model=config.spark_model,
+            max_tokens=config.spark_max_tokens,
+            messages=[{"role": "user", "content": instruction}],
+        )
+    except Exception as e:  # loud + ours to fix; name the one thing to check
+        return DispatchResult(
+            False, "",
+            f"the Spark model didn't answer ({type(e).__name__}: {e}) — is vLLM serving "
+            f"{config.spark_model!r} at {config.spark_base_url}?",
+            "", None, 0.0, "",
+        )
+    elapsed = time.time() - t0
+    text = "".join(
+        getattr(b, "text", "") for b in (resp.content or []) if getattr(b, "type", "") == "text"
+    ).strip()
+    if not text:
+        broke, delivered = "the Spark model returned an empty response", False
+    else:
+        broke, delivered = None, True
+    summary = f"{elapsed:.0f}s; {len(text)} chars from {config.spark_model}. {text[:400]}"
+    return DispatchResult(delivered, summary, broke, "", None, 0.0, getattr(resp, "id", ""))

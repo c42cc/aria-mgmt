@@ -93,6 +93,9 @@ the build-time IDE agent only; they are inert to Aria's runtime engine.
 | Loops (capability as data) | `loops/*.yaml` + `src/loops.py` |
 | Engine (Claude Code) | `src/engine_claude_code.py` |
 | Dispatcher (ground-truth verify) | `src/dispatcher.py` |
+| The house (Phase 4): Home Assistant endpoint + actuation/ground-truth verify | `src/homeassistant.py` + `src/dispatcher.py::_run_home` + `loops/home-*.yaml` |
+| The Spark endpoint (local model as executor) | `src/dispatcher.py::_run_spark` + `loops/local-ask.yaml` |
+| Phase-4 physical verify (camera frame + Gemini) | `src/home_verify.py` (`python -m src.home_verify`) |
 | Durable conversation (memory + per-turn metrics) | `src/conversation.py` (`data/aria.db`) |
 | Durable facts / outcome log | `src/memory.py` · `src/outcome_log.py` |
 | The measurement loop (the review) | `src/review.py` (`python -m src.review`) |

@@ -52,6 +52,27 @@ class Config:
     # This is the co-located Phase-0 scope; Phase 3 adds per-endpoint scoping.
     claude_code_permission_mode: str = os.getenv("ARIA_CC_PERMISSION_MODE", "bypassPermissions").strip()
 
+    # ── The house (Phase 4) — Home Assistant endpoint ──────────────────────
+    # Aria controls the physical house through ONE substrate: Home Assistant.
+    # Empty = the house endpoint reports "not configured" (honest, never a silent
+    # fallback). Set both to point at your HA instance (local-first, over
+    # Tailscale). The token is a long-lived HA access token. The conductor turns
+    # speech into (device, action); the endpoint actuates HA's REST API and
+    # verifies against GROUND TRUTH (re-reads the entity state) — the LLM is never
+    # on the actuation hot path.
+    hass_url: str = os.getenv("HASS_URL", "").strip().rstrip("/")
+    hass_token: str = field(default=os.getenv("HASS_TOKEN", "").strip(), repr=False)
+    hass_timeout_sec: float = float(os.getenv("HASS_TIMEOUT_SEC", "15"))
+
+    # ── Spark endpoint — a local open-source model as an executor ───────────
+    # The DGX Spark returns "as an endpoint, never as core" (ABSENCES.md): a loop
+    # with endpoint `spark` runs on a model served locally on the Spark (vLLM
+    # serves the Anthropic Messages API natively, so the anthropic SDK with this
+    # base_url drives it unchanged). Empty = the endpoint reports "not configured".
+    spark_base_url: str = os.getenv("SPARK_BASE_URL", "").strip().rstrip("/")
+    spark_model: str = os.getenv("SPARK_MODEL", "local-brain").strip()
+    spark_max_tokens: int = int(os.getenv("SPARK_MAX_TOKENS", "4096"))
+
     # ── Cost / time guardrails ─────────────────────────────────────────────
     daily_spend_cap_usd: float = float(os.getenv("DAILY_SPEND_CAP_USD", "20"))
     anthropic_timeout_sec: float = float(os.getenv("ANTHROPIC_TIMEOUT_SEC", "120"))
