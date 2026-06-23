@@ -1,4 +1,4 @@
-# UCS Wiring
+# Aria Wiring
 
 How the pieces named in [`ARCHITECTURE.md`](./ARCHITECTURE.md) actually connect:
 process topology, IPC protocols, audio direction conventions, callback

@@ -7,8 +7,8 @@ import os
 import re
 from typing import Any
 
-from .config import config
-from .db import (
+from ..config import config
+from ..db import (
     get_next_prompt_version,
     get_prompt_version_content,
     get_prompt_versions,

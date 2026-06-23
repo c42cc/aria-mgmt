@@ -14,7 +14,7 @@ from google import genai
 from google.genai import types
 
 from .config import config
-from .prompts import load_template
+from .constructor.prompts import load_template
 
 log = logging.getLogger(__name__)
 
@@ -1305,7 +1305,7 @@ class GeminiSession:
         the conversation feels continuous.
         """
         async with self._lifecycle_lock:
-            from .prompts import clear_cache
+            from .constructor.prompts import clear_cache
             clear_cache()
             self._served_fc_ids.clear()
             context = self.get_transcript_context(max_turns=5)

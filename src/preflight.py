@@ -850,7 +850,7 @@ async def probe_applescript_cursor() -> tuple[bool, str, str, str]:
 
 async def probe_prompts() -> tuple[bool, str, str, str]:
     """All prompt templates load without falling back."""
-    from .prompts import load_template
+    from .constructor.prompts import load_template
 
     templates = [
         "gemini_system",

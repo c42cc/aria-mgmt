@@ -1,8 +1,20 @@
-# UCS — Universal Capability System
+# The Universal Constructor
+
+> Aria *wields* this; she is not this. The Universal Constructor is the
+> inspectable program — a prompt library and the loops that run and rewrite it —
+> that Aria runs on. It is documented here as its own subsystem, separable from
+> Aria and portable beyond her. For how Aria the shell uses it, see
+> [`VISION_ARIA.md`](./VISION_ARIA.md) and [`ARCHITECTURE.md`](./ARCHITECTURE.md);
+> for the north-star essay and live trace, see
+> [`docs/universal_constructor.html`](./docs/universal_constructor.html). The
+> realized code lives under [`src/constructor/`](src/constructor/).
+>
+> ("UCS", the `ucs2` directory, and the `#ucs` Discord channels are legacy
+> identifiers for the repo and its channels — not names for this engine.)
 
 ## Vision
 
-A self-improving prompt orchestration engine that manages, injects, executes, and evaluates prompts across heterogeneous model backends. Designed to be portable — runs locally, ships to friends, works everywhere.
+A self-improving prompt orchestration engine that manages, injects, executes, and evaluates prompts across heterogeneous model backends. Designed to be portable — runs locally, ships to friends, works everywhere. It is the *program*; the shell that wields it (Aria) is a separate concern.
 
 ---
 
@@ -23,7 +35,7 @@ Everything else in the system is a composition of these four.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    UCS Runtime                       │
+│                    Constructor                       │
 │                                                      │
 │  ┌──────────┐   ┌──────────────┐   ┌──────────────┐ │
 │  │  Prompt   │──▶│  Injection   │──▶│ Intelligence │ │
@@ -171,18 +183,22 @@ Atomic prompts can be composed into chains declaratively. A `pipeline.yaml` defi
 
 ## Implementation Status
 
-UCS was integrated into Aria using a phased approach: grow each piece
-alongside the existing system, prove it independently, then let the
-unification emerge naturally.
+The Constructor is regrouped under one namespace, [`src/constructor/`](src/constructor/),
+so it stays separable from Aria's shell. It was grown alongside the existing
+system, proven independently, then unified — and the pieces that merely
+duplicated Aria's *execution engine* (her one agent loop) were deleted rather
+than kept as a parallel layer.
 
 | Primitive | Status | Where |
 |---|---|---|
-| Prompt Library (version control) | **Implemented** | `src/prompts.py` — version archival in `prompt_versions` table with origin tracking, rollback by voice |
-| Prompt Library (metadata/affinity) | Deferred | Not yet needed — Phase 1 data doesn't show model-specific prompt tuning demand |
-| Injection Engine (context budget) | **Folded in** | Context-budget truncation now lives in the single agent loop; `loop_executions` still records `context_truncated` / `turns_dropped`. |
-| Intelligence Loop | **Removed** | The flag-gated `src/ucs.py` `IntelligenceLoop` (`UCS_ENABLED`) was a dormant duplicate of the agent loop and was deleted; there is one loop, in `src/tools.py`. |
-| Model Router | **Removed** | `src/ucs.py` `ModelRouter` went with the flag; `models.yaml` is still read for model config (`src/config.py`, `src/tools.py`). |
-| Evaluation Layer | **Implemented** (offline CLI) | `src/eval.py` — approval-rate scoring from execution logs |
+| Constructor namespace (the program, regrouped) | **Implemented** | `src/constructor/` — `prompts.py`, `eval.py`, `prompt_tools.py` |
+| Prompt Library (version control) | **Implemented** | `src/constructor/prompts.py` — version archival in the `prompt_versions` table with origin tracking, rollback by voice |
+| Prompt Library (metadata/affinity) | Deferred | Not yet needed — usage data doesn't show model-specific prompt-tuning demand |
+| Injection Engine (`{{include}}` / `{{variable}}`) | **Implemented** | `src/constructor/prompts.py` — recursive, cycle-guarded include resolution, assembled into calls by the agent loop |
+| Injection Engine (context budget) | **Folded in** | Context-budget truncation lives in Aria's single agent loop; `loop_executions` records `context_truncated` / `turns_dropped` |
+| Intelligence Loop | **Removed** | The flag-gated `src/ucs.py` `IntelligenceLoop` (`UCS_ENABLED`) duplicated Aria's *execution engine* (her one agent loop), not the Constructor's library/eval; deleted. There is one loop, in `src/tools.py` |
+| Model Router | **Removed** | `src/ucs.py` `ModelRouter` went with the flag; `models.yaml` is still read for model config (`src/config.py`, `src/tools.py`) |
+| Evaluation Layer (the "improve" loop) | **Implemented** (offline CLI) | `src/constructor/eval.py` — approval-rate scoring from execution logs; `python -m src.constructor.eval` |
 | Model Registry | **Implemented** | `models.yaml` — single source of truth for models, costs, capabilities |
 | Execution Logging | **Implemented** | `loop_executions` table — every reasoning call logged with model/tokens/latency/cost |
 | Prompt Composability | Deferred | Not yet needed |

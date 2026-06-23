@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from src import prompts
+from src.constructor import prompts
 
 
 class PromptIncludes(unittest.TestCase):

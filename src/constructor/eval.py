@@ -1,6 +1,6 @@
 """UCS Evaluation Layer — offline prompt quality scoring.
 
-Run via CLI:  python -m src.eval [command]
+Run via CLI:  python -m src.constructor.eval [command]
 
 Governance: this module ADVISES. It never calls save_template or
 rollback_template. User voice edits always win. See ARCHITECTURE.md
@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .db import get_connection
+from ..db import get_connection
 
 log = logging.getLogger(__name__)
 
@@ -161,14 +161,14 @@ class EvalRunner:
 def _cli_main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    from .db import init_db
+    from ..db import init_db
     init_db()
 
     args = sys.argv[1:]
     runner = EvalRunner()
 
     if not args or args[0] == "help":
-        print("Usage: python -m src.eval <command> [prompt_name]")
+        print("Usage: python -m src.constructor.eval <command> [prompt_name]")
         print()
         print("Commands:")
         print("  rate <prompt_name>     Show approval rates per version")

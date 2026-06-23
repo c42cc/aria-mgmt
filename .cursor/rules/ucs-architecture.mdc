@@ -1,9 +1,9 @@
 ---
-description: UCS architecture invariants and project conventions
+description: Aria architecture invariants and project conventions
 alwaysApply: true
 ---
 
-# UCS — Project Conventions
+# Aria — Project Conventions
 
 Read [`ARCHITECTURE.md`](../../ARCHITECTURE.md) and [`wiring.md`](../../wiring.md)
 when you need a map of the system. They are the source of truth. This file is
@@ -82,12 +82,23 @@ point.
 Do not introduce a fourth store. Do not abstract these behind a data access
 layer.
 
-## Behavior lives in `prompts/`
+## Behavior lives in `prompts/`; the engine is the Universal Constructor
 
 Personas and reusable instructions are markdown files. Edit a file, reload
 (`!reload` or the `reload_prompts` tool), and behavior changes. Do not
 embed long instruction strings in Python; put them in `prompts/` and load
-via `prompts.load_template(name)`.
+via `src.constructor.prompts.load_template(name)`.
+
+The prompt library, its `{{include}}` / `{{variable}}` injection, version
+control, and the offline eval loop are the **Universal Constructor**, and they
+live under `src/constructor/` (`prompts.py`, `eval.py`, `prompt_tools.py`). It
+is a subsystem Aria **wields**, not Aria herself — keep the two untangled. Aria
+(the shell: voice/reason/build roles, dispatch, the one agent loop in
+`src/tools.py`, MCP, memory, capabilities) *uses* the Constructor through her
+prompt-management tools; do not commingle Aria's runtime wiring back into
+`src/constructor/`. The structured-state tables it reads/writes
+(`prompt_versions`, `eval_results`) stay in `src/db.py`. See
+`VISION_CONSTRUCTOR.md`.
 
 ## Channels by ID, not name
 

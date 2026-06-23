@@ -59,14 +59,15 @@ from .outcomes import (
     is_discovery_family,
 )
 from .memory import recall as mem_recall, remember as mem_remember, forget as mem_forget
-from .prompts import (
-    clear_cache as prompts_clear_cache,
-    get_versions as prompts_get_versions,
-    list_templates,
-    load_template,
-    read_raw,
-    rollback_template,
-    save_template,
+from .constructor.prompts import load_template
+from .constructor.prompt_tools import (
+    edit_prompt,
+    init_prompt_tools,
+    list_prompts,
+    prompt_versions,
+    reload_prompts,
+    rollback_prompt,
+    show_prompt,
 )
 from . import spark
 
@@ -434,6 +435,17 @@ def _get_model_costs() -> tuple[float, float]:
     )
 
 
+def _invalidate_model_costs_cache() -> None:
+    """Drop the cached models.yaml costs so the next call re-reads them.
+
+    Injected into the Universal Constructor's reload_prompts tool (the
+    user-facing "reload runtime config" hook) so a model swap via .env + a
+    prompt reload picks up new per-token costs.
+    """
+    global _model_costs_cache
+    _model_costs_cache = None
+
+
 def _estimate_cost(
     input_tokens: int,
     output_tokens: int,
@@ -690,6 +702,20 @@ def init_tools(
     from . import cursor_tools
     cursor_tools.init_cursor_tools(cursor_bridge)
 
+    # Hand the Universal Constructor's prompt tools the Aria-side glue they
+    # need (Anthropic client, Discord callbacks, session reconnect, cost
+    # accounting). The dispatch catalog stays here; the handlers live in
+    # src/constructor/prompt_tools.py.
+    init_prompt_tools(
+        anthropic_client=_anthropic_client,
+        post_callback=_post_callback,
+        alert_callback=_alert_callback,
+        reconnect_callback=_reconnect_callback,
+        estimate_cost=_estimate_cost,
+        state_for=_state_for,
+        invalidate_model_costs=_invalidate_model_costs_cache,
+    )
+
 
 def set_transcript_provider(provider: Callable[[], list[dict[str, str]]]) -> None:
     """Inject the transcript source. Called by bot.py after Gemini session is created."""
@@ -799,12 +825,12 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "confirm_action": _confirm_action_noop,
         "quick_email_check": _quick_email_check,
         "quick_calendar": _quick_calendar,
-        "list_prompts": _list_prompts,
-        "show_prompt": _show_prompt,
-        "edit_prompt": _edit_prompt,
-        "rollback_prompt": _rollback_prompt,
-        "prompt_versions": _prompt_versions,
-        "reload_prompts": _reload_prompts,
+        "list_prompts": list_prompts,
+        "show_prompt": show_prompt,
+        "edit_prompt": edit_prompt,
+        "rollback_prompt": rollback_prompt,
+        "prompt_versions": prompt_versions,
+        "reload_prompts": reload_prompts,
         "get_focused_app": _get_focused_app,
         "focus_app": _focus_app,
         "dictate_into_focused_app": _dictate_into_focused_app,
@@ -3189,131 +3215,13 @@ async def _quick_calendar(days_ahead: int = 1) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompt management tools
+# Prompt management tools — Aria's hands on the Universal Constructor.
+# The handlers now live in src/constructor/prompt_tools.py (list / show / edit /
+# rollback / versions / reload). They are imported at the top of this file and
+# registered in the dispatch catalog below; their Aria-side glue (Anthropic
+# client, post/alert callbacks, session reconnect, cost accounting) is injected
+# via init_prompt_tools(...) from init_tools().
 # ---------------------------------------------------------------------------
-
-async def _list_prompts() -> str:
-    names = list_templates()
-    return json.dumps({"prompts": names})
-
-
-async def _show_prompt(name: str) -> str:
-    try:
-        content = read_raw(name)
-    except FileNotFoundError:
-        return json.dumps({"error": f"Prompt '{name}' not found. Available: {list_templates()}"})
-
-    if _post_callback:
-        asyncio.create_task(_post_callback(f"**Prompt: `{name}`**\n\n{content}"))
-
-    summary = content[:300].replace("\n", " ")
-    if len(content) > 300:
-        summary += "..."
-    return json.dumps({"name": name, "length": len(content), "summary": summary})
-
-
-async def _edit_prompt(name: str, instruction: str, session_key: str = "") -> str:
-    if not _anthropic_client:
-        return json.dumps({"error": "Anthropic client not initialized"})
-    state = _state_for(session_key)
-    state.claude_calls += 1
-    if state.claude_calls > config.per_session_claude_calls_max:
-        return json.dumps({"error": f"Per-session Claude call limit ({config.per_session_claude_calls_max}) reached"})
-
-    try:
-        current = read_raw(name)
-    except FileNotFoundError:
-        return json.dumps({"error": f"Prompt '{name}' not found. Available: {list_templates()}"})
-
-    response = await asyncio.to_thread(
-        _anthropic_client.messages.create,
-        model=config.claude_model,
-        system=(
-            "You are editing a prompt template. Return ONLY the complete "
-            "edited content. Do not wrap in markdown code fences. Do not "
-            "add commentary before or after. Just the updated prompt text."
-        ),
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Current prompt:\n\n{current}\n\n---\n\n"
-                f"Edit instruction: {instruction}\n\n"
-                "Return the complete updated prompt."
-            ),
-        }],
-        max_tokens=4096,
-    )
-
-    new_content = response.content[0].text
-
-    if response.usage:
-        cost = _estimate_cost(response.usage.input_tokens, response.usage.output_tokens)
-        log_event("edit_prompt", {"name": name}, instruction[:200], 0, "", cost)
-
-    save_template(name, new_content, origin="user")
-
-    if _post_callback:
-        asyncio.create_task(_post_callback(
-            f"**Updated prompt: `{name}`**\n\n{new_content}"
-        ))
-
-    needs_reload = name == "gemini_system"
-    return json.dumps({
-        "ok": True,
-        "name": name,
-        "needs_reload": needs_reload,
-        "message": (
-            f"Prompt '{name}' updated. "
-            + ("Call reload_prompts to apply changes to your system prompt."
-               if needs_reload else "Changes take effect on next use.")
-        ),
-    })
-
-
-async def _rollback_prompt(name: str, version: int) -> str:
-    try:
-        content = rollback_template(name, version)
-    except (FileNotFoundError, ValueError) as e:
-        return json.dumps({"error": str(e)})
-
-    if _post_callback:
-        asyncio.create_task(_post_callback(
-            f"**Rolled back prompt: `{name}` to v{version}**\n\n{content}"
-        ))
-
-    needs_reload = name == "gemini_system"
-    return json.dumps({
-        "ok": True,
-        "name": name,
-        "restored_version": version,
-        "needs_reload": needs_reload,
-        "message": (
-            f"Prompt '{name}' rolled back to version {version}. "
-            + ("Call reload_prompts to apply changes to your system prompt."
-               if needs_reload else "Changes take effect on next use.")
-        ),
-    })
-
-
-async def _prompt_versions(name: str) -> str:
-    versions = prompts_get_versions(name)
-    if not versions:
-        return json.dumps({"name": name, "versions": [], "message": "No version history yet."})
-    return json.dumps({"name": name, "versions": versions})
-
-
-async def _reload_prompts() -> str:
-    global _model_costs_cache
-    prompts_clear_cache()
-    _model_costs_cache = None
-
-    if _reconnect_callback:
-        await _reconnect_callback()
-
-    if _alert_callback:
-        asyncio.create_task(_alert_callback("Prompts reloaded. Gemini session reconnected."))
-
-    return json.dumps({"ok": True, "message": "Prompt cache cleared. Session reconnected."})
 
 
 # ---------------------------------------------------------------------------

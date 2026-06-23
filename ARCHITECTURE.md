@@ -1,8 +1,8 @@
-# UCS Architecture
+# Aria Architecture
 
 A map for a senior engineer with full repo access and limited memory of the system.
-This document describes what UCS is, the primitives it stands on, the layers it
-runs through, the capabilities it exposes, and where each thing lives in the repo.
+This document describes what Aria is, the primitives she stands on, the layers she
+runs through, the capabilities she exposes, and where each thing lives in the repo.
 
 For process topology, IPC, audio formats, and lifecycle wiring, read
 [`wiring.md`](./wiring.md).
@@ -86,7 +86,22 @@ Tools fall into a few flavors:
 - **Self-management** to list, view, edit, and reload the prompt templates
   themselves so the user can tune behavior by voice.
 
-### Prompts as Editable Behavior
+### The Universal Constructor — Editable Behavior
+
+Aria's behavior is a **program she can edit**, and that program is a distinct
+subsystem she *wields* — not Aria herself. The **Universal Constructor**
+(`src/constructor/`) is the prompt library, the `{{include:}}` / `{{variable}}`
+injection that assembles prompts into model calls, version control over every
+edit, and the offline eval loop that scores prompt versions against real usage.
+Aria reaches it through her prompt-management tools (list / show / edit /
+rollback / versions / reload, in `src/constructor/prompt_tools.py`, registered
+in the catalog in `src/tools.py`); the engine itself (`prompts.py`, `eval.py`)
+holds no Discord, Gemini, or MCP wiring. The boundary is deliberate and is the
+whole point: the Constructor is the inspectable *program*; Aria is the shell
+that runs it. Her single agent loop (`src/tools.py::_do_with_claude_loop`) is
+the execution engine the injected program feeds; the eval loop only ADVISES
+(Fundamental 13). North-star vision: `VISION_CONSTRUCTOR.md` and
+`docs/universal_constructor.html`.
 
 Every persona and every reusable instruction is a markdown template in
 `prompts/`. The bot reads them at runtime. The user can ask Aria to edit her
@@ -97,7 +112,7 @@ The engineering doctrine has exactly one home, `prompts/_principles.md`
 (operate on the primitive; fewest moving parts; reuse over rebuild; no legacy;
 all failures observable; halt don't heal; state what you checked; done means
 verified). Every reasoning/build persona **references** it with a
-`{{include:_principles}}` directive that `src/prompts.py::load_template`
+`{{include:_principles}}` directive that `src/constructor/prompts.py::load_template`
 resolves at load time (recursively, cycle-guarded; a missing include or a cycle
 raises loudly) — so the rigor is part of every plan/build/verify call by
 construction and cannot drift. `scripts/lint_principles_include.sh` reds the
@@ -263,8 +278,8 @@ There is deliberately **one** agent loop and one planning path — an earlier
 flag-gated duplicate (`UCS_ENABLED` / `src/ucs.py`) of the most failure-prone
 primitive drifted (no dollar cap, no local tools) and was removed. Every loop
 execution is still logged to the `loop_executions` table (model, tokens, cost,
-truncation) for observability; the offline eval CLI (`src/eval.py`) reads that
-table to score prompt versions by approval rate. Model configuration and loop
+truncation) for observability; the offline eval CLI (`src/constructor/eval.py`)
+reads that table to score prompt versions by approval rate. Model configuration and loop
 profiles live in `models.yaml`.
 
 ### State
@@ -465,7 +480,7 @@ points; cross-references inside the code are reliable.
 | Judge calibration (earns the right to gate) | `src/judge_calibration.py` + `evals/calibration_corpus.json` |
 | The one gate (the door to main) | `scripts/gate.sh` |
 | Enforce-by-absence ledger + checker | `configs/structural_absences.json` + `tools/structural_absence_check.py` |
-| Offline eval CLI (scores prompt versions from `loop_executions`) | `src/eval.py` |
+| Offline eval CLI (scores prompt versions from `loop_executions`) | `src/constructor/eval.py` |
 | Product correctness harness | `src/judge.py` + `specs/correctness/` |
 | MCP client and dispatch | `src/mcp.py` |
 | Cursor bridge (Python side) | `src/cursor_bridge.py` |
@@ -487,6 +502,21 @@ points; cross-references inside the code are reliable.
 | Audit log | `src/mcp.py` (writer) + `data/audit.jsonl` |
 | Configuration | `src/config.py` + `.env` |
 | Model registry | `models.yaml` |
+
+### The Universal Constructor
+
+The program Aria wields, regrouped under one namespace so it stays separable
+from her shell. Aria *uses* this; she is not commingled with it.
+
+| What | Where |
+|---|---|
+| The package (the program Aria wields) | `src/constructor/` |
+| Prompt library + `{{include:}}`/`{{variable}}` injection + version control | `src/constructor/prompts.py` |
+| Improve/eval loop (scores prompt versions; advises rollback; never overrides) | `src/constructor/eval.py` |
+| Aria's prompt-management tools (list/show/edit/rollback/versions/reload) | `src/constructor/prompt_tools.py` (catalog registered in `src/tools.py`) |
+| Version + eval tables (the structured-state home) | `src/db.py` (`prompt_versions`, `eval_results`) |
+| The prompt templates themselves (behavior as data) | `prompts/*.md` |
+| Vision + north-star | `VISION_CONSTRUCTOR.md`, `docs/universal_constructor.html` |
 
 ### Editable behavior
 

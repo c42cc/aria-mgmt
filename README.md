@@ -1,4 +1,4 @@
-# UCS — Aria
+# Aria
 
 **A voice-first personal operating shell.** You talk to a Discord bot named
 **Aria** from your phone. She speaks back conversationally and, behind the
@@ -38,8 +38,14 @@ this is going, read [`VISION_ARIA.md`](./VISION_ARIA.md).
 - **Tools** are the action surface. Gemini doesn't touch the world directly; it
   calls Python tool handlers on a fixed catalog, with cost and risk-tier checks
   applied mechanically at dispatch.
-- **Prompts are behavior.** Every persona/instruction is a markdown file in
-  `prompts/`, read at runtime. Editing a file changes behavior on the next call.
+- **Prompts are behavior, and that behavior is a program she edits.** Every
+  persona/instruction is a markdown file in `prompts/`, read at runtime. That
+  library — plus the injection, version control, and eval loop that operate on
+  it — is the **Universal Constructor** ([`src/constructor/`](src/constructor/)),
+  the inspectable program Aria *wields*. She edits, versions, and rolls back her
+  own prompts by voice; a change takes effect on the next call. The Constructor
+  is a subsystem Aria uses, not Aria herself — see
+  [`VISION_CONSTRUCTOR.md`](./VISION_CONSTRUCTOR.md).
 - **Failures are loud.** Preflight probes every capability end-to-end and
   refuses to enter ready state on a critical failure, with the exact fix.
 
@@ -141,7 +147,7 @@ A concept-to-file index lives in [`ARCHITECTURE.md`](./ARCHITECTURE.md)'s
 |---|---|
 | [`README.md`](./README.md) | This file — what Aria is and how to run her |
 | [`VISION_ARIA.md`](./VISION_ARIA.md) | What Aria is and where she's going |
-| [`VISION_UCS.md`](./VISION_UCS.md) | The Universal Constructor System vision |
+| [`VISION_CONSTRUCTOR.md`](./VISION_CONSTRUCTOR.md) | The Universal Constructor — the prompt library + injection + eval engine Aria wields |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Primitives, layers, capabilities, repo map |
 | [`wiring.md`](./wiring.md) | Process topology, IPC, audio, lifecycle wiring |
 | [`docs/`](./docs/) | Reference docs, forensics, archived planning briefs |

@@ -2905,7 +2905,7 @@ async def reload(ctx: commands.Context):
     if not _is_authorized(ctx.author.id):
         await ctx.send("Not authorized.")
         return
-    from .prompts import clear_cache
+    from .constructor.prompts import clear_cache
     clear_cache()
     if gemini and gemini.connected:
         await ctx.send("Reloading prompts and reconnecting Gemini...")

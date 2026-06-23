@@ -30,10 +30,27 @@ def test_db_init():
 
 
 def test_prompts_load():
-    from src.prompts import load_template
+    from src.constructor.prompts import load_template
     planning = load_template("planning")
     assert "implementation plan" in planning.lower() or "plan" in planning.lower()
     print("PASS: prompts load")
+
+
+def test_constructor_namespace():
+    """The Universal Constructor is single-homed in src/constructor/ — Aria
+    wields it, she is not commingled with it. The old loose modules stay gone."""
+    import os
+    import src.constructor.prompts  # noqa: F401
+    import src.constructor.eval  # noqa: F401
+    import src.constructor.prompt_tools  # noqa: F401
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for legacy in ("src/prompts.py", "src/eval.py"):
+        assert not os.path.exists(os.path.join(repo, legacy)), (
+            f"{legacy} resurrected — the Universal Constructor lives in "
+            "src/constructor/, not loose in src/"
+        )
+    print("PASS: constructor namespace single-homed")
 
 
 def test_voice_bridge_module():
@@ -116,7 +133,7 @@ def test_prompt_versioning():
     """save_template archives old content with origin; rollback restores it."""
     import tempfile
     from src.db import init_db, get_connection
-    from src.prompts import save_template, get_versions, rollback_template, get_path, read_raw
+    from src.constructor.prompts import save_template, get_versions, rollback_template, get_path, read_raw
 
     init_db()
 
@@ -306,7 +323,7 @@ def test_eval_approval_rate():
         started_at="2026-01-01T00:03:00Z",
     )
 
-    from src.eval import EvalRunner
+    from src.constructor.eval import EvalRunner
     runner = EvalRunner()
     scores = runner.approval_rate("planning")
 
@@ -364,7 +381,7 @@ def test_eval_compare_versions():
         started_at="2026-01-01T00:03:00Z",
     )
 
-    from src.eval import EvalRunner
+    from src.constructor.eval import EvalRunner
     runner = EvalRunner()
     scores = runner.compare_versions("_cmp_smoke")
 
@@ -380,7 +397,7 @@ def test_eval_compare_versions():
 
 def test_eval_never_writes_prompts():
     """Eval module has no import of save_template or rollback_template."""
-    import src.eval as eval_mod
+    import src.constructor.eval as eval_mod
 
     source_file = eval_mod.__file__
     with open(source_file) as f:
@@ -407,6 +424,7 @@ if __name__ == "__main__":
     test_config_loads()
     test_db_init()
     test_prompts_load()
+    test_constructor_namespace()
     test_voice_bridge_module()
     test_voice_bridge_node_syntax()
     test_voice_bridge_playback_pipeline()

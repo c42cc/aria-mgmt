@@ -190,7 +190,7 @@ async def run():
 
         # 13. prompt_versions row after edit_prompt
         print("[13] prompt_versions after edit...")
-        from src.prompts import save_template, get_versions, get_path, read_raw
+        from src.constructor.prompts import save_template, get_versions, get_path, read_raw
         test_name = "_deep_test_prompt"
         test_path = get_path(test_name)
         try:

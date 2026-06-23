@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.claude_code import ClaudeCodeBridge, DEFAULT_CLAUDE_CODE_REPO  # noqa: E402
 from src.config import config  # noqa: E402
 from src.cursor_registry import cursor_registry  # noqa: E402
-from src.prompts import load_template  # noqa: E402
+from src.constructor.prompts import load_template  # noqa: E402
 
 MODEL = "claude-opus-4-8"
 REPO = DEFAULT_CLAUDE_CODE_REPO
