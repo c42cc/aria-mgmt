@@ -394,6 +394,34 @@ directly instead of Discord. Same tool surface, same prompts, same MCP
 fleet — only the transport is different. Useful for debugging and for
 running offline of Discord.
 
+### Local Spark Agent — a local-brained chat window (no Discord, no cloud)
+
+A browser chat window (`src/local_chat_web.py`, an aiohttp + SSE server on the
+LAN/Tailscale) over the **same** agent loop and MCP fleet, but with the brain
+**served locally on the DGX Spark** instead of cloud Claude. The whole change is
+one primitive relocated, not a new agent:
+
+- **The brain is a `base_url`.** vLLM on the Spark serves the Anthropic Messages
+  API natively (`/v1/messages`), so pointing the SDK there runs
+  `tools._do_with_claude_loop` **byte-for-byte** on an open-source model. The
+  knob is `config.brain_base_url` (`ANTHROPIC_BASE_URL`): empty → cloud Opus (the
+  main bot); set → the Spark (the local chat process). Same loop, env-
+  differentiated per process — no flag, no router (`ModelRouter` stays gone; the
+  `fallback_to_cloud` anti-pattern is ledgered absent).
+- **Serving lives in `src/spark.py`** (`serve_start/stop/status`, the serve-gate
+  assertions) driving the idempotent node-side `ops/spark/serve_model.sh` (vLLM
+  under tmux, or the NGC container). Single-node, independent-worker only — the
+  throttled cluster link (NODES.md §9) is out of scope.
+- **Verified the way everything is verified.** `scripts/spark_serve.py` proves the
+  serve good states twice (machine + Gemini screenshot), most importantly the
+  `tool_use` round-trip (the #1 OSS risk); `scripts/live_meter.py --base-url`
+  writes a `<build_hash>.local.json` receipt that a real request fired a real
+  tool on the Spark brain; `scripts/local_chat_gate.py` screenshots the actual
+  browser window and Gemini-confirms a tool-backed answer.
+- **Halt, don't heal.** If the local brain is unconfigured or unreachable, the
+  chat process refuses to start with the one-command fix. There is **no** silent
+  fallback to cloud — that would hide the exact failure the user must see.
+
 ### Cursor-Watch (External Cursor Observer)
 
 Aria watches every Cursor IDE window on the Mac — the threads the user drives
@@ -556,6 +584,13 @@ from her shell. Aria *uses* this; she is not commingled with it.
 | DGX Spark cluster bring-up (Section B, CX-7 link + netplan) | `ops/spark/cluster_up.sh` |
 | DGX Spark 2-node NCCL all-reduce smoke test | `ops/spark/nccl_smoke.sh` |
 | DGX Spark cluster acceptance (capture + Gemini visual verify) | `scripts/spark_cluster.py` |
+| DGX Spark local-brain serving (serve_start/stop/status + serve-gate asserts) | `src/spark.py` (serve section) |
+| DGX Spark serve engine (vLLM under tmux / NGC container; idempotent; teardown) | `ops/spark/serve_model.sh` |
+| Local-brain serve acceptance + model bench (capture + Gemini) | `scripts/spark_serve.py` |
+| Local chat window (browser chat over the loop, local brain, SSE) | `src/local_chat_web.py` |
+| Local chat web-UI acceptance (browser screenshot + Gemini) | `scripts/local_chat_gate.py` |
+| Brain-location knob (empty → cloud Opus; set → Spark vLLM /v1/messages) | `src/config.py` (`brain_base_url`) + `src/tools.py::init_tools` |
+| Local-brain runtime receipt (a real request fired a real tool on the Spark) | `scripts/live_meter.py --base-url` |
 | DGX Spark ops notes + Aria capability | `ops/spark/NODES.md` |
 
 ### Runtime state (gitignored)

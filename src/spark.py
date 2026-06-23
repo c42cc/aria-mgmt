@@ -1035,3 +1035,323 @@ def fetch_results(node: str, run_id: str, *, branch: str | None = None,
             f"git -C {LV4_LOCAL} fetch {artifacts['bundle_path']} {branch}:{branch} "
             f"&& git -C {LV4_LOCAL} push origin {branch}")
     return artifacts
+
+
+# ===========================================================================
+# Local-brain model serving (Section C, simplified for the chat agent)
+# ===========================================================================
+# Aria's one agent loop speaks the Anthropic Messages API. vLLM now serves that
+# API natively (/v1/messages — vLLM #22627 + #27882), so serving an open-source
+# model HERE and pointing ANTHROPIC_BASE_URL at this node makes the loop run on a
+# LOCAL brain with ZERO loop changes. This is the relocation of the dysfunctional
+# primitive — a remote, metered, cloud-bound brain — into a local weights
+# artifact behind the same interface the loop already uses.
+#
+# ops/spark/serve_model.sh is the node-side engine (vLLM under tmux, or the NGC
+# container); these functions are the Mac-side orchestration over Tailscale SSH,
+# plus the PURE assertions the serve gate (scripts/spark_serve.py) proves twice
+# (machine + an independent Gemini reading of a Terminal screenshot).
+#
+# Single-node, independent-worker only (Profile 1). The 2-node cluster link is
+# power-throttled (NODES.md §9), so distributed inference is out of scope here.
+
+SERVE_SCRIPT = REPO_ROOT / "ops" / "spark" / "serve_model.sh"
+SERVE_PORT = 8000
+SERVE_SESSION = "vllm_serve"
+SERVED_NAME = "local-brain"               # the stable --served-model-name
+# A loaded model holds far more than this; the floor only separates "weights
+# resident" from "GPU idle" so the gate can tell the server actually loaded.
+SERVE_GPU_MIN_USED_MIB = 20_000
+
+# Bench candidates. The bench step (scripts/spark_serve.py --bench) stands up
+# each behind the SAME served name and picks the default on tool-call
+# reliability + latency — the choice is a one-env-var swap, never a code change.
+SERVE_MODELS: dict[str, dict] = {
+    "gpt-oss-120b": {
+        "hf": "openai/gpt-oss-120b", "parser": "openai",
+        "max_model_len": 65536, "gpu_mem_util": "0.85",
+        "note": "MXFP4 MoE, ~56-60 tok/s on GB10, ~100GB — most capable but quick",
+    },
+    "qwen3-30b-a3b": {
+        "hf": "Qwen/Qwen3-30B-A3B", "parser": "hermes",
+        "max_model_len": 65536, "gpu_mem_util": "0.80",
+        "note": "30B-A3B MoE — snappier first token, more room for context/concurrency",
+    },
+}
+DEFAULT_SERVE_MODEL = "gpt-oss-120b"
+
+
+def serve_endpoint(node: str, port: int = SERVE_PORT) -> str:
+    """Base URL the Mac (and Aria's local-brain process) use to reach the node's
+    vLLM over Tailscale. Uses the tailnet IP (MagicDNS does not resolve from the
+    Mac shell — NODES.md §2)."""
+    _alias, ip, _role = resolve_node(node)
+    return f"http://{ip}:{port}"
+
+
+def _resolve_serve_model(model: str | None) -> tuple[str, dict]:
+    """(key, cfg) for a registry name OR an ad-hoc HF id (hermes parser default)."""
+    key = (model or DEFAULT_SERVE_MODEL).strip()
+    if key in SERVE_MODELS:
+        return key, SERVE_MODELS[key]
+    return key, {
+        "hf": key, "parser": "hermes", "max_model_len": 65536,
+        "gpu_mem_util": "0.80", "note": "ad-hoc model id (not in registry)",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mac-side orchestration: pipe serve_model.sh over SSH (mirrors setup()).
+# ---------------------------------------------------------------------------
+
+def _pipe_serve(node: str, subcmd: str, env_prefix: str = "", *, timeout: float = 60.0):
+    alias, _ip, _role = resolve_node(node)
+    if not SERVE_SCRIPT.exists():
+        raise RuntimeError(f"missing {SERVE_SCRIPT}")
+    with open(SERVE_SCRIPT) as f:
+        return subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", alias,
+             f"{env_prefix}bash -s -- {subcmd}"],
+            stdin=f, capture_output=True, text=True, timeout=timeout,
+        )
+
+
+def serve_start(node: str, model: str | None = None, *, served_name: str = SERVED_NAME,
+                port: int = SERVE_PORT, engine: str = "auto", tool_parser: str | None = None,
+                max_model_len: int | None = None, gpu_mem_util: str | None = None) -> dict:
+    """Bring vLLM up on the node (idempotent; a healthy server is a no-op).
+
+    Returns immediately after the launch is issued — weights may still be
+    downloading/loading. Poll with serve_status(node) until healthy."""
+    key, cfg = _resolve_serve_model(model)
+    parser = tool_parser or cfg["parser"]
+    mml = max_model_len or cfg["max_model_len"]
+    gmu = gpu_mem_util or cfg["gpu_mem_util"]
+    env = (
+        f"MODEL={shlex.quote(cfg['hf'])} SERVED_NAME={shlex.quote(served_name)} "
+        f"TOOL_PARSER={shlex.quote(parser)} PORT={port} MAX_MODEL_LEN={mml} "
+        f"GPU_MEM_UTIL={gmu} SERVE_ENGINE={shlex.quote(engine)} "
+    )
+    try:
+        p = _pipe_serve(node, "start", env, timeout=900)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "node": resolve_node(node)[0], "error": "serve start timed out"}
+    ok = p.returncode == 0
+    alias = resolve_node(node)[0]
+    return {
+        "ok": ok, "node": alias, "model_key": key, "model": cfg["hf"],
+        "served_name": served_name, "tool_parser": parser, "port": port,
+        "endpoint": serve_endpoint(node, port),
+        "detail": (p.stdout or "").strip()[-1500:],
+        "error": "" if ok else (p.stderr or p.stdout or "").strip()[-800:],
+        "note": "launch issued; poll serve_status until healthy (weights may be loading).",
+    }
+
+
+def serve_stop(node: str, *, port: int = SERVE_PORT) -> dict:
+    """Tear the server down (tmux session + container). Weights cache is kept."""
+    try:
+        p = _pipe_serve(node, "stop", f"PORT={port} ", timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "node": resolve_node(node)[0], "error": "serve stop timed out"}
+    return {"ok": p.returncode == 0, "node": resolve_node(node)[0],
+            "detail": (p.stdout or "").strip()[-800:]}
+
+
+def serve_status(node: str, *, port: int = SERVE_PORT, timeout: float = 30.0) -> dict:
+    """Read-only serve health: tmux/container liveness, /v1/models, GPU residency."""
+    alias = resolve_node(node)[0]
+    try:
+        p = _pipe_serve(node, "status", f"PORT={port} ", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "node": alias, "reachable": False, "error": "status probe timed out"}
+    out = p.stdout or ""
+    sec = _split_sections(out)
+    serve_kv: dict[str, str] = {}
+    for ln in sec.get("serve", []):
+        if "=" in ln:
+            k, _, v = ln.partition("=")
+            serve_kv[k.strip()] = v.strip()
+    models_blob = "\n".join(sec.get("models", []))
+    gpu_blob = "\n".join(sec.get("gpu", [])).strip()
+    healthy = serve_kv.get("healthy") == "yes" and SERVED_NAME in models_blob
+    return {
+        "ok": healthy, "node": alias, "reachable": p.returncode == 0,
+        "endpoint": serve_endpoint(node, port), "port": port,
+        "tmux_alive": serve_kv.get("tmux_alive") == "yes",
+        "container_alive": serve_kv.get("container_alive") == "yes",
+        "healthy": healthy, "served_name": serve_kv.get("served_name", SERVED_NAME),
+        "models_raw": models_blob.strip()[:400], "gpu": gpu_blob[:200],
+    }
+
+
+# ---------------------------------------------------------------------------
+# /v1/messages probes (Mac -> node over Tailscale) — exactly the wire the loop
+# uses. The body + HTTP status are returned so the gate can both assert AND
+# screenshot the real reply.
+# ---------------------------------------------------------------------------
+
+def _curl(url: str, *, method: str = "GET", payload: dict | None = None,
+          timeout: float = 120.0) -> tuple[str, int]:
+    args = ["curl", "-sS", "-X", method, url,
+            "-H", "content-type: application/json",
+            "-H", "anthropic-version: 2023-06-01",
+            "-H", "authorization: Bearer local-brain"]
+    if payload is not None:
+        args += ["-d", json.dumps(payload)]
+    args += ["-w", "\nHTTP_STATUS=%{http_code}\n"]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "[curl timed out]", 124
+    out = p.stdout + (("\n" + p.stderr) if p.stderr.strip() else "")
+    return out.strip("\n"), p.returncode
+
+
+def models_curl(node: str, *, port: int = SERVE_PORT, timeout: float = 15.0) -> tuple[str, int]:
+    return _curl(f"{serve_endpoint(node, port)}/v1/models", timeout=timeout)
+
+
+def messages_curl(node: str, payload: dict, *, port: int = SERVE_PORT,
+                  timeout: float = 120.0) -> tuple[str, int]:
+    return _curl(f"{serve_endpoint(node, port)}/v1/messages",
+                 method="POST", payload=payload, timeout=timeout)
+
+
+# Payload builders — minimal but representative of what the agent loop sends.
+
+def messages_payload_plain() -> dict:
+    return {"model": SERVED_NAME, "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Reply with exactly: OK"}]}
+
+
+def messages_payload_toolcall() -> dict:
+    """A request that MUST elicit a tool call. The tool_use round-trip is the
+    loop's lifeblood and the #1 OSS-serving risk (parser drift)."""
+    return {
+        "model": SERVED_NAME, "max_tokens": 256,
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string", "description": "City name"}},
+                "required": ["city"],
+            },
+        }],
+        "messages": [{
+            "role": "user",
+            "content": "Use the get_weather tool to check the weather in Paris. You must call the tool.",
+        }],
+    }
+
+
+def messages_payload_cache_control() -> dict:
+    """Carries the exact cache_control:ephemeral breakpoints the loop puts on
+    system + tools + the newest user message (src/tools.py _cache_marked_*). The
+    gate proves vLLM accepts them (it ignores/strips; prefix-caching is auto)."""
+    return {
+        "model": SERVED_NAME, "max_tokens": 64,
+        "system": [{"type": "text", "text": "You are Aria's local brain.",
+                    "cache_control": {"type": "ephemeral"}}],
+        "tools": [{"name": "noop", "description": "no-op",
+                   "input_schema": {"type": "object", "properties": {}},
+                   "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Reply with exactly: OK",
+             "cache_control": {"type": "ephemeral"}}]}],
+    }
+
+
+# Pure response helpers + gate assertions (importable, unit-tested).
+
+def _http_status(out: str) -> int | None:
+    m = re.search(r"HTTP_STATUS=(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def _parse_messages_json(out: str) -> dict:
+    body = re.sub(r"\nHTTP_STATUS=\d+\s*$", "", out).strip()
+    try:
+        return json.loads(body)
+    except Exception:
+        m = re.search(r"\{.*\}", body, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return {}
+    return {}
+
+
+def _first_text_block(resp: dict) -> str:
+    for blk in resp.get("content", []) or []:
+        if isinstance(blk, dict) and blk.get("type") == "text":
+            return str(blk.get("text", ""))
+    return ""
+
+
+def _has_tool_use_block(resp: dict, name: str | None = None) -> bool:
+    for blk in resp.get("content", []) or []:
+        if isinstance(blk, dict) and blk.get("type") == "tool_use":
+            if name is None or blk.get("name") == name:
+                return True
+    return False
+
+
+def assert_serve_models(out: str, rc: int) -> tuple[bool, str]:
+    st = _http_status(out)
+    if st != 200:
+        return False, f"/v1/models HTTP {st} (server not up?)"
+    if SERVED_NAME not in out:
+        return False, f"served model {SERVED_NAME!r} not listed by /v1/models"
+    return True, f"/v1/models lists {SERVED_NAME!r}"
+
+
+def assert_serve_chat(out: str, rc: int) -> tuple[bool, str]:
+    st = _http_status(out)
+    if st != 200:
+        return False, f"/v1/messages HTTP {st}"
+    resp = _parse_messages_json(out)
+    txt = _first_text_block(resp)
+    if not txt.strip():
+        return False, "no assistant text block in the /v1/messages reply"
+    return True, f"assistant replied ({len(txt)} chars), stop_reason={resp.get('stop_reason')!r}"
+
+
+def assert_serve_toolcall(out: str, rc: int) -> tuple[bool, str]:
+    st = _http_status(out)
+    if st != 200:
+        return False, f"/v1/messages HTTP {st}"
+    resp = _parse_messages_json(out)
+    sr = resp.get("stop_reason")
+    if not _has_tool_use_block(resp, "get_weather"):
+        return False, (f"NO parseable tool_use(get_weather) block (stop_reason={sr!r}) "
+                       "— tool-call parser drift, the loop cannot work")
+    if sr != "tool_use":
+        return False, f"tool_use block present but stop_reason={sr!r} (parser/stop drift)"
+    return True, "tool_use(get_weather) present AND stop_reason=tool_use"
+
+
+def assert_serve_cache_control(out: str, rc: int) -> tuple[bool, str]:
+    st = _http_status(out)
+    if st != 200:
+        return False, f"server rejected the cache_control payload (HTTP {st})"
+    resp = _parse_messages_json(out)
+    if not (_first_text_block(resp) or _has_tool_use_block(resp)):
+        return False, "HTTP 200 but empty reply to the cache_control payload"
+    return True, "accepted cache_control:ephemeral blocks (HTTP 200, valid reply)"
+
+
+def assert_serve_gpu(out: str, rc: int) -> tuple[bool, str]:
+    if "GB10" not in out:
+        return False, "no GB10 GPU in nvidia-smi"
+    first = next((ln for ln in out.splitlines() if "GB10" in ln), "")
+    parts = [p.strip() for p in first.split(",")]
+    used = 0
+    if len(parts) >= 2:
+        mu = re.search(r"(\d+)", parts[1])
+        used = int(mu.group(1)) if mu else 0
+    if used < SERVE_GPU_MIN_USED_MIB:
+        return False, f"only {used} MiB resident (<{SERVE_GPU_MIN_USED_MIB}); weights not loaded?"
+    return True, f"GB10, {used} MiB resident (model loaded)"

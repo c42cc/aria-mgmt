@@ -83,9 +83,13 @@ def build_receipt(
     tool_fired: bool,
     ok: bool,
     verdict_reason: str,
+    brain: str = "cloud",
 ) -> dict:
     """Pure: the build-hash-keyed proof receipt. `certifies_trunk` is False for a
-    --dev run so a non-trunk smoke can never be mistaken for a real proof."""
+    --dev run so a non-trunk smoke can never be mistaken for a real proof.
+    `brain` records which model answered ('cloud' = api.anthropic.com Opus, else
+    the local Spark base_url) so a local-brain receipt is never confused with the
+    canonical cloud trunk proof."""
     return {
         "meter": "live_outcome",
         "build_hash": build_hash,
@@ -93,6 +97,7 @@ def build_receipt(
         "dirty": dirty,
         "branch": branch,
         "certifies_trunk": certifies_trunk,
+        "brain": brain,
         "task": task,
         "tool_fired": tool_fired,
         "ok": ok,
@@ -107,10 +112,14 @@ def _receipts_dir() -> str:
     return os.path.join(_REPO_ROOT, "data", "receipts")
 
 
-def write_receipt(receipt: dict) -> str:
-    """Write the receipt keyed to the build hash; atomic (temp -> rename)."""
+def write_receipt(receipt: dict, *, suffix: str = "") -> str:
+    """Write the receipt keyed to the build hash; atomic (temp -> rename).
+
+    `suffix` distinguishes a local-brain receipt (e.g. '.local') from the
+    canonical cloud trunk receipt so the two never overwrite each other — the
+    deployed_trunk / done gate reads the bare '<build_hash>.json' (cloud) proof."""
     os.makedirs(_receipts_dir(), exist_ok=True)
-    path = os.path.join(_receipts_dir(), f"{receipt['build_hash']}.json")
+    path = os.path.join(_receipts_dir(), f"{receipt['build_hash']}{suffix}.json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(receipt, f, indent=2)
@@ -146,7 +155,7 @@ async def run_meter(task: str, *, timeout_sec: float = 240.0) -> tuple[bool, str
     return ok, result, tool_fired
 
 
-async def _amain(task: str, allow_nontrunk: bool) -> int:
+async def _amain(task: str, allow_nontrunk: bool, base_url: str = "") -> int:
     from src import build_hash as bh
 
     branch = bh.current_branch()
@@ -154,9 +163,14 @@ async def _amain(task: str, allow_nontrunk: bool) -> int:
     dirty = bool(dirty_raw)
     build_hash = bh.compute_build_hash()
     head_sha = bh._git(["rev-parse", "HEAD"]) or "nogit"
-    certifies_trunk = (branch == bh.TRUNK) and not dirty
+    # A local-brain run uses a DIFFERENT model than the trunk's cloud Opus, so it
+    # never certifies the canonical trunk (and writes a distinct receipt name).
+    is_local = bool(base_url)
+    brain = base_url if is_local else "cloud"
+    suffix = ".local" if is_local else ""
+    certifies_trunk = (branch == bh.TRUNK) and not dirty and not is_local
 
-    if not certifies_trunk and not allow_nontrunk:
+    if not certifies_trunk and not allow_nontrunk and not is_local:
         print(
             f"live_meter: REFUSE to certify — not a clean trunk build "
             f"(branch={branch!r} dirty={dirty}). A live-outcome receipt must certify "
@@ -166,7 +180,7 @@ async def _amain(task: str, allow_nontrunk: bool) -> int:
         return 2
 
     print(f"live_meter: build_hash={build_hash[:12]} branch={branch} dirty={dirty} "
-          f"certifies_trunk={certifies_trunk}")
+          f"certifies_trunk={certifies_trunk} brain={brain}")
     print(f"live_meter: task = {task!r}")
 
     ok, result, tool_fired = await run_meter(task)
@@ -182,10 +196,11 @@ async def _amain(task: str, allow_nontrunk: bool) -> int:
         tool_fired=tool_fired,
         ok=ok,
         verdict_reason=reason,
+        brain=brain,
     )
-    path = write_receipt(receipt)
+    path = write_receipt(receipt, suffix=suffix)
 
-    print(f"\nlive_meter: tool_fired={tool_fired} ok={ok}")
+    print(f"\nlive_meter: tool_fired={tool_fired} ok={ok} brain={brain}")
     print(f"live_meter: verdict={receipt['verdict']} — {reason}")
     print(f"live_meter: receipt -> {path}")
     print(f"\n--- result ---\n{(result or '').strip()[:800]}\n--------------")
@@ -204,8 +219,24 @@ def main() -> int:
         "--dev", action="store_true",
         help="run off-trunk/dirty; the receipt is marked certifies_trunk=false",
     )
+    parser.add_argument(
+        "--base-url", default="",
+        help="point the brain at a local endpoint (the Spark vLLM /v1, e.g. "
+             "http://100.106.152.104:8000) instead of cloud Opus. Writes a "
+             "'<build_hash>.local.json' receipt; never certifies the cloud trunk.",
+    )
+    parser.add_argument(
+        "--model", default="",
+        help="override CLAUDE_MODEL (the served-model-name, e.g. local-brain) for a --base-url run",
+    )
     args = parser.parse_args()
-    return asyncio.run(_amain(args.task, allow_nontrunk=args.dev))
+    # Set the brain BEFORE any src import so config (frozen at import) reads it.
+    if args.base_url:
+        os.environ["ANTHROPIC_BASE_URL"] = args.base_url
+        os.environ["CLAUDE_MODEL"] = args.model or os.getenv("CLAUDE_MODEL", "") or "local-brain"
+    elif args.model:
+        os.environ["CLAUDE_MODEL"] = args.model
+    return asyncio.run(_amain(args.task, allow_nontrunk=args.dev, base_url=args.base_url))
 
 
 if __name__ == "__main__":

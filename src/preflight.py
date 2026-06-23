@@ -145,11 +145,19 @@ async def probe_db() -> tuple[bool, str, str, str]:
 
 
 async def probe_anthropic() -> tuple[bool, str, str, str]:
-    """Anthropic API reachable with a 1-token completion."""
+    """Anthropic Messages API reachable with a 1-token completion.
+
+    Honors the brain-location knob: with ANTHROPIC_BASE_URL set this validates
+    the LOCAL Spark-served endpoint (the local chat process), otherwise cloud
+    Opus (the main bot). Same SDK, same wire — only base_url differs."""
     from .config import config
     import anthropic
 
-    client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+    base_url = config.brain_base_url or None
+    client = anthropic.Anthropic(
+        api_key=config.anthropic_api_key or ("local-brain" if base_url else ""),
+        base_url=base_url,
+    )
     resp = await asyncio.to_thread(
         client.messages.create,
         model=config.claude_model,
@@ -157,7 +165,55 @@ async def probe_anthropic() -> tuple[bool, str, str, str]:
         messages=[{"role": "user", "content": "ping"}],
     )
     text = resp.content[0].text if resp.content else ""
-    return True, "", "", f"model={config.claude_model} usage={getattr(resp, 'usage', None)} text={text[:30]!r}"
+    where = base_url or "api.anthropic.com"
+    return True, "", "", f"model={config.claude_model} @ {where} usage={getattr(resp, 'usage', None)} text={text[:30]!r}"
+
+
+async def probe_local_brain() -> tuple[bool, str, str, str]:
+    """The local Spark-served brain answers the Messages API with a parseable
+    tool_use — the routing good state. Advisory (WARN).
+
+    Skipped (pass) when ANTHROPIC_BASE_URL is unset: the main bot uses cloud Opus
+    and has no local brain to probe. When set (the local-chat process, or
+    `ANTHROPIC_BASE_URL=… python -m src.preflight`), it does a REAL round-trip
+    through the SDK pointed at the Spark and asserts a tool_use block comes back
+    — the exact wire the agent loop depends on, and the #1 OSS-serving risk.
+    There is no silent fallback to cloud; a dead local brain is reported loudly.
+    """
+    from .config import config
+    import anthropic
+
+    base_url = config.brain_base_url
+    if not base_url:
+        return True, "", "", "no local brain configured (ANTHROPIC_BASE_URL unset) — main bot uses cloud Opus"
+
+    client = anthropic.Anthropic(api_key=config.anthropic_api_key or "local-brain", base_url=base_url)
+    tools = [{
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "input_schema": {"type": "object",
+                         "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    }]
+    resp = await asyncio.to_thread(
+        client.messages.create,
+        model=config.claude_model,
+        max_tokens=256,
+        tools=tools,
+        messages=[{"role": "user",
+                   "content": "Use the get_weather tool to check Paris. You must call the tool."}],
+    )
+    stop = getattr(resp, "stop_reason", None)
+    has_tool = any(getattr(b, "type", "") == "tool_use" for b in (resp.content or []))
+    if not has_tool:
+        return (
+            False,
+            f"local brain at {base_url} did not emit a tool_use block (stop_reason={stop!r}) — "
+            "tool-call parser drift; the agent loop cannot function",
+            "verify the served model+parser: .venv/bin/python scripts/spark_serve.py "
+            "--node spark1 --only serve_toolcall",
+            f"model={config.claude_model}",
+        )
+    return True, "", "", f"local brain {config.claude_model} @ {base_url} emitted tool_use (stop_reason={stop!r})"
 
 
 async def probe_gemini_audio() -> tuple[bool, str, str, str]:
@@ -406,6 +462,21 @@ async def probe_mcp_shell(mcp_client: Any) -> tuple[bool, str, str, str]:
 async def probe_mcp_github(mcp_client: Any) -> tuple[bool, str, str, str]:
     """GitHub MCP exposes tools (deeper auth probe is too expensive at boot)."""
     return await probe_mcp_server(mcp_client, "github", WARN)
+
+
+async def probe_mcp_search(mcp_client: Any) -> tuple[bool, str, str, str]:
+    """Web search MCP ('do search for me'). Optional: OK-but-off when no key is
+    configured (no dead server), a loud WARN when configured but not running."""
+    configured = bool(os.getenv("BRAVE_API_KEY") or os.getenv("TAVILY_API_KEY"))
+    running = mcp_client is not None and "search" in getattr(mcp_client, "_servers", {})
+    if running:
+        return await probe_mcp_server(mcp_client, "search", WARN)
+    if not configured:
+        return (True, "", "",
+                "web search not configured — set BRAVE_API_KEY (or TAVILY_API_KEY) in .env "
+                "to enable 'do search for me'")
+    return (False, "search MCP configured but not running",
+            "check the key is valid and `npx -y @modelcontextprotocol/server-brave-search` runs", "")
 
 
 async def probe_mcp_gcal(mcp_client: Any) -> tuple[bool, str, str, str]:
@@ -1325,6 +1396,9 @@ async def _run_all_inner(
             await _run_probe("mcp_github", WARN, lambda: probe_mcp_github(mcp_client))
         )
         report.results.append(
+            await _run_probe("mcp_search", WARN, lambda: probe_mcp_search(mcp_client))
+        )
+        report.results.append(
             await _run_probe("mcp_google_calendar", WARN, lambda: probe_mcp_gcal(mcp_client))
         )
         report.results.append(
@@ -1384,6 +1458,11 @@ async def _run_all_inner(
     # DGX Spark nodes — advisory reachability. Non-blocking by design: a spark
     # being off is surfaced in #ucs-alerts, never a ready-state blocker.
     report.results.append(await _run_probe("sparks", WARN, probe_sparks))
+
+    # Local brain (open-source model on the Spark). Advisory: skipped when
+    # ANTHROPIC_BASE_URL is unset (main bot = cloud); a real tool_use round-trip
+    # against the Spark when set (the local chat process / standalone preflight).
+    report.results.append(await _run_probe("local_brain", WARN, probe_local_brain))
 
     report.finished_at = datetime.now(timezone.utc).isoformat()
     return report

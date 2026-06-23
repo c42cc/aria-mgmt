@@ -65,6 +65,27 @@ MCP_SERVERS: dict[str, dict[str, Any]] = {
     },
 }
 
+# Web search — "do search for me". Registered ONLY when a key is present so there
+# is never a dead, perpetually-failing server on boot (when unconfigured, the
+# search probe reports it as off, not broken — visible, not silent). Brave is the
+# default; Tavily is the alternative. Pure read tier (R): no confirmation gate.
+if os.getenv("BRAVE_API_KEY"):
+    MCP_SERVERS["search"] = {
+        "command": ["npx", "-y", "@modelcontextprotocol/server-brave-search"],
+        "transport": "stdio",
+        "env": {"BRAVE_API_KEY": os.getenv("BRAVE_API_KEY", "")},
+        "tier_defaults": {"brave": "R", "search": "R", "web": "R", "news": "R",
+                          "local": "R", "get": "R", "list": "R"},
+    }
+elif os.getenv("TAVILY_API_KEY"):
+    MCP_SERVERS["search"] = {
+        "command": ["npx", "-y", "tavily-mcp"],
+        "transport": "stdio",
+        "env": {"TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", "")},
+        "tier_defaults": {"tavily": "R", "search": "R", "web": "R", "extract": "R",
+                          "crawl": "R", "map": "R", "get": "R"},
+    }
+
 AUDIT_PATH = os.path.join(config.data_dir, "audit.jsonl")
 
 

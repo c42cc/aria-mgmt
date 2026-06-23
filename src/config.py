@@ -46,6 +46,27 @@ class Config:
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
     claude_model: str = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
     cursor_model: str = os.getenv("CURSOR_MODEL", "composer-2")
+
+    # Local brain (an open-source model served on the DGX Spark). This is the ONE
+    # knob that relocates the dysfunctional primitive — a remote, metered,
+    # cloud-bound brain — onto local hardware. When ANTHROPIC_BASE_URL is set, the
+    # Anthropic SDK (the agent loop's brain, src/tools.py) and probe_anthropic
+    # talk to THIS endpoint (the Spark's vLLM, which serves /v1/messages natively)
+    # instead of api.anthropic.com. The agent loop is unchanged. Empty = cloud
+    # Opus (the main Discord/voice bot). The local chat web process sets it to the
+    # Spark endpoint and sets CLAUDE_MODEL to the served-model-name ('local-brain').
+    # The SDK honors this env var natively; surfaced as a field so probes see it.
+    brain_base_url: str = os.getenv("ANTHROPIC_BASE_URL", "")
+
+    # Local chat web surface (src/local_chat_web.py): a browser chat window over
+    # the same agent loop + MCP fleet, driven by the local brain. Bind to
+    # 127.0.0.1 for a Mac-only window, or to 0.0.0.0 / the Tailscale IP to reach
+    # it from your phone/laptop — in which case LOCAL_CHAT_SECRET MUST be set
+    # (the server refuses a non-loopback bind without it; an open autonomous
+    # agent on the LAN is a footgun).
+    local_chat_host: str = os.getenv("LOCAL_CHAT_HOST", "127.0.0.1")
+    local_chat_port: int = int(os.getenv("LOCAL_CHAT_PORT", "8742"))
+    local_chat_secret: str = os.getenv("LOCAL_CHAT_SECRET", "")
     # Cheap distillation model for high-volume, low-stakes summarization
     # (Cursor thread roster). This is the sanctioned "memory synthesis may
     # use Haiku" exception to the Opus-only rule — never Sonnet. The slug is

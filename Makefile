@@ -5,7 +5,7 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter
+.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter local-chat spark-serve spark-serve-verify spark-serve-bench spark-serve-stop meter-local
 
 help:
 	@echo "Targets:"
@@ -85,3 +85,41 @@ audit-dedup:
 clean:
 	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+
+# --- Local Spark Agent -----------------------------------------------------
+# A local-brained chat window: an open-source model on the DGX Spark behind the
+# Anthropic Messages API, driving the SAME agent loop + MCP fleet. SPARK_NODE
+# overrides the node (default spark1).
+
+# Serve the default model on the Spark and wait until /v1/models is healthy.
+spark-serve:
+	@$(PYTHON) scripts/spark_serve.py --node $${SPARK_NODE:-spark1} --start
+
+# Verify the serving good states (capture + Gemini): /v1/models, chat,
+# the tool_use round-trip (the #1 risk), cache_control tolerance, GPU residency.
+spark-serve-verify:
+	@$(PYTHON) scripts/spark_serve.py --node $${SPARK_NODE:-spark1}
+
+# Bench both candidates behind one served name; recommend a default on tool-call
+# reliability + tok/s. Heavy (each model downloads/loads).
+spark-serve-bench:
+	@$(PYTHON) scripts/spark_serve.py --node $${SPARK_NODE:-spark1} --bench
+
+# Tear the server down (weights cache kept).
+spark-serve-stop:
+	@$(PYTHON) scripts/spark_serve.py --node $${SPARK_NODE:-spark1} --stop
+
+# The runtime half of done for the LOCAL brain: a real do_with_claude request on
+# the Spark model fires a real tool and answers; writes a <hash>.local.json receipt.
+meter-local:
+	@URL="$${ANTHROPIC_BASE_URL:-$$($(PYTHON) -c 'from src import spark; print(spark.serve_endpoint("spark1"))')}" ; \
+	 $(PYTHON) scripts/live_meter.py --base-url "$$URL" --model local-brain
+
+# Open the local chat window. Resolves the Spark endpoint, points the brain at
+# it, and serves the browser UI. Refuses to start if the brain is unreachable
+# (halt-don't-heal; no cloud fallback). Set LOCAL_CHAT_HOST=0.0.0.0 +
+# LOCAL_CHAT_SECRET=... to reach it from your phone over Tailscale.
+local-chat:
+	@ANTHROPIC_BASE_URL="$${ANTHROPIC_BASE_URL:-$$($(PYTHON) -c 'from src import spark; print(spark.serve_endpoint("spark1"))')}" \
+	 CLAUDE_MODEL="$${CLAUDE_MODEL:-local-brain}" \
+	 $(PYTHON) -m src.local_chat_web

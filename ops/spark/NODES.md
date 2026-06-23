@@ -217,9 +217,24 @@ The runbook itself defers these; we do not guess their inputs.
     busbw is ~1.2 GB/s, bound by the same throttle above: the smoke test proves
     the collective stack is **correct**, not that it is fast.
 - **Section C — serving (Profile 1, independent workers = the operating mode).**
-  Good states: one VLM per node at NVFP4 with KV-cache headroom; both nodes
-  pulling from a shared queue; every run manifest records mode + model + version
-  + quantization. Blocked on three decisions, each of which changes the build:
+  **The CHAT-AGENT serving path is BUILT (2026-06-23).** A single open-source LLM
+  is served on one node behind the Anthropic Messages API (`vllm serve` →
+  `/v1/messages`, which vLLM serves natively), and Aria's unchanged agent loop
+  runs on it by pointing `ANTHROPIC_BASE_URL` at the node — the "Local Spark
+  Agent" (browser chat window, `src/local_chat_web.py`). Stand it up with
+  `ops/spark/serve_model.sh` (Mac side: `src/spark.py::serve_start` /
+  `make spark-serve`); verify the good states (server up, chat, the `tool_use`
+  round-trip, cache_control tolerance, GPU residency) twice with
+  `scripts/spark_serve.py` (capture + Gemini), bench the model with `--bench`, and
+  certify a real tool-backed request with `scripts/live_meter.py --base-url`. The
+  default candidates are gpt-oss-120b (MXFP4, most capable but quick) and a
+  30B-A3B (snappier); the bench picks the default. This needs the privileged path
+  noted in §3 (docker is present on the nodes; the user-level uv-venv engine is
+  the least-privilege alternative).
+
+  The original **VLM tagging-pipeline** flavor of Section C (batch image tagging,
+  shared queue) is a DIFFERENT workload and remains deferred on its own three
+  decisions, each of which changes that build:
   1. **Which VLM** — pick on tagging accuracy via a hand-labeled mini-set bench
      (tagging plan §7), not throughput.
   2. **Queue / object store** — what backs the shared work queue + artifact store.

@@ -23,6 +23,16 @@
       "why": "the 'finished -> invent a next step' auto-proposal. On every watched-thread completion it called Claude to manufacture a 'next step' and pushed it to the phone as a tap-to-approve decision, framing a window the user merely finished driving as something asking for a decision (the live_visuals_4/ucs 'fabricated question' the user hit 2026-06-19). Deleted; a completion is silent-audit-only — only an explicit ask buzzes."
     },
     {
+      "substring": "class ModelRouter",
+      "where": ["src"],
+      "why": "the Local Spark Agent relocates the brain by ONE knob (config.brain_base_url / ANTHROPIC_BASE_URL) that the unchanged agent loop already honors — vLLM serves the Anthropic Messages API natively. Brain selection is a base_url, NOT a router. The flag-gated src/ucs.py ModelRouter was already removed (a dormant duplicate of the one loop); it must not return under the local-brain work."
+    },
+    {
+      "substring": "fallback_to_cloud",
+      "where": ["src"],
+      "why": "halt-don't-heal for the local brain. src/local_chat_web.py REFUSES to start when the Spark brain is unreachable (probe_local_brain) and surfaces the one-command fix. A silent fallback to cloud Claude when the local brain is down would hide the exact failure the user must see (and quietly re-meter spend). Naming the anti-pattern here reds the gate if anyone writes it."
+    },
+    {
       "substring": "def suggest_next_action",
       "where": ["src"],
       "why": "the cheap Claude call behind the deleted auto-proposal (_maybe_propose_next_after_completion). Its only job was to invent a next-step decision to buzz; with the proposal gone it is dead. Removed 2026-06-19 — do not resurrect a 'guess what the user wants next' model call on the cursor-watch path."

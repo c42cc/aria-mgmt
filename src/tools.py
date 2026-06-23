@@ -681,11 +681,21 @@ def init_tools(
     global _discord_history_callback, _discord_threads_callback
 
     # timeout/max_retries bound each agent-loop request (see config note).
+    # base_url is the brain-location knob: empty -> api.anthropic.com (cloud
+    # Opus, the main bot); set -> the DGX Spark's vLLM /v1 (a local open-source
+    # brain, the local chat process). The loop is byte-for-byte identical either
+    # way — vLLM serves the Anthropic Messages API natively. A dummy key
+    # satisfies the SDK when pointing at the local brain (vLLM ignores auth).
+    _brain_base_url = config.brain_base_url or None
     _anthropic_client = anthropic.Anthropic(
-        api_key=config.anthropic_api_key,
+        api_key=config.anthropic_api_key or ("local-brain" if _brain_base_url else ""),
+        base_url=_brain_base_url,
         timeout=config.anthropic_timeout_sec,
         max_retries=1,
     )
+    if _brain_base_url:
+        log.info("Anthropic client pointed at LOCAL brain: %s (model=%s)",
+                 _brain_base_url, config.claude_model)
     _cursor_bridge = cursor_bridge
     _post_callback = post_callback
     _alert_callback = alert_callback
