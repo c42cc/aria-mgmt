@@ -21,10 +21,10 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."  # repo root
 
-if git checkout main; then
-    echo "launch: on trunk 'main'"
+if git checkout aria-live; then
+    echo "launch: on trunk 'aria-live' (the live Discord Aria)"
 else
-    echo "launch: WARNING could not checkout 'main' (dirty tree or conflict) —" \
+    echo "launch: WARNING could not checkout 'aria-live' (dirty tree or conflict) —" \
          "the deployed_trunk preflight gate will refuse ready and print the fix"
 fi
 

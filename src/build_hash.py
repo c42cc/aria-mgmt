@@ -30,8 +30,11 @@ log = logging.getLogger(__name__)
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 
 # The one pinned trunk. The running process must be on this branch; a process on
-# any other branch is drift and refuses ready (it is not the trunk).
-TRUNK = "main"
+# any other branch is drift and refuses ready (it is not the trunk). This is the
+# LIVE Discord Aria line (the old system + the cursor-watch notify), deliberately
+# decoupled from the v2 membrane on `main` (owner decision: run the Discord Aria
+# live; the membrane is a separate tool on `main`).
+TRUNK = "aria-live"
 
 # THE BUILD's inputs — the ONE home. Each entry is (subdir, suffixes); a file
 # under that subdir whose suffix matches is part of the build. Adding a
