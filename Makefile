@@ -1,4 +1,4 @@
-.PHONY: run test gate spark-serve spark-serve-verify spark-serve-bench spark-serve-stop
+.PHONY: run test gate doctor spark-serve spark-serve-verify spark-serve-bench spark-serve-stop
 
 PYTHON ?= .venv/bin/python
 SPARK_NODE ?= spark1
@@ -13,6 +13,10 @@ test:
 # completing and being honestly logged in data/outcomes.jsonl.
 gate: test
 	@echo "GATE GREEN (static). Runtime half = a real request that delivers + logs honestly."
+
+# The single pane — every plane's live health (Mind/Hands/Floor/HA/Cloud + spend).
+doctor:
+	@$(PYTHON) -m src.doctor
 
 # ── The Mind (Spark A) — serve local-brain behind the inference contract ──
 # vLLM serves the Anthropic Messages API natively; the Mac side only points

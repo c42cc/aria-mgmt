@@ -11,6 +11,7 @@ from __future__ import annotations
 import anthropic
 
 from .config import config
+from .floor import status as floor_status
 from .loops import load_loops
 
 
@@ -43,6 +44,11 @@ def check(ping_models: bool = True) -> list[str]:
         if config.spark_base_url
         else "spark endpoint: not configured (set SPARK_BASE_URL)"
     )
+
+    # The Floor (storage-layout contract). Reported honestly, never forced: an
+    # ABSENT Floor is the true state until the NAS mounts — loud, not hidden.
+    floor = floor_status()
+    ok.append(f"floor: present at {floor.root}" if floor.present else f"floor: {floor.detail}")
 
     if ping_models:
         client = anthropic.Anthropic(api_key=config.anthropic_api_key, timeout=30)

@@ -73,6 +73,14 @@ class Config:
     spark_model: str = os.getenv("SPARK_MODEL", "local-brain").strip()
     spark_max_tokens: int = int(os.getenv("SPARK_MAX_TOKENS", "4096"))
 
+    # ── The Floor — the durable, shared, redundant state-of-record plane ────
+    # The storage-layout contract (§1.1). FLOOR_ROOT is the one mount where
+    # state of record lives. EMPTY = the Floor is ABSENT (no shared/redundant
+    # storage yet — the NAS arrives tomorrow); src/floor.py makes that loud and
+    # first-class. When the NAS mounts here, the Floor flips to present with no
+    # code change. Never let compute-local disk masquerade as the Floor.
+    floor_root: str = os.getenv("FLOOR_ROOT", "").strip().rstrip("/")
+
     # ── Cost / time guardrails ─────────────────────────────────────────────
     daily_spend_cap_usd: float = float(os.getenv("DAILY_SPEND_CAP_USD", "20"))
     anthropic_timeout_sec: float = float(os.getenv("ANTHROPIC_TIMEOUT_SEC", "120"))
