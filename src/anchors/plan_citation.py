@@ -27,7 +27,16 @@ from .base import AnchorReport
 log = logging.getLogger(__name__)
 
 
+# The running build's OWN worktree, derived from this file's location — so a
+# plan that cites `src/tools.py` is verified against the files THIS build
+# actually has, not a hardcoded sibling worktree that may sit on a different
+# branch. (Forensic: the live bot runs from `ucs2-notify-on-stop`, but the root
+# below was pinned to `ucs2`, which the v2 membrane branch had stripped of
+# `src/tools.py` — so a citation of a real, present file read as a fabrication.)
+_BUILD_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 ALLOWED_ROOTS = [
+    _BUILD_ROOT,
     "/Users/corbin/PycharmProjects/agi_env_v1/ucs2",
     "/Users/corbin/PycharmProjects",
     "/Users/corbin/Documents",

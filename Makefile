@@ -5,7 +5,7 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter
+.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter fulfillment-golden fulfillment-calibrate fulfillment-pressure fulfillment-reverify fulfillment-report
 
 help:
 	@echo "Targets:"
@@ -13,6 +13,7 @@ help:
 	@echo "  gate         - the one door to main: lints + structural absences + unit suite"
 	@echo "  meter        - the live-outcome meter: a real request on the trunk build (real API \$$)"
 	@echo "  eval-calibrate - calibrate the judge over the labeled corpus (real API \$$); gates Task done"
+	@echo "  fulfillment-{golden,calibrate,pressure,reverify,report} - the request-fulfillment harness (real API \$$)"
 	@echo "  preflight    - run capability preflight (same probes the bot runs at boot)"
 	@echo "  bootstrap    - one-command fresh-machine setup (venv, npm, MCP, OAuth, prompts)"
 	@echo "  kill         - kill any running bot processes"
@@ -43,6 +44,25 @@ meter:
 
 eval-calibrate:
 	@$(PYTHON) -m src.judge_calibration
+
+# Request-fulfillment harness (advisory; intent-first, arc-complete). golden is
+# the R5 definition-of-done; pressure is the world-center adversarial suite;
+# reverify shows the §7 dispatch fix close the dispatch-context dysfunction.
+fulfillment-golden:
+	@$(PYTHON) -m src.fulfillment golden
+
+fulfillment-calibrate:
+	@$(PYTHON) -m src.fulfillment calibrate
+
+fulfillment-pressure:
+	@$(PYTHON) -m src.fulfillment pressure
+
+fulfillment-reverify:
+	@$(PYTHON) -m src.fulfillment reverify
+
+# A live chief-of-staff scorecard over the running bot's real records.
+fulfillment-report:
+	@$(PYTHON) -m src.fulfillment report --data-dir data --hours 72
 
 preflight:
 	@$(PYTHON) -m src.preflight

@@ -393,8 +393,10 @@ class TestFindingsLedger(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------
-# 6. Room continuity without bleed: a NEW thread inherits the same channel's
-#    user/aria exchange; other channels and the cursor-watch stay out.
+# 6. Room continuity + the bounded cross-channel antecedent: a NEW thread
+#    inherits the same channel's user/aria exchange AND the most-recent
+#    cursor-watch event (the §7 R5 fix), while other channels stay out and the
+#    cursor-watch firehose stays capped (it cannot bleed).
 # --------------------------------------------------------------------------
 
 class TestRoomContinuity(unittest.TestCase):
@@ -421,17 +423,29 @@ class TestRoomContinuity(unittest.TestCase):
         )
         self.assertEqual(ctx, "")
 
-    def test_cursor_watch_still_excluded_from_focused_thread(self):
-        from src.conversation import ConversationBuffer
+    def test_cursor_watch_antecedent_bound_but_firehose_capped(self):
+        # §7 fix (forensic 2026-06-24 "Give me the debrief", R5): a focused thread
+        # NOW sees the most-recent cursor-watch event — the antecedent a referential
+        # ask points at — instead of being starved of it. The cap is the defense:
+        # the firehose can't bleed, only the latest event(s) ride in.
+        from src.conversation import (
+            ConversationBuffer, _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT,
+        )
         buf = ConversationBuffer()
         buf.add_user_text("#t-old", "earlier message",
                           session_key="OLD", parent_channel="ucs-chan")
-        buf.add_cursor_event("[Cursor watch: live_visuals_4 assistant turn]")
+        for i in range(5):
+            buf.add_cursor_event(f"[Cursor watch: live_visuals_4 event {i}]")
         ctx = buf.as_claude_context(
             max_turns=10, session_key="NEW", parent_channel="ucs-chan"
         )
-        self.assertIn("earlier message", ctx)
-        self.assertNotIn("live_visuals_4", ctx)
+        self.assertIn("earlier message", ctx)        # room continuity preserved
+        self.assertIn("live_visuals_4", ctx)         # the antecedent IS now bound (the R5 fix)
+        self.assertIn("event 4", ctx)                # most-recent survives
+        self.assertNotIn("event 0", ctx)             # the firehose's tail is dropped
+        self.assertLessEqual(                        # bounded — cannot bleed
+            ctx.count("Cursor watch event"), _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT
+        )
 
     def test_no_parent_channel_keeps_strict_isolation(self):
         from src.conversation import ConversationBuffer

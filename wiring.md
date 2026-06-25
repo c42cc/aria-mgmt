@@ -423,3 +423,40 @@ because:
 If you add a graceful shutdown, the sequence to follow is the reverse of
 boot: close Gemini → stop MCP fleet → stop voice bridge → stop cursor bridge →
 return from `on_ready`.
+
+---
+
+## Request fulfillment: the arc, and binding the antecedent
+
+A top-level message opens its own Discord thread; `do_with_claude` runs in that
+thread's isolated `session_key`. The request's **context** is assembled once, by
+`conversation.ConversationBuffer.as_claude_context`, and crosses the boundary
+into the engine as a preamble on the task (`bot._augment_with_context` →
+`do_with_claude(task=…)`). A focused request sees three things and nothing else:
+
+1. its own thread's turns (`session_key` match),
+2. the room's recent user/aria exchange (`parent_channel` match) — how "that" /
+   "the plan" resolve, and
+3. the **two most-recent cursor-watch events** — the *bounded antecedent* a
+   referential ask points at, e.g. "the debrief" → the Cursor task that just
+   finished. The cap (`_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT`) is the whole
+   defense: it makes this the antecedent, never the firehose.
+
+This third leg is the §7 fix (forensic 2026‑06‑24, R5). Before it, cursor-watch
+events were dropped from focused context, so a referential ask in a fresh thread
+reached the engine as bare words (`transcript:[]`, no preamble) and it
+confabulated — the OFF‑THE‑RAILS failure rooted at the **dispatch‑context**
+layer.
+
+The producer of that failure (a starved dispatch) and its catcher are one
+primitive, not two: `src/fulfillment.py` (the advisory request‑fulfillment
+harness) judges each request against its **true intent**, reconstructed from the
+same cross-channel antecedent — and flags exactly the starvation the dispatch
+fix removes (`preamble_attached` is its structural witness; the judge's
+`dispatch-context` attribution is the grounded count). The harness is
+intent‑first and arc‑complete: `extract_arcs` folds `session_records` +
+`conversation_log` into context‑complete units, `score_fulfillment` runs the
+two‑stage judge (reconstruct intent → score vs intent, class + root‑cause
+layer), and it earns trust only via a build‑hash‑keyed calibration receipt that
+must pass the R5 golden gate. It **advises**; it never gates Aria's "done".
+Reproduce: `make fulfillment-golden | fulfillment-pressure | fulfillment-reverify`.
