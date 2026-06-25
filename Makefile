@@ -18,6 +18,12 @@ gate: test
 doctor:
 	@$(PYTHON) -m src.doctor
 
+# Zed oversight: open the Hands (Spark) dev environment over the mesh (Tailscale
+# SSH). The workspace surfaces live cell runs at .cells/ and the cell branches —
+# watch and directly steer what the dev environment is doing, from anywhere.
+zed-hands:
+	zed "ssh://$(SPARK_CELL_NODE)/home/$(SPARK_CELL_NODE)/live_visuals_4"
+
 # ── The Mind (Spark A) — serve local-brain behind the inference contract ──
 # vLLM serves the Anthropic Messages API natively; the Mac side only points
 # SPARK_BASE_URL at it. Idempotent + loud (scripts/spark_serve.py -> src/spark.py).
