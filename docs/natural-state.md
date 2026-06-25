@@ -50,6 +50,8 @@ ours to surface, never blamed on the node/hub/network. `--json` for machines.
 ## How to operate
 
 ```
+make home                                # publish the front door (self-refreshing)
+#   -> http://100.106.152.104:8123/local/home.html  (local net + Tailscale, no auth)
 make doctor                              # the single pane
 make spark-serve SPARK_NODE=spark1       # bring the Mind up (idempotent)
 make spark-serve-stop SPARK_NODE=spark1  # tear the Mind down (weights kept)

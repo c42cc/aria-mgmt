@@ -1,4 +1,4 @@
-.PHONY: run test gate doctor spark-serve spark-serve-verify spark-serve-bench spark-serve-stop
+.PHONY: run test gate doctor home spark-serve spark-serve-verify spark-serve-bench spark-serve-stop
 
 PYTHON ?= .venv/bin/python
 SPARK_NODE ?= spark1
@@ -17,6 +17,11 @@ gate: test
 # The single pane — every plane's live health (Mind/Hands/Floor/HA/Cloud + spend).
 doctor:
 	@$(PYTHON) -m src.doctor
+
+# The front door — deploy + self-refresh the one-page status to the Mind, served
+# (no auth) at http://100.106.152.104:8123/local/home.html (local net + Tailscale).
+home:
+	@$(PYTHON) scripts/publish_home.py
 
 # Zed oversight: open the Hands (Spark) dev environment over the mesh (Tailscale
 # SSH). The workspace surfaces live cell runs at .cells/ and the cell branches —
