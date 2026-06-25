@@ -60,6 +60,41 @@ def enable_command(port: int | None = None) -> str:
     )
 
 
+# Cheap, cached liveness of the CDP control port. The routes primitive reads
+# this at turn-time (in _build_context) so the conductor SENSES a dead IDE route
+# before choosing it — instead of crashing into it and handing the owner a
+# fix-it command (the "FUCK YOU, I'm 100 miles away, figure it out" forensic,
+# 2026-06-25). Sync + TTL-cached so a per-turn read never costs latency or an
+# inline async probe; a refused localhost connect is instant.
+import socket as _socket
+
+_CDP_HEALTH_TTL = 5.0
+_cdp_health_cache: tuple[float, bool] = (0.0, False)
+
+
+def cdp_up(port: int | None = None) -> bool:
+    """True if the Cursor CDP control port accepts a connection right now.
+
+    A bare TCP connect is the cheap proxy for "IDE control is reachable from
+    here". Cached for `_CDP_HEALTH_TTL`s. Never raises — an unreachable port is
+    a clean False (the route is down), never an exception that masks the read.
+    """
+    global _cdp_health_cache
+    p = int(port if port is not None else config.cursor_cdp_port)
+    now = time.monotonic()
+    ts, val = _cdp_health_cache
+    if now - ts < _CDP_HEALTH_TTL:
+        return val
+    up = False
+    try:
+        with _socket.create_connection((CDP_HOST, p), timeout=0.25):
+            up = True
+    except OSError:
+        up = False
+    _cdp_health_cache = (now, up)
+    return up
+
+
 # ---------------------------------------------------------------------------
 # The truth gate: the on-disk transcript advancing is the only "landed" signal
 # ---------------------------------------------------------------------------

@@ -268,6 +268,24 @@ def _build_context(session_key: str = "") -> str:
     except Exception:
         log.debug("context: capability preconditions omitted", exc_info=True)
 
+    # Routes health (sense before emit, turn-time): if IDE control (CDP) is down,
+    # the conductor must ROUTE AROUND to the same intent — not hand the owner a
+    # fix-it command they may be 100 miles from running. A dead route is data to
+    # route around, never a stop. Escalate the one-command fix only if NO live
+    # route reaches the goal.
+    try:
+        from .cursor_ide_driver import cdp_up, enable_command
+        if not cdp_up():
+            lines.append(
+                "  cursor IDE control: DOWN (CDP port closed). Do NOT hand the user "
+                "a fix-it command if the goal is reachable another way — deliver the "
+                "SAME intent via a live route (cursor_send to an `sdk` agent, or a "
+                "spark Claude Code run). Surface the one-command fix ONLY if no route "
+                f"reaches the goal: {enable_command()}"
+            )
+    except Exception:
+        log.debug("context: cursor control health omitted", exc_info=True)
+
     try:
         remaining = max(0.0, config.daily_spend_cap_usd - get_daily_spend())
         lines.append(
