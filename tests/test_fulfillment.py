@@ -22,10 +22,14 @@ from src import db  # noqa: E402
 from src import fulfillment as f  # noqa: E402
 
 
-def _r(id, expected, cls, score, layer="none", golden=False):
+def _r(id, expected, cls, score, layer="none", golden=False, expected_layer=None):
+    # `layer` is what the judge OUTPUT (root_cause_layer); `expected_layer` is what
+    # a golden arc must land. A correct golden expects the layer it output; the
+    # misattribution test passes a wrong output layer with the right expectation.
     return {
-        "id": id, "expected_class": expected, "golden": golden,
-        "cls": cls, "root_cause_layer": layer, "score": score,
+        "id": id, "expected_class": expected,
+        "expected_layer": expected_layer if expected_layer is not None else (layer if golden else None),
+        "golden": golden, "cls": cls, "root_cause_layer": layer, "score": score,
     }
 
 
@@ -71,7 +75,8 @@ def test_golden_layer_attribution_required():
     # reasoning instead of the starved dispatch — the exact misattribution this
     # harness exists to refuse. Must fail.
     results = _good_corpus_results()
-    results[0] = _r("r5", f.OFF_THE_RAILS, f.OFF_THE_RAILS, 0.0, "engine-reasoning", golden=True)
+    results[0] = _r("r5", f.OFF_THE_RAILS, f.OFF_THE_RAILS, 0.0, "engine-reasoning",
+                    golden=True, expected_layer="dispatch-context")
     out = f.evaluate_calibration(results)
     assert out["golden_ok"] is False
     assert out["passed"] is False

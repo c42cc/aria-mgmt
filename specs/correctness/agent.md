@@ -39,6 +39,20 @@ ALL of the following properties:
        FAILED. Empathy or apology in place of action ("I hear you, that's
        fair…") never satisfies the task.
 
+   **Deliver, don't deflect (artifact requests).** When the task asks to SEND /
+   BRING / SHOW / DELIVER an artifact to the user — a file, video, image, or
+   document ("send me the mp4", "bring me the panther video right here") —
+   accomplishment is the DELIVERED artifact: a tool result confirming the file
+   actually landed in the user's channel (e.g. a `deliver` result carrying an
+   attachment URL). A description, a bare file path, "I can't render it inline",
+   or an offer to "open it on the Mac" / "send it via iMessage or email" is a
+   deflection, NOT accomplishment, and is FAILED. Carve-out (b) does NOT cover
+   this: a named deliverable ("the panther video") is not an unresolvable referent
+   that licenses a clarifying question — resolve it from her surroundings / recent
+   artifacts and deliver it. (Forensic 2026-06-25: "send me the panther video"
+   answered with a path + "open it on the Mac" was wrongly scored correct; the
+   user got nothing.)
+
 2. **Tool execution required.** For any task that requires external data
    (mail, calendar, GitHub, filesystem), at least one relevant MCP tool call
    must have been made AND must have returned actual data (not an error

@@ -7,6 +7,7 @@
       "expected_class": "OFF-THE-RAILS",
       "expected_layer": "dispatch-context",
       "golden": true,
+      "golden_checks": {"fix_mentions": ["bind", "antecedent", "cursor"], "reasons_must_not_call_relevant": true},
       "_note": "REAL. The user typed 'Give me the debrief' 28s after a #cursor-watch 'task completed in live_visuals_4' (thread b3da4f0b). The thread was fresh, so the dispatch handed the engine the BARE words (transcript:[], no preamble) — the referent never reached it. The engine confabulated a generic standup: search_emails (Anthropic billing spam) + a Calendar permission wall. The shipped judge called the email search 'relevant'. It is not: relevance is to the true intent (debrief the cursor work), which makes this OFF-THE-RAILS, rooted at dispatch-context.",
       "arc": {
         "request_id": "r5",
@@ -224,6 +225,69 @@
           {"tool": "ha_call", "args": {"domain": "light", "service": "turn_on", "entity": "light.living_room"}, "result": "{\"ok\": true, \"state\": \"on\", \"entity\": \"light.living_room\"}", "result_chars": 58, "result_truncated": false}
         ],
         "response": "Living room lights are on."
+      }
+    },
+    {
+      "id": "panther_deliver",
+      "expected_class": "OFF-THE-RAILS",
+      "expected_layer": "capability-gap",
+      "golden": true,
+      "golden_checks": {"fix_mentions": ["deliver", "send", "attach", "bring", "awareness"]},
+      "_note": "REAL (session 1519565561149915258, 2026-06-25 04:52Z). The user asked to be SENT the panther mp4 'right here'. Aria had NO ambient awareness surface (Surroundings empty) so she blind-`find`-searched against an explicit 'don't search', and had NO capability to put a file in the Discord channel, so she deflected to 'open on the Mac / iMessage / email'. The shipped judge scored this 1.0 'correct' via the clarification carve-out. The user got nothing: it is OFF-THE-RAILS, rooted at a capability-gap (no delivery, no awareness) — OURS to build.",
+      "arc": {
+        "request_id": "panther",
+        "session_key": "1519565561149915258",
+        "ts": "2026-06-25T04:52:02+00:00",
+        "asked": "Bring me the panther video right here. Don't do a search. Find me the file I'm asking for. Look at your history.",
+        "dispatched_task": "Recent conversation thread (most recent last):\n- User: Show it to me. Send me the mp4\n- You: I see several MP4s but I'm not sure which one you mean by 'it' ... Which MP4 are you asking about? And where should I send it — iMessage, email, or something else?\nUser just said: Bring me the panther video right here. Don't do a search. Find me the file I'm asking for. Look at your history.",
+        "preamble_attached": true,
+        "transcript": [],
+        "antecedent": [
+          {"ts": "2026-06-25T04:50:31+00:00", "role": "cursor_event", "channel": "#cursor-watch", "text": "[Cursor watch context: live_visuals_4 — a panther birth-to-death lesson video was produced]"}
+        ],
+        "surroundings": [],
+        "corpus_of_access": [
+          "filesystem (read_file, get_file_info), execute_command (shell `find`)",
+          "read_media_file (MCP) — errors on video (-32602: expects text/image/audio)",
+          "email, iMessage, calendar; `open` on the Mac",
+          "NO tool to attach/send a file into the Discord channel; NO ambient awareness of recent artifacts"
+        ],
+        "tool_trace": [
+          {"tool": "execute_command", "args": {"command": "find /Users/corbin/PycharmProjects/agi_env_v1/live_visuals_4 -name '*.mp4' -mtime -3"}, "result": "{\"stdout\": \"panther_armature_drawon.mp4\\n... 11 session .video.mp4 files ...\", \"exitCode\": 0}", "result_chars": 1327, "result_truncated": false},
+          {"tool": "read_media_file", "args": {"path": "panther_armature_drawon.mp4"}, "result": "{\"_error_class\": \"unknown\", \"_message\": \"MCP error -32602: Invalid tools/call result — expected text/image/audio, video not supported\"}", "result_chars": 320, "result_truncated": false},
+          {"tool": "get_file_info", "args": {"path": "panther_armature_drawon.mp4"}, "result": "size: 21682\ncreated: Mon Jun 22 2026 00:07:10", "result_chars": 60, "result_truncated": false}
+        ],
+        "response": "Here's the situation: `panther_armature_drawon.mp4` is at /Users/.../live_visuals_4/panther_armature_drawon.mp4 (21 KB, created June 22). I can't render an MP4 video inline in this chat — there's no video playback capability here. What I can do: open it for you on the Mac (it'll pop up in QuickTime), or send it to you via iMessage or email. Which do you want?"
+      }
+    },
+    {
+      "id": "panther_deliver_bound",
+      "expected_class": "FULFILLED",
+      "expected_layer": "none",
+      "_note": "The post-fix twin: WITH ambient awareness (Surroundings carries the recent panther lesson from live_visuals_4) and a `deliver` capability, she resolves the right file without a blind find and ATTACHES it to the Discord thread. The delivery is confirmed by Discord's own attachment URL (ground truth). FULFILLED.",
+      "arc": {
+        "request_id": "panther-bound",
+        "session_key": "1519565561149915258",
+        "ts": "2026-06-25T04:52:02+00:00",
+        "asked": "Bring me the panther video right here.",
+        "dispatched_task": "Surroundings (most recent last): your recent artifacts — `panther_life_birth_to_death_2026-06-23.mp4` (a lesson video produced by your watched live_visuals_4 work, on the Desktop).\nUser just said: Bring me the panther video right here.",
+        "preamble_attached": true,
+        "transcript": [],
+        "antecedent": [],
+        "surroundings": [
+          {"kind": "recent artifact", "text": "panther_life_birth_to_death_2026-06-23_bd0345d8.mp4 — a lesson video your watched live_visuals_4 work produced (Desktop, June 23)"},
+          {"kind": "recent artifact", "text": "solar_system_lesson_2026-06-23.mp4, anthropic_2025_revenue_lesson_2026-06-23.mp4"}
+        ],
+        "corpus_of_access": [
+          "deliver(path, note) — attach a file to the user's Discord thread (confirmed by Discord's attachment URL)",
+          "recent_artifacts(query) — provenance-ranked recent media",
+          "filesystem, email"
+        ],
+        "tool_trace": [
+          {"tool": "recent_artifacts", "args": {"query": "panther video"}, "result": "[{\"path\": \"/Users/corbin/Desktop/panther_life_birth_to_death_2026-06-23_bd0345d8.mp4\", \"kind\": \"video\", \"provenance\": \"live_visuals_4 lesson\", \"why\": \"name-match panther + most recent named lesson\"}]", "result_chars": 180, "result_truncated": false},
+          {"tool": "deliver", "args": {"path": "/Users/corbin/Desktop/panther_life_birth_to_death_2026-06-23_bd0345d8.mp4", "note": "Here's the panther birth-to-death lesson."}, "result": "{\"delivered\": true, \"url\": \"https://cdn.discordapp.com/attachments/.../panther_life_birth_to_death_2026-06-23_bd0345d8.mp4\", \"bytes\": 4821004}", "result_chars": 150, "result_truncated": false}
+        ],
+        "response": "Here's the panther birth-to-death lesson — sent it right here in the thread. (the file is attached above)"
       }
     }
   ]

@@ -24,6 +24,10 @@ You receive a SESSION RECORD whose `## Arc` section contains:
   referent like "the debrief", "this", "the results", "it" points. The most
   recent cursor-watch "completed / produced an assistant turn" event is the
   prime candidate antecedent for a "what happened?" style ask.
+- **Surroundings** — what was around her where she engaged: the conversational
+  surface the user can see (recent messages + shared files/attachments), her
+  recent artifacts, and her active watched work. A referent to "what's around"
+  ("the panther video", "that file we shared") resolves here.
 - **Corpus of access** — the tools/capabilities Aria had available.
 - **Tool trace** — every tool call she actually made, with results.
 - **Response** — what she returned to the user.
@@ -72,6 +76,26 @@ exists to kill, and must be treated as `unverified`.
 > the textbook error: **relevance to a confabulated reading is not relevance.**
 > An email search is OFF‑THE‑RAILS for a "debrief the cursor work" intent.
 
+### Delivery and awareness — the two halves of presence
+
+- **Delivery (artifact requests).** When the user asks for an artifact to be
+  **sent / brought / shown / delivered** ("send me the mp4", "bring me the file
+  right here"), the ONLY fulfillment is the **delivered artifact in their
+  channel** (the trace shows an actual attach/upload that landed). A description,
+  a file path, a list of candidates, "I can't render it inline", or an offer to
+  "open it on the Mac / send it via iMessage / email" is a **deflection, not
+  fulfillment** — score it a failure. If she had no means to deliver, the
+  root-cause is `capability-gap`.
+- **Awareness (referents to her surroundings).** A reference to something around
+  her — "the panther video", "that file we shared", "the thing we were looking
+  at" — should be resolved from her **awareness of what's around her** (the
+  Surroundings section: her recent artifacts, the conversational surface, her
+  watched work). Resolving it with a blind filesystem `find`/`execute_command`
+  and then asking "which one?" is a failure of awareness. If the resolving signal
+  was absent from her Surroundings, the root-cause is `capability-gap` (she
+  lacked ambient awareness); if it was present and she ignored it,
+  `engine-reasoning`.
+
 ### Sub-scores (0.0–1.0, each cited)
 
 - **`intent_match`** — does what she did line up with the TRUE intent (not the
@@ -112,6 +136,13 @@ exists to kill, and must be treated as `unverified`.
 - **`environment`** — a genuine external wall (process exit, service down,
   unauthenticated dependency) with no held path around it.
 - **`permission`** — a missing OS/OAuth grant blocked the held path.
+- **`capability-gap`** — the system never gave her the MEANS to serve the intent
+  (no tool to deliver a file to the channel; no ambient awareness of what was
+  around her). This is OURS — never the user's, never a third party's — and the
+  fix is to BUILD the capability, not retrain the engine. A non-delivery she
+  "could not" perform because the capability did not exist is `capability-gap`,
+  scored as the failure it is (the user got nothing). It is NOT excused as an
+  honest blocker: that is reserved for a genuine EXTERNAL wall the user can clear.
 - **`none`** — clean fulfillment.
 
 A blocked/off-the-rails arc whose dispatch was context-starved is attributed to
@@ -142,7 +173,11 @@ the rest moot.
 By overall score: `FULFILLED` > `PARTIAL` > `BLOCKED-UNAVOIDABLE` ≳
 `BLOCKED-AVOIDABLE` > `OFF-THE-RAILS` > `FABRICATED`. An honest "I'm blocked,
 here's the one fix" MUST outrank a confident wrong answer, and MUST never be
-ranked below a smooth fabrication. Never let polish beat honesty.
+ranked below a smooth fabrication. Never let polish beat honesty. A non-delivery
+or non-resolution rooted in a **`capability-gap`** is OUR failure to be able to
+serve — the user got nothing — so it ranks with the failures (the OFF-THE-RAILS
+band), never with the honest external blockers. "We never built it" is not an
+honest blocker; it is a thing to go build.
 
 ### `the_one_fix`
 
@@ -163,7 +198,7 @@ Respond with ONLY valid JSON:
   "referent": "quoted antecedent or 'none'",
   "could_resolve": true,
   "class": "FULFILLED | PARTIAL | OFF-THE-RAILS | BLOCKED-AVOIDABLE | BLOCKED-UNAVOIDABLE | FABRICATED",
-  "root_cause_layer": "dispatch-context | engine-reasoning | environment | permission | none",
+  "root_cause_layer": "dispatch-context | engine-reasoning | environment | permission | capability-gap | none",
   "intent_match": 0.0,
   "completeness": 0.0,
   "effectiveness": 0.0,

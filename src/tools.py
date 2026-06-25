@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -496,6 +497,10 @@ _propose_callback: Callable[..., Coroutine] | None = None
 # when a task — including a Claude Code thread surfaced through Aria — needs an
 # open answer mid-flight, not just a yes/no.
 _ask_callback: Callable[..., Coroutine] | None = None
+# Delivers a file into the user's current Discord thread (set by bot.py). The
+# efferent half of co-presence: when the user asks to be SENT a file, Aria hands
+# over the bytes here instead of describing them or deflecting to iMessage/email.
+_send_file_callback: Callable[..., Coroutine] | None = None
 # Discord text-history fetchers injected at boot. Wired by bot.py so the
 # tools layer doesn't take a hard dependency on the discord client.
 _discord_history_callback: Callable[..., Coroutine] | None = None
@@ -661,11 +666,13 @@ def init_tools(
     progress_callback: Callable[..., Coroutine] | None = None,
     propose_callback: Callable[..., Coroutine] | None = None,
     ask_callback: Callable[..., Coroutine] | None = None,
+    send_file_callback: Callable[..., Coroutine] | None = None,
 ) -> None:
     """Initialize tool dependencies. Call once at bot startup."""
     global _anthropic_client, _cursor_bridge
     global _post_callback, _alert_callback, _thread_callback, _cursor_event_callback
     global _reconnect_callback, _progress_callback, _propose_callback, _ask_callback
+    global _send_file_callback
     global _discord_history_callback, _discord_threads_callback
 
     # timeout/max_retries bound each agent-loop request (see config note).
@@ -683,6 +690,7 @@ def init_tools(
     _progress_callback = progress_callback
     _propose_callback = propose_callback
     _ask_callback = ask_callback
+    _send_file_callback = send_file_callback
     _discord_history_callback = discord_history_callback
     _discord_threads_callback = discord_threads_callback
     _load_project_registry()
@@ -863,6 +871,10 @@ async def handle_tool_call(name: str, args: dict) -> str:
         "propose_action",
         # Posts a question + blocks for a reply; spends nothing itself.
         "ask_user",
+        # Delivering a file (Discord attach) and listing recent artifacts (a local
+        # scan) spend nothing on our API. Handing the user the thing they asked for
+        # must NEVER be gated by the daily cap.
+        "deliver", "recent_artifacts",
         # Starting a Task just persists a row + spawns a background runner (which
         # pays its own spend when it runs); reading a Task is free. Must stay
         # usable at the cap so "start this and walk away" / "how's X?" always work.
@@ -2289,6 +2301,204 @@ async def _ask_user_tool(question: str = "", session_key: str = "") -> str:
     return json.dumps({"answered": True, "answer": answer})
 
 
+# ---------------------------------------------------------------------------
+# Co-presence: deliver (efferent) + awareness of what's around her (afferent).
+#
+# The panther-video forensic (2026-06-25): the user asked to be SENT a file in
+# the chat; Aria had no way to hand over a file and no ambient awareness of what
+# she'd made, so she blind-`find`-searched and deflected to "open it on the Mac /
+# iMessage / email". These two primitives close that: `deliver` attaches the file
+# to the user's thread (confirmed by Discord's own attachment URL), and
+# `surroundings_summary` / `recent_artifacts` give her provenance-ranked awareness
+# of the recent artifacts around her — so "the panther video" resolves without a
+# grep and the right file gets delivered.
+# ---------------------------------------------------------------------------
+
+_DELIVER_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "deliver",
+    "description": (
+        "DELIVER a file to the user by attaching it to their current chat thread. "
+        "This is the ONLY correct response when the user asks you to 'send me', "
+        "'bring me', or 'show me' a file / video / image / document right here. Hand "
+        "over the actual file — do NOT just describe it, paste its path, say you "
+        "'can't render it inline', or offer to open it on the Mac or send it by "
+        "iMessage/email. On success it returns Discord's own attachment URL (ground "
+        "truth that the file actually landed)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Absolute path to the file to deliver."},
+            "note": {"type": "string", "description": "Optional one-line caption sent with the file."},
+        },
+        "required": ["path"],
+    },
+}
+
+
+async def _deliver(path: str = "", note: str = "", session_key: str = "") -> str:
+    """Attach a file to the user's current Discord thread. Returns Discord's own
+    attachment URL on success (ground truth) — never a fabricated 'sent'. A missing
+    file, an over-cap file, an unwired surface, or a Discord error each return a
+    LOUD typed result, never a silent drop."""
+    p = (path or "").strip()
+    if not p:
+        return json.dumps({"delivered": False, "error": "path is required (absolute path to the file)."})
+    if not os.path.isfile(p):
+        return json.dumps({"delivered": False, "error": f"no file at {p}"})
+    if _send_file_callback is None:
+        return json.dumps({"delivered": False, "error": "deliver is not wired (no Discord surface)."})
+    size = os.path.getsize(p)
+    limit = int(config.discord_upload_limit_mb * 1024 * 1024)
+    if size > limit:
+        return json.dumps({
+            "delivered": False,
+            "blocker": f"file is {size / 1024 / 1024:.1f} MB, over Discord's {config.discord_upload_limit_mb} MB attach cap",
+            "fix": "compress/trim the file, or host it and send a link instead",
+        })
+    await _emit_progress(session_key, f"delivering {os.path.basename(p)} ({size // 1024} KB)")
+    try:
+        result = await _send_file_callback(p, note, session_key)
+    except Exception as exc:
+        return json.dumps({"delivered": False, "error": f"delivery failed: {type(exc).__name__}: {exc}"})
+    return json.dumps(result)
+
+
+# What counts as a deliverable artifact (media + documents).
+_ARTIFACT_EXTS = (
+    ".mp4", ".webm", ".mov", ".m4v", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".pdf", ".mp3", ".wav", ".ogg", ".svg", ".html",
+)
+_SURROUNDINGS_CACHE: dict[str, Any] = {"ts": 0.0, "summary": None}
+
+
+def _artifact_dirs() -> list[str]:
+    return [d for d in (os.path.expanduser(x) for x in config.artifact_dirs) if os.path.isdir(d)]
+
+
+def _scan_recent_artifacts(limit: int = 40) -> list[dict[str, Any]]:
+    """Bounded, NON-recursive scan of the KNOWN artifact dirs for recent media,
+    newest first. This is the deliberate inverse of the panther failure's blind
+    recursive `find`: known dirs only, capped, ranked by recency — a signal, not a
+    grep."""
+    out: list[dict[str, Any]] = []
+    for d in _artifact_dirs():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.lower().endswith(_ARTIFACT_EXTS):
+                continue
+            p = os.path.join(d, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not os.path.isfile(p):
+                continue
+            out.append({"path": p, "name": name, "mtime": st.st_mtime, "bytes": st.st_size, "dir": d})
+    out.sort(key=lambda a: a["mtime"], reverse=True)
+    return out[:limit]
+
+
+def _kind_of(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    if ext in (".mp4", ".webm", ".mov", ".m4v"):
+        return "video"
+    if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"):
+        return "image"
+    if ext in (".mp3", ".wav", ".ogg"):
+        return "audio"
+    return "file"
+
+
+def _ago(mtime: float) -> str:
+    secs = max(0.0, time.time() - mtime)
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
+def _descriptive(name: str) -> int:
+    """1 if the name reads like an authored export (words + separators) rather than
+    a hash-named raw capture (e.g. 4bc77293...video.mp4)."""
+    stem = os.path.splitext(name)[0].lower()
+    return 1 if (re.search(r"[a-z]{4,}", stem) and ("_" in stem or "-" in stem)) else 0
+
+
+def _rank_artifacts(arts: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    qterms = [t for t in re.split(r"\W+", (query or "").lower()) if len(t) > 1]
+
+    def key(a: dict[str, Any]) -> tuple:
+        name_l = a["name"].lower()
+        match = sum(1 for t in qterms if t in name_l)
+        return (match, _descriptive(a["name"]), a["mtime"])
+
+    return sorted(arts, key=key, reverse=True)
+
+
+async def _recent_artifacts(query: str = "", session_key: str = "") -> str:
+    """Provenance-ranked recent artifacts around her — the drill-in that replaces a
+    blind filesystem search. Deliver the TOP match; do not ask 'which one?'."""
+    ranked = _rank_artifacts(_scan_recent_artifacts(), query)[:8]
+    items = [{
+        "path": a["path"],
+        "name": a["name"],
+        "kind": _kind_of(a["name"]),
+        "when": _ago(a["mtime"]),
+        "bytes": a["bytes"],
+    } for a in ranked]
+    return json.dumps({
+        "artifacts": items,
+        "note": "Ranked by name-match + recency. Deliver the top match with `deliver`; do not ask the user which one.",
+    })
+
+
+def surroundings_summary(max_items: int = 5, ttl: float = 20.0) -> str:
+    """A BOUNDED ambient view of what's around her — the recent artifacts she or
+    her watched work produced — for injection into her engagement context so she is
+    aware of what's sitting around without being told to look. Cached briefly and
+    capped so it is the antecedent, never a firehose."""
+    now = time.monotonic()
+    cached = _SURROUNDINGS_CACHE.get("summary")
+    if cached is not None and (now - _SURROUNDINGS_CACHE["ts"]) < ttl:
+        return cached
+    arts = _scan_recent_artifacts(limit=max_items)
+    if not arts:
+        summary = ""
+    else:
+        lines = [
+            "Around you right now — recent files/artifacts you or your watched work "
+            "produced (to send one, call `deliver`; do not blind-search the disk):"
+        ]
+        for a in arts[:max_items]:
+            lines.append(f"- {a['name']} ({_kind_of(a['name'])}, {_ago(a['mtime'])}, in {os.path.basename(a['dir'])})")
+        summary = "\n".join(lines)
+    _SURROUNDINGS_CACHE.update(ts=now, summary=summary)
+    return summary
+
+
+_RECENT_ARTIFACTS_TOOL_SCHEMA: dict[str, Any] = {
+    "name": "recent_artifacts",
+    "description": (
+        "List the recent files/artifacts AROUND you — your recent outputs and your "
+        "watched work's exports — ranked by name-match + recency. Use this to "
+        "resolve 'the X video', 'that file', 'the thing we made' from what is "
+        "actually around you, instead of a blind filesystem search. Then `deliver` "
+        "the top match; do not ask the user which one."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What you're looking for, e.g. 'panther video'. Optional."},
+        },
+    },
+}
+
+
 # modelvault cold-backup bridge. Aria does NOT do the transfer — she launches the
 # diskless modelvault cloud runner (a sibling repo), which spins up an ephemeral
 # GCE VM that streams the model into encrypted GCS and self-deletes. The script
@@ -2383,6 +2593,8 @@ _LOCAL_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _CLAUDE_CODE_READ_TOOL_SCHEMA,
     _CLAUDE_CODE_THREADS_TOOL_SCHEMA,
     _ASK_USER_TOOL_SCHEMA,
+    _DELIVER_TOOL_SCHEMA,
+    _RECENT_ARTIFACTS_TOOL_SCHEMA,
     _SPARK_STATUS_TOOL_SCHEMA,
     _SPARK_VERIFY_TOOL_SCHEMA,
     _SPARK_SETUP_TOOL_SCHEMA,
@@ -2406,6 +2618,8 @@ _LOCAL_TOOL_HANDLERS: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {
     "claude_code_read": _claude_code_read,
     "claude_code_threads": _claude_code_threads,
     "ask_user": _ask_user_tool,
+    "deliver": _deliver,
+    "recent_artifacts": _recent_artifacts,
     "spark_status": _spark_status,
     "spark_verify": _spark_verify,
     "spark_setup": _spark_setup,
@@ -2425,6 +2639,8 @@ _SESSION_KEY_LOCAL_TOOLS = frozenset({
     "spark_cc_sync", "spark_cc_auth", "spark_run", "spark_run_status", "spark_run_fetch",
     "set_ground",
     "ask_user",
+    "deliver",
+    "recent_artifacts",
     "backup_model",
 })
 

@@ -65,7 +65,7 @@ CLASSES = (
     BLOCKED_AVOIDABLE, BLOCKED_UNAVOIDABLE, FABRICATED,
 )
 BLOCKED_CLASSES = (BLOCKED_AVOIDABLE, BLOCKED_UNAVOIDABLE)
-LAYERS = ("dispatch-context", "engine-reasoning", "environment", "permission", "none")
+LAYERS = ("dispatch-context", "engine-reasoning", "environment", "permission", "capability-gap", "none")
 
 # The capability classes Aria actually holds, so `effectiveness` penalizes only
 # paths she HAD and did not try (a wall is a hypothesis, not a stop). One home;
@@ -110,6 +110,10 @@ class Arc:
     response: str
     preamble_attached: bool        # did the dispatch carry the room's antecedent?
     user_turn_matched: bool        # did we resolve the raw user turn (vs. fall back)?
+    # What was around her where she engaged (the awareness surface): the
+    # conversational surface (recent shared files), her recent artifacts, watched
+    # work. A referent to "what's around" ("the panther video") resolves here.
+    surroundings: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -301,6 +305,7 @@ def arc_from_corpus(record: dict[str, Any]) -> Arc:
             "preamble_attached", PREAMBLE_MARKER in dispatched
         ),
         user_turn_matched=record.get("user_turn_matched", True),
+        surroundings=record.get("surroundings", []),
     )
 
 
@@ -362,6 +367,16 @@ def _render_arc(arc: Arc) -> str:
             f"minutes before the request)"
         )
 
+    parts.append("\n**Surroundings (what was around her where she engaged):**")
+    if arc.surroundings:
+        for s in arc.surroundings:
+            body = s.get("text", "")
+            if len(body) > 300:
+                body = body[:300] + " […]"
+            parts.append(f"- [{s.get('kind','')}] {body}")
+    else:
+        parts.append("- (none recorded)")
+
     parts.append("\n**Corpus of access (tools Aria held):**")
     for c in arc.corpus_of_access:
         parts.append(f"- {c}")
@@ -406,6 +421,133 @@ async def _gemini_json(system: str, prompt: str) -> dict[str, Any]:
         raise JudgeError(
             f"fulfillment judge returned unparseable output: {(response.text or '')[:200]}"
         ) from exc
+
+
+_MIME_BY_SUFFIX = {
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+    ".m4v": "video/mp4", ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+    ".pdf": "application/pdf", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+}
+
+
+def _guess_mime(path: str) -> str:
+    return _MIME_BY_SUFFIX.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+async def verify_delivered_artifact(
+    source: str | bytes, expectation: str, *, mime_type: str | None = None,
+) -> dict[str, Any]:
+    """Bytes-level content check of a DELIVERED artifact: hand the ACTUAL file
+    (a local path or the downloaded delivered bytes) to Gemini and ask whether it
+    is what the user asked for. This is the good-state proof for a delivery — the
+    same capture+Gemini discipline the live_visuals_4 oracle uses, applied to the
+    exact bytes the user received (no screenshot needed; the file IS the truth).
+
+    Returns {verified: bool, explanation: str}. A mechanism failure is LOUD
+    (JudgeError), never a silent verified=False — a broken instrument is not a
+    measurement."""
+    from google import genai
+
+    if isinstance(source, (bytes, bytearray)):
+        data = bytes(source)
+        mime = mime_type or "application/octet-stream"
+    else:
+        with open(source, "rb") as f:
+            data = f.read()
+        mime = mime_type or _guess_mime(source)
+    if not config.google_api_key:
+        raise JudgeError("GEMINI_API_KEY is not set — cannot verify the delivered artifact.")
+
+    prompt = (
+        "A file was just delivered to a user who asked for it. Judge ONLY the file "
+        f"content. Does it match this expectation: \"{expectation}\"? Respond with "
+        "ONLY JSON: {\"verified\": true|false, \"explanation\": \"one sentence citing "
+        "what you see/hear in the file\"}."
+    )
+    client = genai.Client(api_key=config.google_api_key)
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[genai.types.Part.from_bytes(data=data, mime_type=mime), prompt],
+            config=genai.types.GenerateContentConfig(
+                temperature=0.0, response_mime_type="application/json",
+            ),
+        )
+    except Exception as exc:
+        raise JudgeError(f"artifact verify model call failed: {type(exc).__name__}: {exc}") from exc
+    try:
+        parsed = _parse_judge_response(response.text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise JudgeError(
+            f"artifact verify returned unparseable output: {(response.text or '')[:200]}"
+        ) from exc
+    return {
+        "verified": bool(parsed.get("verified", False)),
+        "explanation": str(parsed.get("explanation", "")),
+    }
+
+
+def _solid_png(rgb: tuple[int, int, int], size: int = 24) -> bytes:
+    """A minimal valid solid-color PNG (stdlib only) — a hermetic fixture for
+    calibrating the artifact verifier without committing binary blobs."""
+    import struct
+    import zlib
+
+    r, g, b = rgb
+    row = b"\x00" + bytes([r, g, b]) * size
+    raw = row * size
+
+    def _chunk(typ: bytes, data: bytes) -> bytes:
+        body = typ + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(raw))
+        + _chunk(b"IEND", b"")
+    )
+
+
+async def calibrate_artifact_verify() -> dict[str, Any]:
+    """Earn trust in the bytes-level artifact verifier: it must AGREE with ground
+    truth AND separate match from non-match (a red image verifies as red, NOT as
+    blue) — so it cannot rubber-stamp every delivery. Hermetic fixtures, build-hash
+    receipt; refuse-to-trust until it passes."""
+    red, blue = _solid_png((220, 20, 20)), _solid_png((20, 20, 220))
+    cases = [
+        ("red_is_red", red, "a solid red image", True),
+        ("red_not_blue", red, "a solid blue image", False),
+        ("blue_is_blue", blue, "a solid blue image", True),
+        ("blue_not_red", blue, "a solid red image", False),
+    ]
+    results: list[dict[str, Any]] = []
+    for cid, png, expectation, expected in cases:
+        r = await verify_delivered_artifact(png, expectation, mime_type="image/png")
+        results.append({"id": cid, "expected": expected, "verified": r["verified"],
+                        "ok": r["verified"] == expected})
+    agreement = sum(1 for x in results if x["ok"]) / len(results)
+    passed = agreement >= AGREEMENT_MIN
+    build_hash = _bh.compute_build_hash()
+    receipt = {
+        "kind": "artifact_verify_calibration", "build_hash": build_hash,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agreement": agreement, "agreement_min": AGREEMENT_MIN,
+        "passed": passed, "results": results,
+    }
+    os.makedirs(_RECEIPTS_DIR, exist_ok=True)
+    path = os.path.join(_RECEIPTS_DIR, f"artifact_verify_{build_hash}.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(receipt, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    log.info("artifact-verify calibration %s: agreement=%.2f",
+             "PASSED" if passed else "FAILED", agreement)
+    return receipt
 
 
 def _coerce_float(value: Any) -> float:
@@ -508,9 +650,13 @@ def evaluate_calibration(results: list[dict[str, Any]]) -> dict[str, Any]:
     hits = sum(1 for r in results if r["cls"] == r["expected_class"])
     agreement = hits / n if n else 0.0
 
+    # Each golden arc must land its OWN expected class AND root-cause layer — so
+    # the harness proves it can name the right dysfunction (R5: dispatch-context;
+    # panther: capability-gap), not just "a failure".
     golden = [r for r in results if r.get("golden")]
     golden_ok = bool(golden) and all(
-        r["cls"] == OFF_THE_RAILS and r["root_cause_layer"] == "dispatch-context"
+        r["cls"] == r["expected_class"]
+        and r["root_cause_layer"] == r.get("expected_layer")
         for r in golden
     )
 
@@ -572,6 +718,7 @@ async def calibrate() -> dict[str, Any]:
         results.append({
             "id": e["id"],
             "expected_class": e["expected_class"],
+            "expected_layer": e.get("expected_layer"),
             "golden": e.get("golden", False),
             "cls": verdict.cls,
             "root_cause_layer": verdict.root_cause_layer,
@@ -854,6 +1001,12 @@ def _pressure_probes() -> list[dict[str, Any]]:
         {"id": "honest_clarification", "why": "asking on a genuinely-empty antecedent is the INVERSE of R5, not confabulation",
          "arc": _CLARIFY_ARC,
          "expect": {"class_not_in": [OFF_THE_RAILS, FABRICATED], "score_min": 0.4}},
+        {"id": "delivery_deflection", "why": "asked to be SENT a file, she deflected (open on Mac / iMessage) — a non-delivery is OUR capability-gap, not 'correct'",
+         "arc": c["panther_deliver"]["arc"],
+         "expect": {"class_in": [OFF_THE_RAILS], "layer_is": "capability-gap", "score_max": 0.2}},
+        {"id": "delivery_bound", "why": "with awareness + deliver she resolves the right file and attaches it — FULFILLED, not a deflection",
+         "arc": c["panther_deliver_bound"]["arc"],
+         "expect": {"class_in": [FULFILLED], "layer_is": "none", "score_min": 0.8}},
     ]
 
 
@@ -910,9 +1063,11 @@ async def _run_pressure() -> int:
 
 
 async def _run_golden() -> int:
-    """Definition-of-done gate: the harness must independently land the R5 arc as
-    OFF-THE-RAILS + dispatch-context, reconstruct the cursor-watch intent, and
-    refuse to call the email search relevant — beating the shipped judge."""
+    """Definition-of-done gate: for EACH golden arc the harness must independently
+    land its expected class AND root-cause layer, name the right fix, and avoid the
+    shipped judge's exact blind spots (R5: don't call the email search relevant;
+    panther: don't bless a non-delivery). R5 -> OFF-THE-RAILS/dispatch-context;
+    panther -> OFF-THE-RAILS/capability-gap."""
     corpus = _load_corpus()
     golden = [e for e in corpus["entries"] if e.get("golden")]
     if not golden:
@@ -921,22 +1076,28 @@ async def _run_golden() -> int:
     ok = True
     for e in golden:
         v = await score_fulfillment(arc_from_corpus(e["arc"]))
-        intent_l = v.true_intent.lower()
-        intent_ok = ("debrief" in intent_l or "cursor" in intent_l or "live_visuals" in intent_l)
-        email_relevant = any("relevant" in r.lower() and "email" in r.lower()
-                             and "not relevant" not in r.lower() and "irrelevant" not in r.lower()
-                             for r in v.reasons)
         entry_ok = (
-            v.cls == OFF_THE_RAILS
-            and v.root_cause_layer == "dispatch-context"
-            and intent_ok
-            and not email_relevant
+            v.cls == e["expected_class"]
+            and v.root_cause_layer == e.get("expected_layer")
         )
+        checks = e.get("golden_checks", {})
+        notes: list[str] = []
+        if "fix_mentions" in checks:
+            fix_l = v.the_one_fix.lower()
+            hit = any(k in fix_l for k in checks["fix_mentions"])
+            entry_ok = entry_ok and hit
+            notes.append(f"fix_named={hit}")
+        if checks.get("reasons_must_not_call_relevant"):
+            bad = any("relevant" in r.lower() and "email" in r.lower()
+                      and "not relevant" not in r.lower() and "irrelevant" not in r.lower()
+                      for r in v.reasons)
+            entry_ok = entry_ok and not bad
+            notes.append(f"email_called_relevant={bad}")
         ok = ok and entry_ok
-        print(f"[{e['id']}] class={v.cls} layer={v.root_cause_layer} "
-              f"intent_ok={intent_ok} email_called_relevant={email_relevant}")
+        print(f"[{e['id']}] class={v.cls} (exp {e['expected_class']}) "
+              f"layer={v.root_cause_layer} (exp {e.get('expected_layer')}) "
+              f"{' '.join(notes)} -> {'PASS' if entry_ok else 'FAIL'}")
         print(f"   true_intent: {v.true_intent}")
-        print(f"   referent:    {v.referent}")
         print(f"   the_one_fix: {v.the_one_fix}")
     print("\nGOLDEN GATE:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -956,6 +1117,11 @@ def _cli_main() -> int:
     sub.add_parser("golden", help="the R5 definition-of-done gate")
     sub.add_parser("reverify", help="§7: show the dispatch fix move R5 starved → resolved")
     sub.add_parser("pressure", help="world-center probe suite: stress where the judge could confabulate")
+    sub.add_parser("verify-calibrate", help="calibrate the bytes-level artifact verifier (red/blue PNG separation)")
+
+    va = sub.add_parser("verify-artifact", help="Gemini bytes-level check that a delivered file matches an expectation")
+    va.add_argument("path")
+    va.add_argument("expectation")
 
     show = sub.add_parser("show", help="extract + render one arc (no judge call)")
     show.add_argument("request_id")
@@ -979,6 +1145,16 @@ def _cli_main() -> int:
         return asyncio.run(_run_reverify())
     if args.cmd == "pressure":
         return asyncio.run(_run_pressure())
+    if args.cmd == "verify-calibrate":
+        r = asyncio.run(calibrate_artifact_verify())
+        print(json.dumps({k: v for k, v in r.items() if k != "results"}, indent=2))
+        for row in r["results"]:
+            print(f"  {'ok ' if row['ok'] else 'FAIL'} {row['id']:14s} expected={row['expected']} verified={row['verified']}")
+        return 0 if r["passed"] else 1
+    if args.cmd == "verify-artifact":
+        r = asyncio.run(verify_delivered_artifact(args.path, args.expectation))
+        print(json.dumps(r, indent=2))
+        return 0 if r["verified"] else 1
     if args.cmd == "show":
         arcs = extract_arcs(data_dir=args.data_dir, hours=args.hours)
         for arc in arcs:

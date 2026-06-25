@@ -116,6 +116,18 @@ class Config:
     c42_url: str = os.getenv("C42_URL", "https://42c.pw/")
     c42_deploy_timeout_sec: float = float(os.getenv("C42_DEPLOY_TIMEOUT_SEC", "360"))
 
+    # Co-presence: file delivery + awareness of what's around her.
+    # Discord's default upload cap is 25 MiB; over it, `deliver` returns a typed
+    # blocker (host-and-link), never a silent failure or fabricated "sent".
+    discord_upload_limit_mb: float = float(os.getenv("DISCORD_UPLOAD_LIMIT_MB", "25"))
+    # The dirs her ambient awareness (surroundings_summary) and recent_artifacts
+    # scan newest-first and NON-recursively — where her exports/artifacts land.
+    # This is the deliberate inverse of the panther failure's blind recursive find.
+    artifact_dirs: list[str] = field(default_factory=lambda: [
+        d.strip() for d in os.getenv("ARIA_ARTIFACT_DIRS", "~/Desktop,~/Downloads").split(",")
+        if d.strip()
+    ])
+
     # Paths
     data_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
     prompts_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "prompts")

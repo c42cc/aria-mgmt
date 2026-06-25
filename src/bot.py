@@ -690,6 +690,30 @@ async def _emit_progress_to_user(text: str, session_key: str = "") -> None:
         log.debug("progress voice inject failed (non-fatal)", exc_info=True)
 
 
+async def _deliver_file_to_user(path: str, note: str = "", session_key: str = "") -> dict:
+    """Attach `path` to the user's request thread (session_key == the Discord
+    thread id) and return Discord's OWN attachment URL — the ground truth that the
+    file actually landed. The efferent half of co-presence: when the user asks to
+    be SENT a file, Aria hands over the bytes here.
+
+    Raises LOUD if the thread can't be resolved or Discord reports no attachment —
+    never a silent drop, never a fabricated 'sent' (the 2026-06-25 panther
+    forensic). `tools._deliver` turns the raise into a typed result for the engine.
+    """
+    target = None
+    if session_key and str(session_key).isdigit():
+        target = bot.get_channel(int(session_key))
+        if target is None:
+            target = await bot.fetch_channel(int(session_key))  # gateway cache miss
+    if target is None:
+        raise RuntimeError(f"no Discord thread to deliver into (session_key={session_key!r})")
+    msg = await target.send(content=(note or None), file=discord.File(path))
+    if not msg.attachments:
+        raise RuntimeError("Discord accepted the message but reported no attachment")
+    att = msg.attachments[0]
+    return {"delivered": True, "url": att.url, "filename": att.filename, "bytes": att.size}
+
+
 async def _post_confirmation_card(
     action_id: str, tool_name: str, summary: str
 ) -> discord.Message | None:
@@ -2360,6 +2384,7 @@ async def on_ready():
             progress_callback=_emit_progress_to_user,
             propose_callback=_propose_action,
             ask_callback=_ask_user,
+            send_file_callback=_deliver_file_to_user,
         )
         # Wire the Claude Code edit-before-submit review gate to the Discord/
         # voice confirmation surfaces. Claude Code narration rides the same
@@ -2970,23 +2995,33 @@ async def _run_ask(channel, message: str) -> None:
 def _augment_with_context(
     user_text: str, session_key: str = "", parent_channel: str = "",
 ) -> str:
-    """Prepend the request's conversational context to a Claude task, if any.
+    """Prepend the request's conversational context AND her ambient surroundings
+    to a Claude task.
 
-    Scoped to `session_key` (the request's thread) plus the recent user/aria
-    exchange from the same `parent_channel` — the room's own timeline. Thread
-    internals never bleed between requests, but a brand-new thread is no
-    longer amnesiac: "don't do anything with that" can resolve "that" from
-    the message sent in the same room seconds earlier (forensic 2026-06-12).
-    `exclude_last=1` drops the user turn the caller already recorded so it
-    isn't repeated in the task body.
+    Two awareness sources, bounded:
+    - the conversational surface (`as_claude_context`): the request's thread plus
+      the room's recent user/aria exchange and the cursor-watch antecedent (the §7
+      surface), so "that" / "the debrief" resolve;
+    - her surroundings (`tools.surroundings_summary`): a capped, cached view of the
+      recent artifacts she or her watched work produced, so "the panther video" /
+      "that file" resolve from what's around her instead of a blind disk search
+      (the 2026-06-25 panther forensic). Co-presence: she is aware of what's near
+      her wherever she engages.
+
+    `exclude_last=1` drops the user turn the caller already recorded so it isn't
+    repeated in the task body.
     """
+    from .tools import surroundings_summary
+
     ctx = conversation.as_claude_context(
         max_turns=10, exclude_last=1, session_key=session_key,
         parent_channel=parent_channel,
     )
-    if not ctx:
+    surroundings = surroundings_summary()
+    blocks = [b for b in (ctx.strip() if ctx else "", surroundings) if b]
+    if not blocks:
         return user_text
-    return f"{ctx}\nUser just said: {user_text}"
+    return f"{chr(10).join(blocks)}\nUser just said: {user_text}"
 
 
 async def _handle_text_conversation(message: discord.Message) -> None:
