@@ -253,19 +253,29 @@ class ConversationBuffer:
         if not include_alerts:
             candidates = [t for t in candidates if t.role != "alert"]
 
-        # Per-thread isolation WITH room continuity. A focused request sees:
-        #   1. its own thread's turns (session_key match), and
+        # Per-thread isolation WITH room continuity AND the cross-channel
+        # antecedent. A focused request sees:
+        #   1. its own thread's turns (session_key match),
         #   2. the recent user/aria exchange from the same parent channel —
-        #      the conversation a human assistant in that room would remember,
-        #      which is how "that" / "the plan" resolve (forensic 2026-06-12:
-        #      pure isolation severed the room timeline, so every top-level
-        #      message reached the agent with zero context).
-        # What it still NEVER sees: other channels' turns and the ambient
-        # Cursor-watch firehose (the 2026-06-09 `live_visuals_4` bleed) —
-        # voice and global callers (no session_key) keep the whole buffer.
+        #      how "that" / "the plan" resolve (forensic 2026-06-12: pure
+        #      isolation severed the room timeline, so every top-level message
+        #      reached the agent with zero context), AND
+        #   3. the most-recent cursor-watch events (role `cursor_event`),
+        #      BOUNDED to `_MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT` just below —
+        #      the "what just finished" a referential ask points at. Forensic
+        #      2026-06-24: "Give me the debrief" landed in a fresh thread 28s
+        #      after a cursor-watch "task completed in live_visuals_4"; dropping
+        #      cursor_events here starved the engine of its referent and it
+        #      confabulated an email/calendar standup (R5, OFF-THE-RAILS,
+        #      root-cause dispatch-context). The cap is the whole defense: it
+        #      makes this the ANTECEDENT, not the firehose bleed (the 2026-06-09
+        #      `live_visuals_4` flood) — a focused request still NEVER sees
+        #      other rooms' user/aria turns or more than the two latest
+        #      cursor-watch events. (`src/fulfillment.py` verifies the bind held:
+        #      a starved dispatch is exactly what its scorecard flags.)
         if session_key:
             def _keep(t: Turn) -> bool:
-                if t.role == "alert":
+                if t.role in ("alert", "cursor_event"):
                     return True
                 if t.session_key == session_key:
                     return True

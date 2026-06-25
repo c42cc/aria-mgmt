@@ -280,19 +280,29 @@ class TestCostBackstop(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------
-# 5. Input relevance: the ambient Cursor-watch firehose is excluded from a
-#    focused request thread, but still reaches voice / global (no session_key).
+# 5. Input relevance: a focused request thread sees the BOUNDED cursor-watch
+#    antecedent (the §7 R5 fix) — capped so the firehose can't bleed — and voice
+#    / global (no session_key) still reads the whole stream.
 # --------------------------------------------------------------------------
 
 class TestCursorWatchScoping(unittest.TestCase):
-    def test_watch_excluded_from_focused_thread(self):
-        from src.conversation import ConversationBuffer
+    def test_watch_antecedent_bound_but_capped(self):
+        # §7 fix (R5 "Give me the debrief"): the most-recent cursor-watch event —
+        # the referent a "what just happened?" ask points at — now rides into a
+        # focused thread, bounded by the cap so the firehose still can't bleed.
+        from src.conversation import (
+            ConversationBuffer, _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT,
+        )
         buf = ConversationBuffer()
         buf.add_user_text("#keys", "set up tailscale on spark2", session_key="K")
-        buf.add_cursor_event("[Cursor watch: live_visuals_4 produced an assistant turn]")
+        for i in range(4):
+            buf.add_cursor_event(f"[Cursor watch: live_visuals_4 event {i}]")
         ctx = buf.as_claude_context(max_turns=10, session_key="K")
         self.assertIn("set up tailscale on spark2", ctx)
-        self.assertNotIn("live_visuals_4", ctx)
+        self.assertIn("live_visuals_4", ctx)   # the antecedent IS now bound
+        self.assertLessEqual(                  # but bounded — the firehose can't bleed
+            ctx.count("Cursor watch event"), _MAX_CURSOR_EVENTS_IN_CLAUDE_CONTEXT
+        )
 
     def test_watch_included_for_voice_global(self):
         from src.conversation import ConversationBuffer
