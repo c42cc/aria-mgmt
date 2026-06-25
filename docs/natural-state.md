@@ -58,6 +58,39 @@ python -m src.visual_verify --url <u> --question "<intent>"   # capture + Gemini
 python scripts/ha_onboard.py             # (re)mint HASS_TOKEN on a fresh hub
 ```
 
+## Self-management, lockdown & data sovereignty (the "runs itself" survey)
+
+It is built to run itself and be relied on, with the fewest moving parts:
+
+- **Self-recovery.** The Mind (vLLM) and Home Assistant containers run
+  `--restart unless-stopped`, and docker is enabled on boot — so they auto-recover
+  from a crash AND survive a reboot. This is NOT a silent heal: the doctor surfaces
+  a down/flapping plane, so recovery is observable. A deliberate `stop` stays stopped.
+  *Proven*: killing HA's process auto-restarted it (RestartCount 0->1, back up in ~8s).
+- **Reliability over cost-shaving.** The conductor (the part that decides + drives the
+  go-gate) is **Opus on every turn** by default. A live test caught the fast tier
+  (haiku) skipping the CONFIRM phase, which silently jammed the go-gate; all-Opus
+  sequences CONFIRM->DISPATCH correctly. You're paying for reliability where it counts.
+- **Best judge.** The one Gemini visual judge prefers **gemini-3.1-pro-preview**
+  (verified live), with 2.5-flash as the fast fallback.
+- **Data sovereignty.** Local stays local: the local model (gpt-oss-120b), Home
+  Assistant, the conversation store, and the Floor never leave the tailnet. The ONLY
+  egress is the cloud judgment path (Opus) and the visual judge (Gemini):
+  - **Anthropic (Opus)** runs on commercial/API terms — no training on your prompts
+    (keep the account OUT of the Development Partner Program).
+  - **Gemini (visual judge)** sends only screenshots/frames. Use a **paid** Google key
+    (paid tier is not trained on; the free tier is). For sensitive HOME camera frames
+    later, prefer a LOCAL vision model on the Mind so images never leave — recorded as
+    the next data-sovereignty step.
+- **Exposure.** `:8000` (Mind) and `:8123` (HA) bind the LAN + tailnet, behind the home
+  router/NAT — no public route. HA is token-protected; the Mind answers only on your
+  network. Tighten the Mind to tailnet-only by binding its port to the tailnet IP if
+  you ever want to (one line in `serve_model.sh`); not needed for a trusted home.
+- **Secrets** live only in `.env` (gitignored; nothing secret is tracked in git).
+- **Simplicity.** Self-management = two primitives: auto-restart (recover) + `make doctor`
+  (observe). No extra daemon. If you want it to *ping you* when a plane is down, that's a
+  small scheduled doctor-check — a deliberate add, not built by default.
+
 ## Verified (the proofs, watched go green)
 
 - Mind: `/v1/models` -> `local-brain`; a real `local-ask` delivered at **$0 cloud** in ~3s.

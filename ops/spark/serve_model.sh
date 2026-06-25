@@ -145,9 +145,13 @@ start_container() {
   local args; args="$(vllm_args)"
   log "launching (container) '$SESSION' from $VLLM_IMAGE: vllm $args"
   docker rm -f "$SESSION" >/dev/null 2>&1 || true
-  # --restart no: a crash stays down (halt-don't-heal); the serve gate surfaces it.
+  # --restart unless-stopped: this is the home nervous system — it must self-recover
+  # from a crash AND survive a reboot (docker is enabled on boot). NOT silent: the
+  # doctor (src/doctor.py) surfaces a down/flapping Mind, so recovery is observable,
+  # never a hidden heal. A deliberate `serve_model.sh stop` still stays stopped.
+  # Override with RESTART_POLICY=no for a one-off build-verifier serve.
   # MXFP4 MoE (gpt-oss) wants the FlashInfer FP4 path; harmless for other models.
-  docker run -d --name "$SESSION" --restart no \
+  docker run -d --name "$SESSION" --restart "${RESTART_POLICY:-unless-stopped}" \
     --gpus all --shm-size=16g \
     -v "$HF_CACHE:/hf-cache" -e "HF_HUB_CACHE=/hf-cache" \
     -e VLLM_USE_FLASHINFER_MOE_FP4=1 -e VLLM_FLASHINFER_MOE_BACKEND=throughput \

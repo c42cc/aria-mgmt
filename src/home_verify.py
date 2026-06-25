@@ -24,7 +24,10 @@ import time
 from . import homeassistant
 from .config import config
 
-_GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+# Best-first (verified live 2026-06-25): the 3.1 Pro is the most accurate visual
+# judge (worth it — "is the door actually closed?" / "does this render match?");
+# 2.5-flash is the fast fallback. The one judge home, reused by visual_verify too.
+_GEMINI_MODELS = ["gemini-3.1-pro-preview", "gemini-2.5-flash", "gemini-2.0-flash"]
 
 
 def gemini_verdict(image: bytes, question: str) -> tuple[bool, str]:

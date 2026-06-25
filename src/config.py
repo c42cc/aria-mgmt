@@ -102,10 +102,13 @@ class Config:
     # thread ever outgrows this). And the default thread name.
     context_window_turns: int = int(os.getenv("ARIA_CONTEXT_TURNS", "200"))
     default_thread: str = os.getenv("ARIA_THREAD", "main").strip() or "main"
-    # Tiering (review 2.2): routine/interview turns use the fast model; the
-    # nuanced post-build REPORT stays on Opus. ~1.8x faster turns, routing + the
-    # guards verified to hold on the fast model. Set false to force all-Opus.
-    conductor_tier_routine: bool = os.getenv("ARIA_CONDUCTOR_TIER", "true").lower() == "true"
+    # Tiering: routine turns CAN use the fast model for speed. But a live test of
+    # the home nervous system showed the fast tier (haiku) skipping the CONFIRM
+    # phase, so the go-gate never fired and Aria could not act via conversation.
+    # For a system you rely on (and are OK paying for), the conductor is Opus on
+    # EVERY turn by default — the go-gate sequencing is verified to hold there.
+    # Set ARIA_CONDUCTOR_TIER=true to re-enable the fast tier for routine turns.
+    conductor_tier_routine: bool = os.getenv("ARIA_CONDUCTOR_TIER", "false").lower() == "true"
 
     # ── Paths ──────────────────────────────────────────────────────────────
     prompts_dir: Path = _REPO / "prompts"
