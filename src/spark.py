@@ -1100,7 +1100,10 @@ SERVE_MODELS: dict[str, dict] = {
     },
     "qwen3-30b-a3b": {
         "hf": "Qwen/Qwen3-30B-A3B", "parser": "hermes",
-        "max_model_len": 65536, "gpu_mem_util": "0.80",
+        # Qwen3-30B-A3B's max_position_embeddings is 40960 — vLLM (correctly)
+        # refuses a larger --max-model-len (RoPE would NaN). This was 65536 (a
+        # gpt-oss value copied by mistake); pinned to the model's real ceiling.
+        "max_model_len": 40960, "gpu_mem_util": "0.80",
         "note": "30B-A3B MoE — snappier first token, more room for context/concurrency",
     },
 }
