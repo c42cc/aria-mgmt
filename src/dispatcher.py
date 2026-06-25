@@ -89,6 +89,8 @@ def run(loop: Loop, slots: dict) -> DispatchResult:
         return _run_home(loop, slots)
     if loop.endpoint == "spark":
         return _run_spark(loop, slots)
+    if loop.endpoint == "hands":
+        return _run_hands(loop, slots)
     return DispatchResult(False, "", f"endpoint {loop.endpoint!r} is not wired yet", "", None, 0.0, "")
 
 
@@ -218,3 +220,71 @@ def _run_spark(loop: Loop, slots: dict) -> DispatchResult:
         broke, delivered = None, True
     summary = f"{elapsed:.0f}s; {len(text)} chars from {config.spark_model}. {text[:400]}"
     return DispatchResult(delivered, summary, broke, "", None, 0.0, getattr(resp, "id", ""))
+
+
+def _run_hands(loop: Loop, slots: dict) -> DispatchResult:
+    """The Hands endpoint — Aria manages the dev environment by dispatching a
+    BUILD cell to a Spark node (spark2). It is the ONE engine (Claude Code)
+    relocated onto the node: an isolated branch, the engineering doctrine in the
+    instruction, headless billing, and — the load-bearing part — verification
+    against GROUND TRUTH (the node's git state shows a real commit/diff), never
+    the cell's narration. Loud + no fallback: a launch/auth failure returns the
+    one fix; a finished-but-empty cell reads NOT delivered."""
+    import time as _time
+
+    from . import spark
+
+    keys = [s.key for s in (*loop.required_slots, *loop.optional_slots)]
+    filled = {k: (str(slots.get(k)).strip() if slots.get(k) else "none specified") for k in keys}
+    doctrine = prompts.load("_principles")
+    task = loop.dispatch.format(**filled).strip()
+    instruction = (
+        "[Operating doctrine you must honor — these are not suggestions]\n"
+        f"{doctrine}\n\n[Task — you are a build cell on the Hands (Spark node)]\n{task}\n"
+    )
+    node = config.spark_cell_node
+    branch = f"hands/{loop.id}-{_time.strftime('%Y%m%d-%H%M%S')}"
+    res = spark.run_audit(
+        node, instruction, billing=config.spark_cell_billing, branch=branch,
+        model=config.spark_cell_model, mode="bypassPermissions",
+    )
+    if not res.get("ok"):
+        return DispatchResult(False, "", res.get("error", "the Hands cell failed to launch"), "", None, 0.0, "")
+
+    run_id = res["run_id"]
+    deadline = _time.time() + config.spark_cell_timeout_sec
+    st: dict = {}
+    while _time.time() < deadline:
+        _time.sleep(10)
+        st = spark.run_status(node, run_id)
+        if st.get("done"):
+            break
+    if not st.get("done"):
+        return DispatchResult(
+            False, f"hands:{node} run {run_id} on {branch}",
+            f"the Hands cell {run_id} did not finish within {config.spark_cell_timeout_sec:.0f}s "
+            f"(still running) — inspect: ssh {node} 'tmux attach -t {run_id}'",
+            "", None, 0.0, run_id,
+        )
+
+    # GROUND TRUTH: a real commit on the branch + a clean exit (not the cell's word).
+    try:
+        ncommits = int(str(st.get("commits_on_branch") or "0").strip() or "0")
+    except ValueError:
+        ncommits = 0
+    exit_code = st.get("exit_code")
+    cost = float((st.get("result") or {}).get("cost_usd") or 0.0)
+    fetched = spark.fetch_results(node, run_id, branch=branch)  # pull the importable bundle
+
+    if exit_code not in (0, None) and ncommits == 0:
+        broke, delivered = f"the Hands cell exited {exit_code} and left no commit", False
+    elif ncommits <= 0:
+        broke, delivered = "the Hands cell finished but committed no diff — nothing changed", False
+    else:
+        broke, delivered = None, True
+    summary = (
+        f"hands:{node} run {run_id}; branch {branch}; commits={ncommits}; exit={exit_code}; "
+        f"${cost:.4f}; bundle={fetched.get('bundle_path', '(none)')}. "
+        f"cell said: {(st.get('last_assistant') or '')[:200]}"
+    )
+    return DispatchResult(delivered, summary, broke, "", None, cost, run_id)

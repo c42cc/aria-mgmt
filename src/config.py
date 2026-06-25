@@ -73,6 +73,17 @@ class Config:
     spark_model: str = os.getenv("SPARK_MODEL", "local-brain").strip()
     spark_max_tokens: int = int(os.getenv("SPARK_MAX_TOKENS", "4096"))
 
+    # ── The Hands — cells on a Spark node (the dev-environment executor) ─────
+    # Aria manages the dev environment by dispatching build cells to the Hands
+    # (spark2): one Claude Code engine, relocated onto the node, on an isolated
+    # branch, verified by ground truth (a real diff). Billing mirrors the Mac
+    # engine ('api' = the node's metered key, headless; 'subscription' = node Max
+    # OAuth, free once logged in). Cost is capped by daily_spend_cap_usd.
+    spark_cell_node: str = os.getenv("SPARK_CELL_NODE", "spark2").strip()
+    spark_cell_model: str = os.getenv("SPARK_CELL_MODEL", "claude-haiku-4-5").strip()
+    spark_cell_billing: str = os.getenv("SPARK_CELL_BILLING", "api").strip()
+    spark_cell_timeout_sec: float = float(os.getenv("SPARK_CELL_TIMEOUT_SEC", "900"))
+
     # ── The Floor — the durable, shared, redundant state-of-record plane ────
     # The storage-layout contract (§1.1). FLOOR_ROOT is the one mount where
     # state of record lives. EMPTY = the Floor is ABSENT (no shared/redundant

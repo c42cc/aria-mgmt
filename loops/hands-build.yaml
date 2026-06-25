@@ -1,0 +1,21 @@
+id: hands-build
+name: Build on the Hands (Spark)
+description: >
+  Dispatch a development task to a build cell on the Hands (the volatile Spark
+  execution plane). One Claude Code engine, relocated onto the node, builds the
+  change on an isolated branch and we verify the result against GROUND TRUTH (the
+  node's git state carries a real commit/diff). Use this for dev-environment work
+  that should run ON the Sparks, off the Mac -- features, fixes, refactors,
+  chores in a synced repo. The build is headless and cost-capped.
+endpoint: hands
+loop: >
+  State the change to make; a cell on the Hands builds it on its own branch, and
+  we confirm a real diff landed (re-reading the node's git), never the cell's word.
+required_slots:
+  - key: task
+    ask: "What should the Hands cell build or change (be specific about the file/behavior)?"
+dispatch: |
+  {task}
+done: "A cell on the Hands committed a real diff on its isolated branch, verified by re-reading the node's git state (commits_on_branch > 0, clean exit)."
+gates: []
+report: text

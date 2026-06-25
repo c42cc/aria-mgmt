@@ -851,7 +851,11 @@ export CLAUDE_CODE_EFFORT_LEVEL="{effort}"
 RUNDIR="$HOME/{runs}/{run_id}"
 mkdir -p "$RUNDIR"
 cd "$HOME/{workspace}" || {{ echo "FATAL: no workspace $HOME/{workspace}" > "$RUNDIR/run.log"; echo 127 > "$RUNDIR/rc"; touch "$RUNDIR/DONE"; exit 127; }}
-git switch "{branch}" 2>/dev/null || git switch -c "{branch}" 2>/dev/null || git checkout -b "{branch}" 2>/dev/null || true
+# Each cell branches from a CLEAN main base (isolation): never stack a new cell
+# on the previous cell's leftover branch. main..HEAD (run_status) then counts
+# exactly this cell's commits.
+git switch main 2>/dev/null || git checkout main 2>/dev/null || true
+git switch -c "{branch}" 2>/dev/null || git checkout -b "{branch}" 2>/dev/null || git switch "{branch}" 2>/dev/null || true
 {{ echo "[runner] $(date -Is) model={model} effort={effort} thinking={thinking_label} billing={billing} branch=$(git branch --show-current) head=$(git rev-parse --short HEAD)"; }} >> "$RUNDIR/meta.txt"
 {claude_invocation} -p "$(cat "$RUNDIR/instruction.md")" \\
   --model {model} --permission-mode {mode} --output-format stream-json --verbose \\
