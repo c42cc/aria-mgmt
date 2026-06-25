@@ -738,6 +738,7 @@ SETUP_CC_SCRIPT = REPO_ROOT / "ops" / "spark" / "setup_cc_workspace.sh"
 REMOTE_WORKSPACE = "live_visuals_4"            # under the node user's $HOME
 REMOTE_RUNS = ".cache/spark_cc_runs"           # under the node user's $HOME
 REMOTE_CREDS = ".claude/.credentials.json"     # subscription OAuth (Linux home)
+REMOTE_KEYFILE = ".config/spark/anthropic_key"  # 0600 metered key (api billing)
 LOCAL_RUN_ARTIFACTS = REPO_ROOT / "data" / "spark" / "runs"
 LEDGER_NAME = "TODO_GO_FORWARD_FORENSIC_AUDIT_COLLAPSE_LEDGER.md"
 DEFAULT_AUDIT_INSTRUCTION = REPO_ROOT / "ops" / "spark" / "audit_collapse_instruction.md"
@@ -833,8 +834,11 @@ def cc_auth_status(node: str, *, probe: bool = False, timeout: float = 60.0) -> 
 
 _RUNNER_TEMPLATE = """#!/usr/bin/env bash
 # Detached Claude Code run launched by src/spark.py::run_audit. Survives SSH
-# drops (tmux); writes stream-json to run.log; ANTHROPIC_API_KEY stripped so the
-# Max subscription is used (never the metered key).
+# drops (tmux); writes stream-json to run.log. Billing matches the Mac engine's
+# contract ({billing}): 'subscription' strips ANTHROPIC_API_KEY so the node's Max
+# OAuth is used (free); 'api' reads the node's own 0600 key file so the headless
+# run authenticates with the metered key (the key is NEVER written into this
+# script or the launch command — only read from disk at run time).
 set -uo pipefail
 source "$HOME/.config/spark/env.sh" 2>/dev/null || true
 # Pin reasoning HERE: this runner is non-interactive (it does NOT source
@@ -843,12 +847,13 @@ source "$HOME/.config/spark/env.sh" 2>/dev/null || true
 # determinism; {thinking_label} extended thinking.
 export CLAUDE_CODE_EFFORT_LEVEL="{effort}"
 {thinking_export}
+{auth_prelude}
 RUNDIR="$HOME/{runs}/{run_id}"
 mkdir -p "$RUNDIR"
 cd "$HOME/{workspace}" || {{ echo "FATAL: no workspace $HOME/{workspace}" > "$RUNDIR/run.log"; echo 127 > "$RUNDIR/rc"; touch "$RUNDIR/DONE"; exit 127; }}
 git switch "{branch}" 2>/dev/null || git switch -c "{branch}" 2>/dev/null || git checkout -b "{branch}" 2>/dev/null || true
-{{ echo "[runner] $(date -Is) model={model} effort={effort} thinking={thinking_label} branch=$(git branch --show-current) head=$(git rev-parse --short HEAD)"; }} >> "$RUNDIR/meta.txt"
-env -u ANTHROPIC_API_KEY claude -p "$(cat "$RUNDIR/instruction.md")" \\
+{{ echo "[runner] $(date -Is) model={model} effort={effort} thinking={thinking_label} billing={billing} branch=$(git branch --show-current) head=$(git rev-parse --short HEAD)"; }} >> "$RUNDIR/meta.txt"
+{claude_invocation} -p "$(cat "$RUNDIR/instruction.md")" \\
   --model {model} --permission-mode {mode} --output-format stream-json --verbose \\
   >> "$RUNDIR/run.log" 2>&1
 echo $? > "$RUNDIR/rc"
@@ -860,6 +865,7 @@ def run_audit(node: str, instruction: str, *, branch: str | None = None,
               mode: str = DEFAULT_RUN_MODE, run_id: str | None = None,
               model: str = AUDIT_MODEL, effort: str = AUDIT_EFFORT,
               extended_thinking: bool = AUDIT_EXTENDED_THINKING,
+              billing: str = "subscription",
               force_unauthed: bool = False) -> dict:
     """Launch a detached, disconnection-proof Claude Code run on the node: write
     the instruction + a runner into ~/REMOTE_RUNS/<run_id>/, ensure a fresh
@@ -878,13 +884,32 @@ def run_audit(node: str, instruction: str, *, branch: str | None = None,
     if not instruction.strip():
         raise ValueError("instruction is required")
 
+    if billing not in ("subscription", "api"):
+        raise ValueError(f"bad billing {billing!r} (one of 'subscription', 'api')")
+
     # Refuse to launch a run that would immediately fail auth (loud, not silent).
-    auth = cc_auth_status(alias)
-    if not auth.get("has_oauth_creds") and not force_unauthed:
-        return {"ok": False, "node": alias,
-                "error": f"node claude is not subscription-authed (~/{REMOTE_CREDS} "
-                         f"missing). Run `ssh -t {alias}` then `claude` -> `/login`, "
-                         "then retry. (force_unauthed=True launches anyway.)"}
+    # The billing contract mirrors the Mac engine (src/engine_claude_code.py):
+    # subscription = free node OAuth; api = the metered key, read from the node's
+    # own 0600 file at run time (never written into this script or the launch cmd).
+    if billing == "subscription":
+        auth = cc_auth_status(alias)
+        if not auth.get("has_oauth_creds") and not force_unauthed:
+            return {"ok": False, "node": alias,
+                    "error": f"node claude is not subscription-authed (~/{REMOTE_CREDS} "
+                             f"missing). Either `ssh -t {alias}` then `claude` -> `/login` "
+                             "for free builds, or pass billing='api' to use the metered key."}
+        auth_prelude = "# subscription billing: the node's Max OAuth is used"
+        claude_invocation = "env -u ANTHROPIC_API_KEY claude"
+    else:  # api
+        keyfile = f"$HOME/{REMOTE_KEYFILE}"
+        chk, _rc = ssh_probe(alias, f'test -s "{keyfile}" && echo HAVE_KEY || echo NO_KEY', timeout=20)
+        if "HAVE_KEY" not in chk and not force_unauthed:
+            return {"ok": False, "node": alias,
+                    "error": f"billing='api' but no key at ~/{REMOTE_KEYFILE} on {alias}. "
+                             "Provision it (write ANTHROPIC_API_KEY to that 0600 file)."}
+        auth_prelude = (f'export ANTHROPIC_API_KEY="$(cat "{keyfile}")" '
+                        f'|| {{ echo "FATAL: cannot read {keyfile}" >&2; exit 90; }}')
+        claude_invocation = "claude"
 
     thinking_export = ("export MAX_THINKING_TOKENS=0" if not extended_thinking
                        else "# extended thinking enabled (effort drives depth on Opus 4.8)")
@@ -894,8 +919,9 @@ def run_audit(node: str, instruction: str, *, branch: str | None = None,
     _ssh_put(alias, f"{rundir_rel}/instruction.md", instruction)
     runner = _RUNNER_TEMPLATE.format(
         runs=REMOTE_RUNS, run_id=run_id, workspace=REMOTE_WORKSPACE, branch=branch,
-        mode=mode, model=model, effort=effort,
+        mode=mode, model=model, effort=effort, billing=billing,
         thinking_export=thinking_export, thinking_label=thinking_label,
+        auth_prelude=auth_prelude, claude_invocation=claude_invocation,
     )
     _ssh_put(alias, f"{rundir_rel}/run.sh", runner, executable=True)
 
