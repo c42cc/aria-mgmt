@@ -1,5 +1,23 @@
 # UCS — Aria
 
+> ## What this repo is
+>
+> **The live Discord Aria — the running, always-on assistant.** This worktree on
+> branch **`aria-live`** (`../ucs2-notify-on-stop`) is the production bot. It is
+> NOT the v2 membrane — that is the standalone repo `c42cc/aria` (`../aria`).
+>
+> - **Span of control.** Your machine and accounts, live: email, calendar,
+>   GitHub, filesystem, shell, macOS apps, your Cursor windows (cursor-watch),
+>   Claude Code builds, model backups, and the two DGX **Spark** nodes. Runs
+>   under launchd; `launch.sh` re-pins it to `aria-live` on every boot.
+> - **Used for.** Everyday voice/text assistant work from Discord (`#ucs`) and
+>   voice — "any new mail?", "back up this model", "build X", "watch my Cursor".
+> - **For whom.** Corbin, on Discord + voice. Gemini renders (ears + mouth),
+>   Claude Opus reasons, the MCP fleet + Claude Code act.
+> - **Trunk.** `aria-live` is the pinned build trunk (`src/build_hash.py`),
+>   deliberately decoupled from `c42cc/ucs` `main` so the membrane can evolve on
+>   `main` without disturbing the running bot.
+
 **A voice-first personal operating shell.** You talk to a Discord bot named
 **Aria** from your phone. She speaks back conversationally and, behind the
 scenes, dispatches real work — planning, building software, reading mail,
