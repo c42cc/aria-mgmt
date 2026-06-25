@@ -59,3 +59,31 @@ regression:
 - **The capture+Gemini agreement gate as a universal code gate.** It returns
   only at Phase 4 for genuine physical state (`src/home_verify.py`), exactly as
   this ledger already requires.
+
+## The Natural State substrate (feat/natural-state-spark) — what stayed gone, and the seams
+
+The Spark substrate was forward-ported onto this slim line WITHOUT resurrecting
+legacy (see `docs/natural-state.md`). A naive `git merge local-spark-agent` would
+have re-added the deleted Discord/constructor sprawl + the removed governance
+apparatus; that was rejected. The following stay gone — re-adding any is a regression:
+
+- **The removed governance apparatus stays removed.** `scripts/gate.sh`,
+  `scripts/live_meter.py`, `tools/structural_absence_check.py`,
+  `configs/structural_absences.json` were NOT brought back with `src/spark.py`. The
+  gate is `make test`; the runtime half is a real logged request (review 1.2).
+- **The Discord/constructor/MCP legacy stays removed.** `src/spark.py` and the
+  `ops/spark/*` scripts are stdlib-only / self-contained; `src/mcp.py`,
+  `src/tools.py`, `src/gemini_session.py`, `src/constructor/` did NOT come along.
+- **No second Claude Code engine.** Cells on the Hands are the SAME engine relocated
+  onto the node (`src/spark.py::run_audit`), billing-unified with the Mac engine — not
+  a parallel executor.
+- **No cloud fallback anywhere.** local-ask -> the Mind (local, $0); a dead Mind /
+  bad HA token / unconfigured endpoint each return the one fix, loudly.
+
+Seams recorded so they cannot become silent drift (full detail in
+`docs/natural-state.md`): the **one Gemini judge** now spans `home_verify` (camera)
+and `visual_verify` (browser), with LV4's `lib/gemini_judge.py` a third home to
+collapse later; the **Floor is ABSENT** until the NAS mounts; the **ConnectX cluster
+is dormant**; **HA runs in docker** (not rootless podman — docker needs no sudo on
+spark1); a standing **hologram_service GPU worker was stopped** to free the Mind
+(restart command in `docs/natural-state.md`).

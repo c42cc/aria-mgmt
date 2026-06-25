@@ -103,6 +103,7 @@ the build-time IDE agent only; they are inert to Aria's runtime engine.
 | Boot preflight | `src/preflight.py` |
 | Section-3 decisions + Phase-1 setup | `docs/aria-v2/` |
 | What was removed, and why | `ABSENCES.md` |
+| The Natural State substrate (Mind/Hands/Floor/HA/Zed, the single pane) | `docs/natural-state.md` · `src/spark.py` · `src/floor.py` · `src/doctor.py` · `src/visual_verify.py` |
 
 ## Phases
 
