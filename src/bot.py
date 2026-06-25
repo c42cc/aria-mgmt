@@ -2070,6 +2070,13 @@ async def _notify_user_buzz(content: str) -> bool:
 # but no stop is manufactured into a decision the agent never posed.
 _BUZZ_KINDS: tuple[str, ...] = ("question", "finished", "completed", "errored", "stalled")
 
+# Attention backpressure: a same-kind STOP from the same thread within this many
+# seconds of the last phone buzz is folded into the silent audit (already posted)
+# instead of buzzing again. This kills the duplicate completed/cancelled bursts
+# without touching the "every distinct stop surfaces" policy — a new kind or a
+# post-cooldown event still buzzes, and nothing is dropped.
+_BUZZ_DEDUP_COOLDOWN_S: float = 120.0
+
 
 async def _task_done_gate(goal: str, result: str, session_key: str) -> tuple[bool, list[str]]:
     """Gate a Task's done claim with the CALIBRATED judge (Step 6). Refuse-to-trust:
@@ -2225,6 +2232,21 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
 
     if evt.kind not in _BUZZ_KINDS:
         return
+
+    # Attention backpressure (never a drop): fold a same-kind repeat from THIS
+    # thread within the cooldown into the silent audit posted above, rather than
+    # buzzing the phone twice for what is the same stop re-reported. A distinct
+    # kind or a post-cooldown stop still buzzes.
+    now = time.monotonic()
+    if (agent.last_buzzed_kind == evt.kind
+            and now - agent.last_buzzed_at < _BUZZ_DEDUP_COOLDOWN_S):
+        log.info(
+            "attention: folded a duplicate %s buzz for %s into the audit "
+            "(within %.0fs cooldown)", evt.kind, agent.agent_id, _BUZZ_DEDUP_COOLDOWN_S,
+        )
+        return
+    agent.last_buzzed_at = now
+    agent.last_buzzed_kind = evt.kind
 
     await _notify_user_buzz(_format_registry_dm(evt))
 

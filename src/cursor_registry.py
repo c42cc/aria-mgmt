@@ -110,6 +110,14 @@ class CursorAgent:
     # spoken yet, `last_event_reason` is what we surface instead.
     last_delivered_at: float = 0.0
     last_delivered_reason: str = ""
+    # Attention backpressure: the kind + monotonic time of the last buzz actually
+    # PUSHED to the phone for this thread. A same-kind repeat within the cooldown
+    # is folded into the (already-posted) silent audit instead of buzzing again —
+    # the duplicate completed/cancelled bursts (conversation_log 694/698/710,
+    # 701/704/706) stop double-pinging. Distinct kinds and post-cooldown events
+    # always buzz; nothing is ever dropped (the audit trail holds the fold).
+    last_buzzed_at: float = 0.0
+    last_buzzed_kind: str = ""
 
     def to_public_dict(self) -> dict:
         """JSON-safe projection for tool responses and audits.
