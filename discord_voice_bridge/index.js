@@ -45,9 +45,21 @@ import readline from "node:readline";
 // See dave_passthrough_patch.js header for context. Removable once
 // @discordjs/voice >= 0.20.0 ships PR #11449.
 import "./dave_passthrough_patch.js";
+import { EchoSuppressor } from "./echo_suppressor.js";
 
 const BOT_TOKEN = process.env.DISCORD_VOICE_BOT_TOKEN || "";
 const AUTHORIZED_USER_ID = process.env.AUTHORIZED_VOICE_USER_ID || "";
+
+// The voice floor primitive: never forward Aria's own playback back to Gemini
+// as if the user said it (the 643..658 self-echo loop). Tunable from .env; the
+// defaults are the suppressor's own. ARIA_AEC_ENABLED=0 disables it (pure
+// passthrough) for an A/B during live verification.
+const echo = new EchoSuppressor({
+  enabled: process.env.ARIA_AEC_ENABLED !== "0",
+  corrThreshold: process.env.ARIA_AEC_CORR ? parseFloat(process.env.ARIA_AEC_CORR) : undefined,
+  hangoverMs: process.env.ARIA_AEC_HANGOVER_MS ? parseInt(process.env.ARIA_AEC_HANGOVER_MS, 10) : undefined,
+  maxLagMs: process.env.ARIA_AEC_MAXLAG_MS ? parseInt(process.env.ARIA_AEC_MAXLAG_MS, 10) : undefined,
+});
 
 if (!BOT_TOKEN) {
   process.stderr.write("DISCORD_VOICE_BOT_TOKEN is required\n");
@@ -249,8 +261,22 @@ function setupReceiver(conn) {
     downsampler.on("data", (chunk) => {
       if (frameCount === 0) diag("first audio frame from speaker", { userId, bytes: chunk.length });
       frameCount++;
-      // Real audio is flowing — the receive path is healthy; clear the deaf counter.
+      // Real audio is flowing — the receive path is healthy; clear the deaf
+      // counter. (A suppressed echo frame still proves we can hear, so this
+      // health signal stays BEFORE the echo gate.)
       consecutiveEmptySpeakingBursts = 0;
+      // Floor: sense before forwarding. If this frame is Aria's own playback
+      // echoing back, drop it (loudly counted) — never feed it to Gemini as a
+      // user turn. Independent speech (barge-in) is forwarded.
+      const verdict = echo.classify(chunk, Date.now());
+      if (!verdict.forward) {
+        if (echo.suppressed === 1 || echo.suppressed % 50 === 0) {
+          diag("AEC: suppressed self-echo frame", {
+            suppressed: echo.suppressed, corr: Number(verdict.corr.toFixed(2)),
+          });
+        }
+        return;
+      }
       emit({ event: "audio", user_id: userId, pcm_b64: chunk.toString("base64") });
     });
     let cleanedUp = false;
@@ -419,6 +445,9 @@ function doPlay({ pcm_b64 }) {
   if (playRx === 1 || playRx % 100 === 0) {
     diag("AUDIO[C doPlay]: pushed chunk", { n: playRx, bytes: buf.length, total: playBytes });
   }
+  // Register what Aria is about to say as the echo-suppressor reference, so the
+  // receiver can recognize this audio when the room returns it.
+  echo.pushReference(buf, Date.now());
   stream.push(buf);
 }
 
