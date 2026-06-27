@@ -80,8 +80,17 @@ class Config:
     # External Cursor observer (hooks-driven, watches other IDE windows)
     cursor_event_host: str = os.getenv("UCS_CURSOR_EVENT_HOST", "127.0.0.1")
     cursor_event_port: int = int(os.getenv("UCS_CURSOR_EVENT_PORT", "8731"))
-    # A running Cursor thread quiet for this long emits a one-shot 'stalled' buzz.
-    cursor_stall_minutes: int = int(os.getenv("UCS_CURSOR_STALL_MINUTES", "15"))
+    # The lifecycle watcher's three thresholds. A buzz is the function of the
+    # thread's TRANSCRIPT, evaluated when it settles — not a per-turn hook.
+    #  - settle: a thread quiet this long has genuinely handed back -> ONE terminal
+    #    buzz (finished/question/errored), derived from the transcript tail.
+    #  - hung: quiet this long with NO stop ever -> the hang catcher (the only path
+    #    a silently-stuck thread surfaces; never a silent failure).
+    #  - discovery: how often the filesystem is swept for live threads whose first
+    #    hook never arrived, so the watcher works even when hooks are dark.
+    cursor_settle_seconds: float = float(os.getenv("UCS_CURSOR_SETTLE_SECONDS", "12"))
+    cursor_hung_minutes: int = int(os.getenv("UCS_CURSOR_HUNG_MINUTES", "15"))
+    cursor_discovery_seconds: float = float(os.getenv("UCS_CURSOR_DISCOVERY_SECONDS", "10"))
 
     # Lurk-in-voice: when true, the voice sidecar stays connected to the
     # voice channel after the authorized user leaves (Gemini and audio

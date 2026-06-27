@@ -72,9 +72,20 @@ class SessionInfo:
     # workspace's). The granularity the user actually works in.
     status: Status = "unknown"
     last_event_reason: str = ""
+    pending_question: str | None = None
+    recent_plan_files: list[str] = field(default_factory=list)
+    # The last stop-hook status seen for this thread ("completed"/"error"/
+    # "aborted"/"running"). Only disambiguates error vs cancel at settle; the
+    # transcript itself is the source of truth for "did it hand back".
+    last_hook_status: str = "running"
     _tail_offset: int = 0
     _tail_task: asyncio.Task | None = field(default=None, repr=False)
     _tail_mtime: float = 0.0
+    # Lifecycle-watcher state: when bytes last arrived (the settle clock), and
+    # the transcript offset at which we last emitted a terminal buzz (mirrors the
+    # durable db watermark so the hot path doesn't hit sqlite every poll).
+    _last_byte_at: float = 0.0
+    _delivered_offset: int = -1
 
 
 @dataclass
@@ -110,14 +121,6 @@ class CursorAgent:
     # spoken yet, `last_event_reason` is what we surface instead.
     last_delivered_at: float = 0.0
     last_delivered_reason: str = ""
-    # Attention backpressure: the kind + monotonic time of the last buzz actually
-    # PUSHED to the phone for this thread. A same-kind repeat within the cooldown
-    # is folded into the (already-posted) silent audit instead of buzzing again —
-    # the duplicate completed/cancelled bursts (conversation_log 694/698/710,
-    # 701/704/706) stop double-pinging. Distinct kinds and post-cooldown events
-    # always buzz; nothing is ever dropped (the audit trail holds the fold).
-    last_buzzed_at: float = 0.0
-    last_buzzed_kind: str = ""
 
     def to_public_dict(self) -> dict:
         """JSON-safe projection for tool responses and audits.
@@ -465,25 +468,22 @@ class CursorAgentRegistry:
                     sess.transcript_path = payload.get("transcript_path")
             agent.current_sid = sid
 
-        kind, severity, reason = _classify_hook(hook_type, payload, agent)
-        # Per-THREAD status from THIS session's hook (the user works in threads).
+        # The hook is now a WAKE + a status HINT, never a buzz. Emission is owned
+        # by the lifecycle watcher (the per-session tailer), which derives the
+        # surfaced state from the TRANSCRIPT when the thread SETTLES — so a
+        # per-turn stop hook no longer fires a per-turn "completed". We record the
+        # stop status only so the watcher can tell an error/cancel apart from a
+        # normal hand-back; ensure the tailer is running and let it own the rest.
         if sid:
             tracked = agent.sessions.get(sid)
             if tracked is not None:
+                tracked.last_hook_status = _hook_terminal_status(hook_type, payload)
                 tracked.status = _status_from_hook(hook_type, payload, tracked.status)
-                if reason:
-                    tracked.last_event_reason = reason
-        # Workspace status = aggregate across its threads (running if any live).
         agent.status = _aggregate_agent_status(agent, now)
         agent.last_event_at = now
 
         if sid and sess and sess.transcript_path:
             self._ensure_tailer(agent, sess)
-
-        if kind:
-            await self._emit_event(
-                RegistryEvent(kind=kind, agent=agent, severity=severity, reason=reason)
-            )
         return agent
 
     async def register_from_sdk(
@@ -805,6 +805,50 @@ class CursorAgentRegistry:
                 return name
         return os.path.basename(norm) or norm
 
+    async def ensure_thread_from_disk(
+        self, workspace_root: str, sid: str, transcript_path: str
+    ) -> None:
+        """Attach a tailer to a thread discovered on disk (its first hook never
+        arrived, or hooks are dark). No emit here — the tailer owns surfaced state
+        from now on. Idempotent: a running tailer is left untouched."""
+        if not workspace_root or not sid or not transcript_path:
+            return
+        workspace_root = workspace_root.rstrip("/")
+        agent = self._get_or_create(workspace_root, source="ide")
+        now = time.time()
+        sess = agent.sessions.get(sid)
+        if sess is None:
+            sess = SessionInfo(
+                sid=sid, started_at=now, last_event_at=now,
+                transcript_path=transcript_path,
+            )
+            agent.sessions[sid] = sess
+        elif not sess.transcript_path:
+            sess.transcript_path = transcript_path
+        self._ensure_tailer(agent, sess)
+
+    async def discover_threads_from_disk(self, *, window_hours: float = 0.5) -> int:
+        """Attach a tailer to every recently-active thread on disk across all
+        known project roots. Hook-independent discovery — the watcher's guard
+        against a silent blind spot when a thread's first hook never lands.
+        Returns the number of threads ensured. Idempotent."""
+        from .cursor_external import list_recent_threads
+        roots: set[str] = {p for p in self._project_aliases.values() if p}
+        roots |= {a.workspace_root for a in self._agents.values() if a.workspace_root}
+        n = 0
+        for root in roots:
+            try:
+                threads = list_recent_threads(root, window_hours=window_hours, limit=30)
+            except Exception:
+                log.exception("discovery: list_recent_threads failed for %s", root)
+                continue
+            for t in threads:
+                await self.ensure_thread_from_disk(
+                    root.rstrip("/"), t.get("sid", ""), t.get("transcript_path", "")
+                )
+                n += 1
+        return n
+
     def _ensure_tailer(self, agent: CursorAgent, sess: SessionInfo) -> None:
         if self._stopping:
             return
@@ -818,17 +862,39 @@ class CursorAgentRegistry:
         )
 
     async def _tail_session(self, agent: CursorAgent, sess: SessionInfo) -> None:
-        """Poll the JSONL file for new turns and update the agent in place."""
-        last_event_grace_until = 0.0
-        # The pre-existing backlog — everything already in the transcript when
-        # this tailer attaches (after a bot restart, or the first time we ever
-        # see a thread) — is HISTORY: it happened before we were watching. We
-        # read it once to seed state, but must NOT emit events for it. Replaying
-        # it resurfaced stale/answered questions from days-old threads as fresh
-        # pings, and echoed the dev assistant's own AskQuestion back at the user
-        # ("ucs is asking..."). Only turns appended AFTER we catch up are real,
-        # notifiable activity.
-        primed = sess._tail_offset > 0
+        """Own ONE thread's surfaced state. Read its transcript incrementally and,
+        when it SETTLES (quiet >= settle_seconds), emit exactly one terminal buzz
+        derived from the transcript tail — never a per-turn hook. Once attached,
+        this polls the file directly, so it keeps working even if every later hook
+        is dark (the discovery sweep attaches one for a thread whose first hook
+        never arrived).
+        """
+        from .config import config
+        from . import db
+
+        # Floor guards against a zero/negative misconfig; the real value is the
+        # config default (12s). hung is always >= settle.
+        settle = max(0.05, config.cursor_settle_seconds)
+        hung = max(settle, config.cursor_hung_minutes * 60.0)
+
+        # Seed the durable watermark on first attach: everything already in the
+        # transcript is HISTORY (it settled before we were watching), so seed
+        # delivered_offset to the current size — only growth AFTER attach can fire
+        # a terminal buzz. This is the one anti-replay guard (restart-safe and
+        # backlog-safe); it replaces the in-memory 120s dedup cooldown entirely.
+        if sess._delivered_offset < 0:
+            durable_off, _ = db.get_cursor_delivered(sess.sid)
+            try:
+                cur_size = (
+                    os.path.getsize(sess.transcript_path)
+                    if sess.transcript_path and os.path.exists(sess.transcript_path)
+                    else 0
+                )
+            except OSError:
+                cur_size = 0
+            sess._delivered_offset = max(durable_off, cur_size, sess._tail_offset)
+            sess._last_byte_at = time.time()
+
         try:
             while not self._stopping:
                 try:
@@ -849,45 +915,30 @@ class CursorAgentRegistry:
                             la, lu, plans, ask_q = _parse_jsonl_turns(text_lines)
                             if la or ask_q:
                                 # The session that just produced output IS the
-                                # current one. Without this, concurrent threads
-                                # in one workspace clobber agent-level fields and
-                                # the narration can't say which thread spoke.
+                                # current one. Without this, concurrent threads in
+                                # one workspace clobber agent-level fields and the
+                                # narration can't say which thread spoke.
                                 agent.current_sid = sess.sid
                                 if la:
                                     agent.last_assistant_text = la[: self._truncate_chars]
                                     sess.last_assistant_text = agent.last_assistant_text
                                 # An explicit ask-the-user tool call is the ONLY
-                                # decision signal. A question is never inferred
-                                # from prose (the trailing-'?' heuristic that
-                                # fabricated decisions was deleted).
-                                q = ask_q
-                                agent.pending_question = q
-                                if primed:
-                                    kind: EventKind = "question" if q else "progress"
-                                    severity: Severity = "high" if q else "low"
-                                    reason = (
-                                        f"{agent.project_label} is asking: {q[:200]}"
-                                        if q
-                                        else f"{agent.project_label} thread {sess.sid[:8]} produced an assistant turn."
-                                    )
-                                    await self._emit_event(
-                                        RegistryEvent(
-                                            kind=kind,
-                                            agent=agent,
-                                            severity=severity,
-                                            reason=reason,
-                                        )
-                                    )
+                                # decision signal; never inferred from prose.
+                                sess.pending_question = ask_q
+                                agent.pending_question = ask_q
                             if lu:
                                 agent.last_user_text = lu[: self._truncate_chars]
                                 sess.last_user_text = agent.last_user_text
+                                # The user spoke -> any pending question is answered.
+                                sess.pending_question = None
+                                agent.pending_question = None
                             if plans:
+                                sess.recent_plan_files = plans[-5:]
                                 agent.recent_plan_files = plans[-5:]
                             sess.last_event_at = time.time()
                             agent.last_event_at = sess.last_event_at
-                            # Caught up to the backlog; subsequent appends are
-                            # live activity and DO notify.
-                            primed = True
+                            # New bytes => not a hand-back yet; re-arm the settle.
+                            sess._last_byte_at = sess.last_event_at
                 except FileNotFoundError:
                     pass
                 except Exception:
@@ -896,17 +947,73 @@ class CursorAgentRegistry:
                         agent.project_label, sess.sid[:8],
                     )
 
-                if agent.status in ("finished", "errored"):
-                    if last_event_grace_until == 0:
-                        last_event_grace_until = time.time() + self._tail_idle_grace
-                    elif time.time() >= last_event_grace_until:
-                        return
-                else:
-                    last_event_grace_until = 0
+                # SETTLE: quiet long enough to be a real hand-back (or a hang).
+                # Classify ONCE per halt from the transcript; the durable
+                # watermark makes it idempotent across polls AND restarts.
+                quiet_for = time.time() - sess._last_byte_at
+                if sess._tail_offset > sess._delivered_offset and quiet_for >= settle:
+                    terminal = self._classify_terminal(agent, sess, quiet_for, hung)
+                    if terminal is not None:
+                        kind, severity, reason = terminal
+                        sess._delivered_offset = sess._tail_offset
+                        sess.status = _status_for_kind(kind, sess.status)
+                        agent.status = _aggregate_agent_status(agent, time.time())
+                        try:
+                            db.set_cursor_delivered(
+                                sess.sid, sess._tail_offset, kind,
+                                project=agent.project_label, summary=reason[:200],
+                            )
+                        except Exception:
+                            log.exception("watermark persist failed for %s", sess.sid[:8])
+                        await self._emit_event(
+                            RegistryEvent(kind=kind, agent=agent, severity=severity, reason=reason)
+                        )
+
+                # Reap a fully-delivered, long-quiet tailer to bound live tasks;
+                # the discovery sweep re-attaches a fresh one if it resumes (new
+                # growth -> a new halt past this watermark -> a new buzz).
+                if sess._tail_offset <= sess._delivered_offset and quiet_for >= hung:
+                    return
 
                 await asyncio.sleep(self._tail_interval)
         except asyncio.CancelledError:
             return
+
+    def _classify_terminal(
+        self, agent: CursorAgent, sess: SessionInfo, quiet_for: float, hung: float
+    ) -> tuple[EventKind, Severity, str] | None:
+        """The single classifier: what state did this thread hand back in?
+
+        Pure function of the transcript tail + the one thing the transcript can't
+        show (error vs user-cancel, from the stop hook). Returns the terminal
+        event, or None to keep waiting. Every other moment — mid-task turns,
+        subagent finishes, progress — is silent by construction (no emit path).
+        """
+        headline = f"{agent.project_label} thread {sess.sid[:8]}"
+        # A decision the agent explicitly stopped on -> needs you NOW.
+        if sess.pending_question:
+            return ("question", "high", f"{headline} is asking: {sess.pending_question[:240]}")
+        if sess.recent_plan_files:
+            return ("question", "high", f"{headline} built a plan awaiting your approval.")
+        # The stop hook is the only signal separating an error / a user-cancel
+        # from a normal hand-back — the transcript can't show those.
+        if sess.last_hook_status == "error":
+            return ("errored", "high", f"{headline} errored.")
+        if sess.last_hook_status in ("aborted", "cancelled", "canceled", "stopped"):
+            return ("cancelled", "low", f"{headline} was cancelled.")
+        # A quiet thread that left a real wrap-up turn has handed back to you.
+        if _transcript_handed_back(sess.transcript_path) and sess.last_assistant_text:
+            return ("finished", "high", f"{headline} finished and handed back to you.")
+        # Quiet, but no wrap-up and no stop ever: a genuine hang is the ONLY way a
+        # silently-stuck thread surfaces. Wait out hung_window, then state it
+        # factually — never a "definitely stuck" claim.
+        if quiet_for >= hung:
+            mins = int(quiet_for / 60)
+            return (
+                "stalled", "high",
+                f"{headline} has been quiet for {mins} min with no hand-back (possible hang).",
+            )
+        return None
 
     async def _emit_event(self, evt: RegistryEvent) -> None:
         # Stamp the agent with the latest event reason BEFORE firing the
@@ -923,54 +1030,83 @@ class CursorAgentRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Hook classifier (single source of truth for "what kind of event is this?")
+# Lifecycle-watcher helpers. The hook is a wake + a status HINT; the transcript
+# is the source of truth for "did it hand back, and in what state?".
 # ---------------------------------------------------------------------------
 
-def _classify_hook(
-    hook_type: str, payload: dict, agent: CursorAgent
-) -> tuple[EventKind | None, Severity, str]:
-    """Return (kind, severity, reason). `kind=None` means the hook is noise."""
-    status = (payload.get("status") or payload.get("final_status") or "").lower()
-    tool_name = (
-        payload.get("tool_name")
-        or (payload.get("tool_call") or {}).get("name")
-        or ""
-    )
-    label = agent.project_label
-
+def _hook_terminal_status(hook_type: str, payload: dict) -> str:
+    """The stop hook's status, normalized — the watcher's one disambiguator for
+    error vs user-cancel vs a normal hand-back. Non-stop hooks mean the loop is
+    still going; the transcript, not the hook, decides when it has settled."""
     if hook_type == "stop":
-        if status == "completed":
-            return "finished", "high", f"Cursor task completed in {label}."
-        if status == "error":
-            return "errored", "high", f"Cursor task errored in {label}."
-        if status in ("aborted", "cancelled", "canceled", "stopped"):
-            # A user-initiated cancel is NOT a buzz — the explicit "stop bugging
-            # me on cancel" rule. Recorded to the silent audit stream, never paged.
-            return "cancelled", "low", f"Cursor task cancelled in {label}."
-        return "finished", "low", f"Cursor agent loop ended in {label} (status={status or 'unknown'})."
-
-    if hook_type == "subagentStop":
-        if status == "error":
-            return "errored", "high", f"Cursor subagent errored in {label}."
-        return "progress", "low", f"Cursor subagent finished in {label}."
-
-    if hook_type == "postToolUse":
-        tn = tool_name.lower().replace(" ", "")
-        if "createplan" in tn or "create_plan" in tn:
-            # A constructed plan is a DECISION awaiting approval — a question, so
-            # the one typed gate buzzes it (not a generic 'started' that doesn't).
-            return "question", "high", f"Cursor constructed a plan awaiting approval in {label}."
-        if tool_name.lower() == "task":
-            return "started", "low", f"Cursor dispatched a subagent in {label}."
-        return None, "low", ""
-
+        status = (payload.get("status") or payload.get("final_status") or "").lower()
+        if status in ("error", "aborted", "cancelled", "canceled", "stopped"):
+            return status
+        return "completed"
     if hook_type == "sessionEnd":
-        reason = (payload.get("reason") or "").lower()
-        if reason in ("error",):
-            return "errored", "high", f"Cursor session ended with error in {label}."
-        return None, "low", ""
+        return "error" if (payload.get("reason") or "").lower() == "error" else "completed"
+    return "running"
 
-    return None, "low", ""
+
+def _status_for_kind(kind: EventKind, prior: Status) -> Status:
+    """Per-thread status after a terminal classification."""
+    if kind in ("finished", "cancelled"):
+        return "finished"
+    if kind == "errored":
+        return "errored"
+    if kind == "question":
+        return "waiting"
+    if kind == "stalled":
+        return "running"  # still technically running — a hang, not a hand-back
+    return prior
+
+
+def _transcript_handed_back(path: str | None) -> bool:
+    """True iff the transcript's last turn is a finished assistant wrap-up — text
+    the agent left for you — rather than a dangling tool call still in flight.
+
+    A quiet thread whose last entry is a tool_use (or a tool/user result the
+    agent hasn't answered yet) has NOT handed back: it is mid-action or hung.
+    This is the shape check that keeps a hung tool from masquerading as 'done'.
+    Bounded tail read; runs only at settle, never on the hot poll path.
+    """
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-262144, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    last = None
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and obj.get("role") in ("user", "assistant"):
+            last = obj
+    if last is None or last.get("role") != "assistant":
+        # No parsable tail, or the agent's turn is next -> not a hand-back.
+        return False
+    message = last.get("message") or {}
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return False
+    for block in reversed(content):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and str(block.get("text", "")).strip():
+            return True
+        if block.get("type") == "tool_use":
+            return False
+    return False
 
 
 def _status_from_hook(hook_type: str, payload: dict, prior: Status) -> Status:

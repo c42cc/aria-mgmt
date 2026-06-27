@@ -20,7 +20,12 @@ CREATE TABLE IF NOT EXISTS cursor_sessions (
     status       TEXT NOT NULL DEFAULT 'running',
     started_at   TEXT NOT NULL,
     last_event_at TEXT,
-    last_event_summary TEXT
+    last_event_summary TEXT,
+    -- Durable surfaced-state watermark: the transcript byte offset at which the
+    -- lifecycle watcher last emitted a terminal buzz for this thread, and that
+    -- buzz's kind. A restart re-reads this instead of replaying delivered halts.
+    delivered_offset INTEGER NOT NULL DEFAULT 0,
+    delivered_kind TEXT
 );
 
 -- Claude Code (Agent SDK) sessions Aria drives. Mirrors cursor_sessions, plus
@@ -219,6 +224,16 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         _migrate_loop_executions(conn)
         _migrate_verdicts_anchors(conn)
+        _migrate_cursor_delivered(conn)
+
+
+def _migrate_cursor_delivered(conn: sqlite3.Connection) -> None:
+    """Add the lifecycle watcher's durable surfaced-state watermark columns."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(cursor_sessions)").fetchall()}
+    if "delivered_offset" not in cols:
+        conn.execute("ALTER TABLE cursor_sessions ADD COLUMN delivered_offset INTEGER NOT NULL DEFAULT 0")
+    if "delivered_kind" not in cols:
+        conn.execute("ALTER TABLE cursor_sessions ADD COLUMN delivered_kind TEXT")
 
 
 def _migrate_loop_executions(conn: sqlite3.Connection) -> None:
@@ -399,6 +414,46 @@ def get_active_cursor_sessions() -> list[dict[str, Any]]:
             "SELECT * FROM cursor_sessions WHERE status IN ('running', 'waiting')"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_cursor_delivered(session_id: str) -> tuple[int, str]:
+    """The durable watermark for a thread: (delivered_offset, delivered_kind).
+
+    Returns (0, "") when the thread has never had a terminal buzz delivered —
+    the lifecycle watcher reads this so a bot restart never replays a halt it
+    already surfaced before the crash.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT delivered_offset, delivered_kind FROM cursor_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    if not row:
+        return 0, ""
+    return int(row["delivered_offset"] or 0), str(row["delivered_kind"] or "")
+
+
+def set_cursor_delivered(
+    session_id: str, offset: int, kind: str, *, project: str = "", summary: str = ""
+) -> None:
+    """Persist that the watcher surfaced this thread's halt at `offset` as `kind`.
+
+    Upserts the row (a thread discovered from disk may have no prior row), so
+    the watermark survives a restart and is the single source of 'already
+    surfaced' truth — replacing the in-memory 120s dedup cooldown.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO cursor_sessions (session_id, project, status, started_at, "
+            "last_event_at, last_event_summary, delivered_offset, delivered_kind) "
+            "VALUES (?, ?, 'running', ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "delivered_offset=excluded.delivered_offset, "
+            "delivered_kind=excluded.delivered_kind, "
+            "last_event_at=excluded.last_event_at, "
+            "last_event_summary=excluded.last_event_summary",
+            (session_id, project, _now(), _now(), summary, int(offset), kind),
+        )
 
 
 # ---------------------------------------------------------------------------

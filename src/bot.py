@@ -78,11 +78,10 @@ _last_voice_alert_at: dict[str, float] = {}
 # task used to drop on process churn. Started once in on_ready's boot-only init.
 _judge_sweep_task: asyncio.Task | None = None
 _JUDGE_SWEEP_INTERVAL_SEC = 120.0
-_cursor_stall_task: asyncio.Task | None = None
-_STALL_WATCH_INTERVAL_SEC = 60.0
-# Watermark per agent: the last_event_at we already stall-notified at. A new
-# event changes last_event_at, so the key differs and the thread re-arms.
-_stall_notified_at: dict[str, float] = {}
+# The lifecycle watcher's filesystem discovery sweep: attaches a tailer to live
+# Cursor threads whose first hook never arrived, so the watcher keeps seeing work
+# even when hooks are dark (settle/hung detection lives in the tailer itself).
+_cursor_discovery_task: asyncio.Task | None = None
 
 _wake_listener = None          # WakeWordListener | None (typed loosely to avoid import at module level)
 _local_speaker: SpeakerOutput | None = None
@@ -1625,43 +1624,26 @@ async def _judge_sweep_loop() -> None:
             log.exception("Judge sweep iteration failed — continuing")
 
 
-async def _cursor_stall_watch_loop() -> None:
-    """Buzz a one-shot 'stalled' summary when a running Cursor thread goes quiet
-    past the stall window, re-arming when a new event lands (the watermark is
-    keyed to the thread's last_event_at, so a resumed-then-restalled thread can
-    stall again). A stall is the only way a silently-hung thread surfaces — no
-    stop hook fires for a hang — so it counts as a STOP and notifies, with a
-    factual 'quiet for N min' summary, never a 'definitely stuck' claim."""
-    from .cursor_registry import RegistryEvent
+async def _cursor_discovery_loop() -> None:
+    """Filesystem discovery for the lifecycle watcher. Sweep every project root
+    for live Cursor threads and attach a tailer to each — so a thread whose FIRST
+    hook never arrived (or that started while hooks were dark) is still watched.
 
+    The tailer is hook-independent once attached: it polls the transcript and
+    emits the single settled-state buzz (finished / question / errored), plus the
+    hang catcher (quiet past hung_window with no hand-back). This sweep is what
+    closes the only blind spot — a thread we never heard a hook for — so the
+    watcher never fails silently. Attach is idempotent (a running tailer dedups)."""
     await bot.wait_until_ready()
-    stall_sec = max(60.0, config.cursor_stall_minutes * 60.0)
+    interval = max(3.0, config.cursor_discovery_seconds)
     while not bot.is_closed():
         try:
-            await asyncio.sleep(_STALL_WATCH_INTERVAL_SEC)
-            now = time.time()
-            for agent in cursor_registry.agents():
-                if agent.status != "running" or agent.last_event_at <= 0:
-                    continue
-                if now - agent.last_event_at < stall_sec:
-                    continue
-                if _stall_notified_at.get(agent.agent_id) == agent.last_event_at:
-                    continue
-                _stall_notified_at[agent.agent_id] = agent.last_event_at
-                mins = int((now - agent.last_event_at) / 60)
-                await _narrate_registry_event(RegistryEvent(
-                    kind="stalled",
-                    agent=agent,
-                    severity="high",
-                    reason=(
-                        f"Cursor thread in {agent.project_label} has been quiet for "
-                        f"{mins} min (running, no new activity)."
-                    ),
-                ))
+            await asyncio.sleep(interval)
+            await cursor_registry.discover_threads_from_disk()
         except asyncio.CancelledError:
             return
         except Exception:
-            log.exception("Cursor stall watch iteration failed — continuing")
+            log.exception("Cursor discovery sweep failed — continuing")
 
 
 # ---------------------------------------------------------------------------
@@ -1979,12 +1961,23 @@ def _format_registry_speech(evt: RegistryEvent) -> str:
 
 
 def _format_registry_dm(evt: RegistryEvent) -> str:
-    """One-shot Discord DM body. Mention-prefixed so the phone buzzes."""
+    """One-shot Discord DM body. Mention-prefixed so the phone buzzes.
+
+    Thread-IDENTIFIABLE by construction: it leads with the thread's distilled
+    label when we have one (the sid handle is always in `evt.reason`), so two
+    concurrent threads in one project never alias into the same anonymous ping.
+    Honest about timing: if the hand-back is older than a moment (a restart- or
+    discovery-surfaced event), it says how long ago.
+    """
     agent = evt.agent
     mention_id = config.authorized_user_ids[0] if config.authorized_user_ids else ""
     mention = f"<@{mention_id}> " if mention_id else ""
-    project = (agent.workspace_root or "").rstrip("/").split("/")[-1] or agent.workspace_root
-    lines = [f"{mention}{evt.reason} ({project})"]
+    tlabel = _cached_thread_label(agent.current_sid) if agent.current_sid else ""
+    head = f"[{tlabel}] {evt.reason}" if tlabel else evt.reason
+    age = time.time() - agent.last_event_at if agent.last_event_at else 0.0
+    if age >= 90:
+        head += f" (handed back ~{int(age / 60)}m ago)"
+    lines = [f"{mention}{head}"]
     if agent.pending_question:
         lines.append(f"It's asking: {agent.pending_question[:300]}")
     elif agent.last_assistant_text:
@@ -2058,24 +2051,15 @@ async def _notify_user_buzz(content: str) -> bool:
         return False
 
 
-# The ONE attention policy: a watched thread buzzes the user every time it STOPS
-# — a question it stopped to ask, a completion, an error, or a 15-min stall —
-# each carrying a factual little summary of what it actually did
+# The ONE attention policy: a thread buzzes the user exactly ONCE when it SETTLES
+# into a hand-back — a question it stopped to ask, a completion, an error, or a
+# hang — each carrying a factual little summary of what it actually did
 # (`_format_registry_dm` reads the thread's own last words / the question / the
-# error; it never invents one). Routine 'progress', a 'started', and a
-# user-initiated 'cancelled' stay silent-audit-only. The fabrication sources are
-# gone (2026-06-19): a `question` comes ONLY from an explicit AskQuestion/
-# askFollowup tool call (never a trailing '?'), and a completion is summarized
-# from real output (never a Claude-invented "next step"). So every stop pings,
-# but no stop is manufactured into a decision the agent never posed.
+# error; it never invents one). Mid-task turns, subagent finishes, progress, and
+# a user-initiated cancel are silent BY CONSTRUCTION — the lifecycle watcher has
+# no emit path for them. The buzz is the transcript's settled state, not a
+# per-turn hook, so it fires at the moment that actually matters, once.
 _BUZZ_KINDS: tuple[str, ...] = ("question", "finished", "completed", "errored", "stalled")
-
-# Attention backpressure: a same-kind STOP from the same thread within this many
-# seconds of the last phone buzz is folded into the silent audit (already posted)
-# instead of buzzing again. This kills the duplicate completed/cancelled bursts
-# without touching the "every distinct stop surfaces" policy — a new kind or a
-# post-cooldown event still buzzes, and nothing is dropped.
-_BUZZ_DEDUP_COOLDOWN_S: float = 120.0
 
 
 async def _task_done_gate(goal: str, result: str, session_key: str) -> tuple[bool, list[str]]:
@@ -2233,21 +2217,10 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     if evt.kind not in _BUZZ_KINDS:
         return
 
-    # Attention backpressure (never a drop): fold a same-kind repeat from THIS
-    # thread within the cooldown into the silent audit posted above, rather than
-    # buzzing the phone twice for what is the same stop re-reported. A distinct
-    # kind or a post-cooldown stop still buzzes.
-    now = time.monotonic()
-    if (agent.last_buzzed_kind == evt.kind
-            and now - agent.last_buzzed_at < _BUZZ_DEDUP_COOLDOWN_S):
-        log.info(
-            "attention: folded a duplicate %s buzz for %s into the audit "
-            "(within %.0fs cooldown)", evt.kind, agent.agent_id, _BUZZ_DEDUP_COOLDOWN_S,
-        )
-        return
-    agent.last_buzzed_at = now
-    agent.last_buzzed_kind = evt.kind
-
+    # No dedup cooldown needed: the lifecycle watcher emits exactly ONE terminal
+    # event per halt (guarded by the durable per-sid transcript-offset watermark),
+    # so a buzz here is already de-duplicated at the source — a new buzz means a
+    # genuinely new hand-back, never the same stop re-reported.
     await _notify_user_buzz(_format_registry_dm(evt))
 
 
@@ -2359,7 +2332,7 @@ async def on_ready():
     global cursor_observer
     global _voice_reconcile_task
     global _judge_sweep_task
-    global _cursor_stall_task
+    global _cursor_discovery_task
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id)
 
     if not _on_ready_done:
@@ -2594,11 +2567,12 @@ async def on_ready():
                 _judge_sweep_loop(), name="judge_sweep"
             )
 
-        # The 15-min stall watchdog — a silently-hung thread has no stop hook, so
-        # this surfaces it as a STOP and buzzes a factual 'quiet for N min' line.
-        if _cursor_stall_task is None or _cursor_stall_task.done():
-            _cursor_stall_task = asyncio.create_task(
-                _cursor_stall_watch_loop(), name="cursor_stall_watch"
+        # The lifecycle watcher's discovery sweep — attaches a tailer to live
+        # threads whose first hook never arrived, so the watcher keeps seeing work
+        # when hooks are dark (settle + hang detection live in the tailer itself).
+        if _cursor_discovery_task is None or _cursor_discovery_task.done():
+            _cursor_discovery_task = asyncio.create_task(
+                _cursor_discovery_loop(), name="cursor_discovery"
             )
 
         _on_ready_done = True

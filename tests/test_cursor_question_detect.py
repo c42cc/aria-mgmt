@@ -180,7 +180,23 @@ class TestTailerDoesNotReplayBacklog(unittest.IsolatedAsyncioTestCase):
         import os
         import shutil
         import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import patch
         from src.cursor_registry import CursorAgentRegistry, SessionInfo
+
+        d = tempfile.mkdtemp()
+        # The lifecycle watcher emits the question at SETTLE (not per-turn) and
+        # persists a durable watermark, so this needs a fast settle + a temp db.
+        fake_cfg = SimpleNamespace(
+            data_dir=d, cursor_settle_seconds=0.2,
+            cursor_hung_minutes=0.5, cursor_discovery_seconds=0.2,
+        )
+        cfg_patch = patch("src.config.config", fake_cfg)
+        db_patch = patch("src.db.DB_PATH", os.path.join(d, "state.db"))
+        cfg_patch.start()
+        db_patch.start()
+        from src.db import init_db
+        init_db()
 
         reg = CursorAgentRegistry(tail_interval_sec=0.05)
         events = []
@@ -190,7 +206,6 @@ class TestTailerDoesNotReplayBacklog(unittest.IsolatedAsyncioTestCase):
 
         reg.set_emit_callback(emit)
 
-        d = tempfile.mkdtemp()
         try:
             path = os.path.join(d, "sid.jsonl")
             # Pre-existing backlog containing a (historical) AskQuestion.
@@ -202,22 +217,24 @@ class TestTailerDoesNotReplayBacklog(unittest.IsolatedAsyncioTestCase):
             agent.sessions["sid"] = sess
             reg._ensure_tailer(agent, sess)
 
-            await asyncio.sleep(0.3)  # let it prime over the backlog
+            await asyncio.sleep(0.45)  # seed over the backlog AND pass a settle window
             self.assertEqual(
                 [e for e in events if e.kind == "question"], [],
                 "backlog must NOT be replayed as question events",
             )
 
-            # Append a genuinely NEW ask -> must emit exactly one question.
+            # Append a genuinely NEW ask -> settles into exactly one question.
             with open(path, "a") as f:
                 f.write(json.dumps({"role": "assistant", "message": {"content": _NEW_ASK_CONTENT}}) + "\n")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.45)
 
             qs = [e for e in events if e.kind == "question"]
             self.assertEqual(len(qs), 1, f"new ask should emit one question, got {len(qs)}")
             self.assertIn("ship it", qs[0].reason)
         finally:
             await reg.stop()
+            db_patch.stop()
+            cfg_patch.stop()
             shutil.rmtree(d, ignore_errors=True)
 
 
