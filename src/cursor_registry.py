@@ -57,6 +57,16 @@ EventKind = Literal[
 # off recency so a stale "running" can't masquerade as active work.
 RUNNING_RECENCY_SEC = 180.0
 
+# A thread whose transcript has been quiet longer than this at the moment we
+# FIRST attach is treated as settled HISTORY (seed past it; suppress) — a restart
+# or discovery of an old thread. A thread touched more recently is live or JUST
+# handed back (the stop hook that attached us IS this hand-back), so its current
+# terminal state is emitted once. This is the fix for "a thread that hands back at
+# the very moment its first hook attaches us never pinged" — the seed used to
+# swallow exactly that hand-back, which is the common case for any thread whose
+# first hook is its own turn-end (e.g. an interactive chat that just answered you).
+_ATTACH_HISTORY_SECONDS = 120.0
+
 
 @dataclass
 class SessionInfo:
@@ -877,22 +887,30 @@ class CursorAgentRegistry:
         settle = max(0.05, config.cursor_settle_seconds)
         hung = max(settle, config.cursor_hung_minutes * 60.0)
 
-        # Seed the durable watermark on first attach: everything already in the
-        # transcript is HISTORY (it settled before we were watching), so seed
-        # delivered_offset to the current size — only growth AFTER attach can fire
-        # a terminal buzz. This is the one anti-replay guard (restart-safe and
-        # backlog-safe); it replaces the in-memory 120s dedup cooldown entirely.
+        # Seed the durable watermark on first attach. RECENCY decides what counts
+        # as already-settled HISTORY (suppress) vs the fresh hand-back that just
+        # attached us (emit):
+        #  - quiet > _ATTACH_HISTORY_SECONDS at attach: it settled before we were
+        #    watching and we hold no delivery record -> history (restart, or
+        #    discovery of an old thread). Seed to the current size so a stale
+        #    completion is never replayed as a burst.
+        #  - touched more recently: live, or JUST handed back (the stop hook that
+        #    attached us IS this hand-back). Seed only to the durable watermark so
+        #    the current terminal state settles and emits exactly once.
+        # This is the one anti-replay guard (restart- and backlog-safe) AND the fix
+        # for a thread that hands back at the moment its first hook attaches us.
         if sess._delivered_offset < 0:
             durable_off, _ = db.get_cursor_delivered(sess.sid)
             try:
-                cur_size = (
-                    os.path.getsize(sess.transcript_path)
-                    if sess.transcript_path and os.path.exists(sess.transcript_path)
-                    else 0
-                )
+                exists = bool(sess.transcript_path) and os.path.exists(sess.transcript_path)
+                cur_size = os.path.getsize(sess.transcript_path) if exists else 0
+                quiet_at_attach = (time.time() - os.path.getmtime(sess.transcript_path)) if exists else 1e9
             except OSError:
-                cur_size = 0
-            sess._delivered_offset = max(durable_off, cur_size, sess._tail_offset)
+                cur_size, quiet_at_attach = 0, 1e9
+            if quiet_at_attach > _ATTACH_HISTORY_SECONDS:
+                sess._delivered_offset = max(durable_off, cur_size, sess._tail_offset)
+            else:
+                sess._delivered_offset = max(durable_off, sess._tail_offset)
             sess._last_byte_at = time.time()
 
         try:

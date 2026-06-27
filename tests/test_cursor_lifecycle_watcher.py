@@ -81,15 +81,20 @@ class LifecycleWatcher(unittest.IsolatedAsyncioTestCase):
     def _kinds(self, kind: str):
         return [e for e in self.events if e.kind == kind]
 
-    async def _attach(self, sid: str, rows: list[dict] | None = None):
-        """Attach a tailer and let it SEED first — everything present at attach is
-        history (the anti-replay guard). Returns the path; bytes appended after
-        this returns are the live activity that can buzz."""
+    async def _attach(self, sid: str, rows: list[dict] | None = None, old: bool = False):
+        """Attach a tailer and let it SEED first. Content present at attach is
+        HISTORY only if the transcript is OLD (quiet past _ATTACH_HISTORY_SECONDS);
+        a freshly-written transcript is a live/just-handed-back thread the watcher
+        must surface. `old=True` ages the file so it counts as history. Returns the
+        path; bytes appended after this returns are always live activity."""
         from src.cursor_registry import SessionInfo
         p = os.path.join(self.tmp, f"{sid}.jsonl")
         with open(p, "w") as f:
             for r in (rows or []):
                 f.write(json.dumps(r) + "\n")
+        if old:
+            past = time.time() - 600  # 10 min ago -> history
+            os.utime(p, (past, past))
         agent = self.reg._get_or_create("/proj/live_visuals_4", source="ide")
         sess = SessionInfo(sid=sid, started_at=time.time(), last_event_at=time.time(), transcript_path=p)
         agent.sessions[sid] = sess
@@ -155,12 +160,26 @@ class LifecycleWatcher(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sidone1", reasons)
         self.assertIn("sidtwo2", reasons)
 
-    async def test_restart_does_not_replay_a_settled_halt(self):
-        # A thread that already finished BEFORE we attached is history: the
-        # watermark is seeded to the current size, so no buzz on (re)attach.
-        await self._attach("sidrest0", rows=[_user("do it"), _atext("already finished before watch")])
+    async def test_fresh_handback_at_attach_emits(self):
+        # THE bug: a thread whose FIRST hook attaches us at its own turn-end. The
+        # transcript already holds the hand-back, but it is FRESH -> it must still
+        # ping (the old seed-to-filesize swallowed exactly this, so aria/this very
+        # chat never pinged). Attach to a just-handed-back transcript, append
+        # nothing, and require one finished.
+        await self._attach("sidfresh0", rows=[_user("audit it"), _atext("Done — here is the summary.")])
         await asyncio.sleep(0.45)
-        self.assertEqual(self._kinds("finished"), [], "a pre-existing halt is seeded, never replayed")
+        fin = self._kinds("finished")
+        self.assertEqual(len(fin), 1, "a fresh hand-back present at attach must ping exactly once")
+        self.assertIn("sidfresh", fin[0].reason)
+
+    async def test_old_finished_thread_is_suppressed_on_attach(self):
+        # A thread that finished LONG before we attached (restart / discovery of an
+        # old thread) is history: seeded past, never replayed as a stale burst.
+        await self._attach(
+            "sidold00", rows=[_user("do it"), _atext("finished 10 minutes ago")], old=True
+        )
+        await asyncio.sleep(0.45)
+        self.assertEqual(self._kinds("finished"), [], "an old settled halt is history, never replayed")
 
     async def test_discovery_attaches_a_threadless_of_hooks(self):
         # A thread whose first hook never arrived: discovery's ensure-from-disk

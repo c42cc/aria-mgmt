@@ -180,6 +180,7 @@ class TestTailerDoesNotReplayBacklog(unittest.IsolatedAsyncioTestCase):
         import os
         import shutil
         import tempfile
+        import time
         from types import SimpleNamespace
         from unittest.mock import patch
         from src.cursor_registry import CursorAgentRegistry, SessionInfo
@@ -208,9 +209,13 @@ class TestTailerDoesNotReplayBacklog(unittest.IsolatedAsyncioTestCase):
 
         try:
             path = os.path.join(d, "sid.jsonl")
-            # Pre-existing backlog containing a (historical) AskQuestion.
+            # Pre-existing backlog containing a (historical) AskQuestion. Age it so
+            # recency treats it as settled HISTORY (a days-old thread), not a fresh
+            # hand-back — that is the case that must stay silent.
             with open(path, "w") as f:
                 f.write(json.dumps({"role": "assistant", "message": {"content": _ASK_TURN_CONTENT}}) + "\n")
+            _past = time.time() - 600
+            os.utime(path, (_past, _past))
 
             agent = reg._get_or_create("/tmp/proj_backlog", source="ide")
             sess = SessionInfo(sid="sid", started_at=0.0, last_event_at=0.0, transcript_path=path)
