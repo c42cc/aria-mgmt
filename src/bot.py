@@ -28,6 +28,7 @@ from .discord_voice import VoiceTransitionBusy, voice_bridge, voice_controller
 from .gemini_session import GeminiSession
 from .local_audio import SpeakerOutput
 from .memory import init_memory, remember, recall
+from . import presence
 
 logging.basicConfig(
     level=logging.INFO,
@@ -388,6 +389,11 @@ async def _on_wake_word() -> None:
     global _local_session_active, _local_speaker, _local_silence_task
 
     if _local_session_active:
+        return
+    if presence.is_away():
+        # "Aria go away for N" — ignore wake words while away so a false
+        # detection (the 3 AM self-talk) can't open a voice session. Auto-resumes.
+        log.info("Wake word ignored — Aria is away (%s)", presence.describe())
         return
     if voice_controller.in_voice:
         log.debug("Wake word heard but Discord voice is active — ignoring")
@@ -1073,6 +1079,18 @@ async def _handle_tool_call(name: str, args: dict) -> str:
     that already send the result to message.channel do not trigger a
     duplicate post.
     """
+    if name == "go_away":
+        minutes = float(args.get("minutes") or 30)
+
+        async def _ack_then_leave() -> None:
+            await asyncio.sleep(2.5)  # let the spoken acknowledgement play first
+            await _go_quiet(minutes * 60.0)
+
+        asyncio.create_task(_ack_then_leave(), name="go_away_leave")
+        human = f"{minutes / 60:.0f} hours" if minutes >= 90 else f"{int(minutes)} minutes"
+        return (f"Okay \u2014 going quiet for about {human}. I'll stop listening and "
+                f"come back then; say '!here' if you want me sooner.")
+
     from .tools import handle_tool_call
     result = await handle_tool_call(name, args)
     if name in _VOICE_VISIBLE_TOOLS and result:
@@ -1412,6 +1430,13 @@ async def _auto_join_voice_channel(channel: discord.VoiceChannel) -> bool:
     """
     global _spicylit_active, _grok_session, _grok_session_started_at
     global _last_audio_received_at
+
+    if presence.is_away():
+        # While away she does not auto-join voice (boot rescan or you joining a
+        # channel). A manual !join / !back clears away first, so this only gates
+        # the automatic paths.
+        log.info("Auto-join skipped — Aria is away (%s)", presence.describe())
+        return False
 
     is_spicylit = (
         config.discord_spicylit_channel_id
@@ -2101,7 +2126,7 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
         except Exception:
             log.exception("Failed to post cursor watch audit")
 
-    on_voice = bool(gemini and gemini.connected)
+    on_voice = bool(gemini and gemini.connected) and not presence.is_away()
     if on_voice:
         try:
             try:
@@ -2590,6 +2615,7 @@ async def join(ctx: commands.Context):
         await ctx.send("Already in voice.")
         return
 
+    presence.clear_away()  # a manual !join means "come back"
     if await _auto_join_voice_channel(channel):
         await ctx.send(f"Joined {channel.name}")
     else:
@@ -2610,6 +2636,49 @@ async def leave(ctx: commands.Context):
         await gemini.close()
     await voice_controller.leave()
     await ctx.send("Left voice channel.")
+
+
+async def _go_quiet(seconds: float) -> str:
+    """Enter the away state for `seconds` and leave any live voice session. The
+    one place 'go away' takes effect (the !away command and the go_away voice
+    tool both call it), so the behavior can't diverge."""
+    presence.set_away(seconds)
+    _cancel_audio_tasks()
+    if gemini and gemini.connected:
+        try:
+            await gemini.close()
+        except Exception:
+            log.exception("go-away: error closing Gemini")
+    try:
+        await voice_controller.leave()
+    except Exception:
+        log.exception("go-away: error leaving voice")
+    return presence.describe()
+
+
+@bot.command(name="away")
+async def _cmd_away(ctx: commands.Context, *, duration: str = "30m") -> None:
+    """`!away 30m` / `!away 9h` — go quiet: stop listening (wake word), leave/don't
+    join voice, auto-resume after the time. Phone notifications keep working."""
+    if not _is_authorized(ctx.author.id):
+        await ctx.send("Not authorized.")
+        return
+    seconds = presence.parse_duration(duration)
+    if seconds is None:
+        await ctx.send("Tell me how long, e.g. `!away 30m` or `!away 9h`.")
+        return
+    await _go_quiet(seconds)
+    await ctx.send(f"Going quiet \u2014 {presence.describe()}. Say `!here` anytime.")
+
+
+@bot.command(name="here", aliases=["resume", "unmute"])
+async def _cmd_here(ctx: commands.Context) -> None:
+    """`!here` (or `!resume`/`!unmute`) — come back now, cancelling an active away."""
+    if not _is_authorized(ctx.author.id):
+        await ctx.send("Not authorized.")
+        return
+    presence.clear_away()
+    await ctx.send("Back \u2014 listening again.")
 
 
 @bot.command()

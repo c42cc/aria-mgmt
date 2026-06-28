@@ -21,6 +21,27 @@ log = logging.getLogger(__name__)
 
 TOOL_DECLARATIONS = [
     types.FunctionDeclaration(
+        name="go_away",
+        description=(
+            "Go quiet and leave for a while when Corbin tells you to — e.g. 'go "
+            "away for 30 minutes', 'leave me alone for an hour', 'be quiet for 9 "
+            "hours', 'go away'. You stop listening (wake word off) and leave voice, "
+            "then auto-resume after the time. Use ONLY when he explicitly asks you "
+            "to go away / be quiet for a period. Default to 30 minutes if he didn't "
+            "say how long."
+        ),
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "minutes": types.Schema(
+                    type="NUMBER",
+                    description="How long to stay away, in minutes (30 = 30 minutes, 540 = 9 hours).",
+                ),
+            },
+            required=["minutes"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="plan_with_claude",
         description="Send a planning request to Claude Opus 4.6 for analysis, planning, architecture, or debugging strategy.",
         parameters=types.Schema(
