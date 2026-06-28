@@ -122,6 +122,31 @@ class TestDeliverHonesty(_Base):
         alarm.assert_called_once()
 
 
+class TestEnvParsing(unittest.TestCase):
+    """The hand `.env` parser must agree with python-dotenv on inline comments —
+    a `DISCORD_TEXT_CHANNEL_ID=123 #ucs` that leaks the comment builds a broken
+    URL (the real bug found by reproducing the live state)."""
+
+    def test_clean_value(self):
+        import src.notify_phone as np
+
+        self.assertEqual(np._clean_value("123 #ucs"), "123")
+        self.assertEqual(np._clean_value("123    #ucs"), "123")
+        self.assertEqual(np._clean_value('"quoted value"'), "quoted value")
+        self.assertEqual(np._clean_value("nocomment"), "nocomment")
+        self.assertEqual(np._clean_value("has#hash"), "has#hash")  # no space => kept
+
+
+class TestAlarmThrottle(_Base):
+    """The loud alarm rungs are throttled per failure key so a persistently-down
+    path nags once per window, not once per stop — without dropping ledger truth."""
+
+    def test_first_fires_then_throttles_same_key(self):
+        self.assertFalse(self.np._alarm_throttled("403"))   # first -> fire
+        self.assertTrue(self.np._alarm_throttled("403"))    # repeat -> throttled
+        self.assertFalse(self.np._alarm_throttled("500"))   # new reason -> fire
+
+
 class TestStalePending(_Base):
     def test_unresolved_pending_is_counted(self):
         self.np.ledger_append({"status": "pending", "sid": "a"})

@@ -29,13 +29,14 @@ never imports `src.config` (which pulls in dotenv).
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 API = "https://discord.com/api/v10"
 HTTP_TIMEOUT = 8.0
@@ -48,6 +49,21 @@ LEDGER = os.path.expanduser("~/Library/Logs/voicebot/notify.log")
 # --------------------------------------------------------------------------- #
 # env + ledger
 # --------------------------------------------------------------------------- #
+def _clean_value(val: str) -> str:
+    """Match python-dotenv: honor quotes, strip an inline `# comment` (a `#`
+    preceded by whitespace). The bot loads `.env` via dotenv (clean); this hand
+    parser must agree or a value like `DISCORD_TEXT_CHANNEL_ID=123 #ucs` leaks
+    the comment into a URL (the real bug this fixes)."""
+    val = val.strip()
+    if val[:1] in ('"', "'"):
+        end = val.find(val[0], 1)
+        return val[1:end] if end != -1 else val[1:]
+    for i, ch in enumerate(val):
+        if ch == "#" and (i == 0 or val[i - 1].isspace()):
+            return val[:i].strip()
+    return val
+
+
 def load_env(repo_root: str = REPO_ROOT) -> dict[str, str]:
     """Parse `<repo>/.env` (KEY=VALUE), overlaid by the real environment.
 
@@ -64,9 +80,8 @@ def load_env(repo_root: str = REPO_ROOT) -> dict[str, str]:
                     continue
                 key, _, val = line.partition("=")
                 key = key.strip()
-                val = val.strip().strip('"').strip("'")
                 if key:
-                    env[key] = val
+                    env[key] = _clean_value(val)
     except FileNotFoundError:
         pass
     # The live environment wins (so the bot's already-loaded secrets apply).
@@ -152,6 +167,11 @@ def _post(token: str, path: str, body: dict) -> dict:
             f"notify path could not reach Discord at {path}: {exc.reason} "
             f"(our connectivity, our problem to fix)"
         ) from exc
+    except (http.client.HTTPException, ValueError, OSError) as exc:
+        # A malformed value (e.g. a bad channel id) or transport fault must read
+        # as a typed LOUD notify failure, never an uncaught crash that loses the
+        # alarm. Still our problem to fix, never "Discord's fault".
+        raise NotifyError(f"notify path malformed/transport error at {path}: {exc}") from exc
 
 
 def _dm_channel_id(token: str, user_id: str) -> str:
@@ -211,10 +231,41 @@ def _local_notification(title: str, message: str) -> None:
         sys.stderr.write(f"[notify_phone] local notification rung failed: {exc}\n")
 
 
-def _alarm(env: dict, *, why: str, hint: str, missed: str, sid: str, project: str) -> None:
+def _alarm_throttled(why_key: str, window_sec: float = 1800.0) -> bool:
+    """True if an alarm with this key fired within the window — so the loud rungs
+    don't FLOOD #ucs while a broken path stays broken. This throttles only the
+    repeated NOTICE; the `failed`/`alarm` ledger lines of truth are still written."""
+    path = os.path.join(STATE_DIR, "last_alarm.json")
+    now = time.time()
+    try:
+        with open(path) as fh:
+            prev = json.load(fh)
+        if prev.get("why_key") == why_key and now - float(prev.get("at", 0)) < window_sec:
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        _ensure_dirs()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"why_key": why_key, "at": now}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return False
+
+
+def _alarm(env: dict, *, why: str, hint: str, missed: str, sid: str, project: str,
+           why_key: str = "") -> None:
     """Raise a LOUD alarm that the notify path is DOWN. This is not a fallback
     delivery of the notification — it is an alarm about a broken primitive,
-    plus the context of what you missed and the one-command fix."""
+    plus the context of what you missed and the one-command fix. The loud rungs
+    are throttled per `why_key` so a persistently-broken path nags once, not
+    once-per-stop; every failure is still recorded in the ledger."""
+    if why_key and _alarm_throttled(why_key):
+        ledger_append({"status": "alarm", "sid": sid, "project": project,
+                       "why": why, "throttled": True})
+        return
     token = env.get("DISCORD_APP_BOT_TOKEN", "")
     channel = env.get("DISCORD_TEXT_CHANNEL_ID", "")
     mention = (env.get("AUTHORIZED_USER_IDS", "").split(",") or [""])[0].strip()
@@ -276,7 +327,8 @@ def deliver(
 
     if not token or not users:
         why = "missing DISCORD_APP_BOT_TOKEN or AUTHORIZED_USER_IDS in .env"
-        _alarm(env, why=why, hint="populate .env", missed=content, sid=sid, project=project)
+        _alarm(env, why=why, hint="populate .env", missed=content, sid=sid,
+               project=project, why_key="missing-secrets")
         ledger_append({"status": "failed", "sid": sid, "project": project, "error": why})
         return Result(False, error=why)
 
@@ -296,7 +348,8 @@ def deliver(
                 return Result(True, msg_id=msg_id)
             except NotifyError as exc2:
                 exc = exc2
-        _alarm(env, why=str(exc), hint=exc.hint, missed=content, sid=sid, project=project)
+        _alarm(env, why=str(exc), hint=exc.hint, missed=content, sid=sid,
+               project=project, why_key=str(exc.status or "send"))
         ledger_append({"status": "failed", "sid": sid, "project": project,
                        "error": str(exc), "hint": exc.hint})
         return Result(False, error=str(exc), hint=exc.hint)

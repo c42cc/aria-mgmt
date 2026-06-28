@@ -252,10 +252,19 @@ def _first_user_id() -> str:
             for line in fh:
                 if line.strip().startswith("AUTHORIZED_USER_IDS="):
                     raw = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    return raw.split(",")[0].strip()
+                    return _strip_comment(raw).split(",")[0].strip()
     except OSError:
         pass
     return os.environ.get("AUTHORIZED_USER_IDS", "").split(",")[0].strip()
+
+
+def _strip_comment(val: str) -> str:
+    """Drop an inline `# comment` (a `#` preceded by whitespace) so an id never
+    carries the comment into a mention/URL."""
+    for i, ch in enumerate(val):
+        if ch == "#" and (i == 0 or val[i - 1].isspace()):
+            return val[:i].strip()
+    return val
 
 
 # --------------------------------------------------------------------------- #
