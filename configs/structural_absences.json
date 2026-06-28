@@ -26,6 +26,16 @@
       "substring": "def suggest_next_action",
       "where": ["src"],
       "why": "the cheap Claude call behind the deleted auto-proposal (_maybe_propose_next_after_completion). Its only job was to invent a next-step decision to buzz; with the proposal gone it is dead. Removed 2026-06-19 — do not resurrect a 'guess what the user wants next' model call on the cursor-watch path."
+    },
+    {
+      "substring": "notification delivered via #ucs",
+      "where": ["src"],
+      "why": "the fabricated-success lie: the old _notify_user_buzz fell back to a #ucs @mention when the DM was Forbidden and logged 'notification delivered' — so a notify path that never reached the phone read as success (DMs were dead ALL of 2026-06-27 and nothing surfaced it). Collapsed 2026-06-27 into src/notify_phone.deliver: 'delivered' requires a Discord message id, and a failure is a LOUD alarm + a `failed` ledger line, never a silent reroute."
+    },
+    {
+      "substring": "def _dm_authorized_user",
+      "where": ["src"],
+      "why": "the second delivery home (discord.py create_dm + a silent #ucs fallback). Collapsed 2026-06-27 into the ONE verified home src/notify_phone.deliver, used by both the standalone Cursor stop hook and the bot. A resurrected second DM primitive re-opens the two-homes honesty drift."
     }
   ],
 

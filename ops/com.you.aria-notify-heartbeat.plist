@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.you.aria-notify-heartbeat</string>
+
+    <!-- The notify path's self-test: once a day (and at load) it exercises the
+         REAL delivery primitive (src/notify_phone.py) end-to-end to your phone
+         and checks the ledger for unresolved sends. If the path is dead it has
+         already alarmed (a [NOTIFY PATH DOWN] post + a local macOS notification),
+         so a future break is caught by the system, never by your silence. The
+         worker is stdlib-only, so it does not depend on the bot being up. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2-notify-on-stop/.venv/bin/python</string>
+        <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2-notify-on-stop/src/notify_phone.py</string>
+        <string>heartbeat</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/corbin/PycharmProjects/agi_env_v1/ucs2-notify-on-stop</string>
+
+    <!-- osascript (/usr/bin) is the Discord-independent last alarm rung. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Run at load (an immediate proof) and once a day at 09:00. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/corbin/Library/Logs/voicebot/notify-heartbeat.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/corbin/Library/Logs/voicebot/notify-heartbeat.log</string>
+</dict>
+</plist>

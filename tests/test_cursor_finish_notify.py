@@ -1,19 +1,21 @@
-"""Regression: the cursor-watch off-voice delivery contract.
+"""Contract: the cursor-watch off-voice delivery, after the deterministic collapse.
 
-A watched thread buzzes the user OFF-VOICE on every STOP — a `question`, a
-`finished`/`completed`, an `errored`, or a `stalled` — each carrying a factual
-little summary (`_format_registry_dm` reads the thread's own last words / the
-question / the error). Routine progress/started stay on the forced-silent
-`#ucs-alerts` audit stream. Crucially, a completion/error is summarized from
-REAL output — never manufactured into a fabricated question or a Claude-invented
-"next step" (the 2026-06-19 collapse deleted both the trailing-'?' prose
-heuristic and the "finished -> invent a next step" auto-proposal).
+The IDE phone buzz is now owned by the standalone Cursor `stop` hook
+(`hooks/notify-finish.py` -> `src/notify_phone.py`), NOT the tailer-driven
+narrator. So:
 
-These tests isolate `_narrate_registry_event`'s off-voice path: every stop
-buzzes with a summary; progress/started stay silent.
+  * `_notify_user_buzz` routes through the ONE delivery home (`notify_phone`).
+    "Delivered" means Discord accepted the DM; a failure is LOUD and returns
+    False — never the old silent `#ucs` fallback that logged a fabricated
+    "delivered" while DMs were dead all day.
+  * The narrator does NOT phone-buzz for `source == "ide"` events (the hook
+    owns them) — it keeps the silent #ucs audit and the spoken voice heads-up.
+    It STILL phone-buzzes SDK / Claude-Code finishes (no IDE hook fires there).
+  * Routine progress/started never buzz. The DM summary is built from REAL
+    output, never an invented next step.
 
 Run with:
-    .venv/bin/python -m unittest tests.test_cursor_finish_notify -v
+    .venv/bin/python -m pytest tests/test_cursor_finish_notify.py -q
 """
 
 from __future__ import annotations
@@ -28,14 +30,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _make_event(kind: str, severity: str = "low", *, reason: str = "", question: str | None = None):
+def _make_event(kind: str, severity: str = "low", *, source: str = "ide",
+                reason: str = "", question: str | None = None):
     from src.cursor_registry import CursorAgent, RegistryEvent
 
     agent = CursorAgent(
         agent_id="/tmp/aria_notify_selftest",
         workspace_root="/tmp/aria_notify_selftest",
         project_label="aria_notify_selftest",
-        source="ide",
+        source=source,
     )
     agent.last_assistant_text = "Did the thing."
     agent.last_event_at = 1234.0
@@ -49,57 +52,67 @@ def _make_event(kind: str, severity: str = "low", *, reason: str = "", question:
     )
 
 
-class TestNotifyUserBuzz(unittest.IsolatedAsyncioTestCase):
-    """`_notify_user_buzz` prefers a DM, falls back to a non-silent #ucs ping."""
+class TestNotifyUserBuzzOneHome(unittest.IsolatedAsyncioTestCase):
+    """`_notify_user_buzz` routes through the one verified delivery home and is
+    honest: True only when Discord accepted the DM, never on a silent fallback."""
 
-    async def test_prefers_dm(self):
-        from src import bot
+    async def test_delegates_to_notify_phone_and_reports_delivered(self):
+        from src import bot, notify_phone
 
-        with patch.object(bot, "_dm_authorized_user", AsyncMock(return_value=True)) as dm, \
-             patch.object(bot, "post_to_text", AsyncMock()) as ucs:
-            ok = await bot._notify_user_buzz("buzz <@1>")
+        with patch.object(
+            notify_phone, "deliver",
+            MagicMock(return_value=notify_phone.Result(True, msg_id="42")),
+        ) as deliver:
+            ok = await bot._notify_user_buzz("buzz <@1>", kind="finished",
+                                             project="p", sid="s")
             self.assertTrue(ok)
-            dm.assert_awaited_once()
-            ucs.assert_not_awaited()
+            deliver.assert_called_once()
 
-    async def test_falls_back_to_ucs_when_dm_closed(self):
-        from src import bot
+    async def test_failed_send_is_loud_never_a_fabricated_success(self):
+        from src import bot, notify_phone
 
-        with patch.object(bot, "_dm_authorized_user", AsyncMock(return_value=False)) as dm, \
-             patch.object(bot, "post_to_text", AsyncMock()) as ucs:
-            ok = await bot._notify_user_buzz("buzz <@1>")
-            self.assertTrue(ok)
-            dm.assert_awaited_once()
-            ucs.assert_awaited_once()
-
-    async def test_reports_failure_when_both_paths_fail(self):
-        from src import bot
-
-        with patch.object(bot, "_dm_authorized_user", AsyncMock(return_value=False)), \
-             patch.object(bot, "post_to_text", AsyncMock(side_effect=RuntimeError("no channel"))):
+        # notify_phone has already alarmed internally; the buzz must report False,
+        # never the old "delivered via #ucs" lie.
+        with patch.object(
+            notify_phone, "deliver",
+            MagicMock(return_value=notify_phone.Result(False, error="DMs disabled")),
+        ):
             ok = await bot._notify_user_buzz("buzz <@1>")
             self.assertFalse(ok)
 
+    async def test_no_silent_ucs_fallback_path_remains(self):
+        # The old fallback called post_to_text on DM failure and logged
+        # "delivered". That path must be gone: a failed deliver never touches it.
+        from src import bot, notify_phone
 
-class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
-    """Off-voice (`gemini` not connected), every STOP buzzes with a summary;
-    routine progress/started stay on the silent audit stream."""
+        with patch.object(
+            notify_phone, "deliver",
+            MagicMock(return_value=notify_phone.Result(False, error="x")),
+        ), patch.object(bot, "post_to_text", AsyncMock()) as ucs:
+            await bot._notify_user_buzz("buzz <@1>")
+            ucs.assert_not_awaited()
 
-    def _patches(self, *, buzz=True):
+
+class TestNarratorIdeSuppressedSdkBuzzes(unittest.IsolatedAsyncioTestCase):
+    """Off-voice: IDE stops do NOT phone-buzz (the hook owns them) but still
+    audit; SDK/Claude-Code stops DO phone-buzz; progress/started never buzz."""
+
+    def _patches(self):
         from src import bot
 
-        self._buzz = AsyncMock(return_value=buzz)
+        self._buzz = AsyncMock(return_value=True)
+        self._alerts = AsyncMock()
         return [
             patch.object(bot, "gemini", None),  # off voice
             patch.object(bot, "conversation", MagicMock()),
-            patch.object(bot, "post_to_alerts", AsyncMock()),
+            patch.object(bot, "post_to_alerts", self._alerts),
             patch.object(bot, "_notify_user_buzz", self._buzz),
         ]
 
-    async def _run(self, evt, *, buzz=True):
+    async def _run(self, evt):
         from src import bot
 
-        ctxs = self._patches(buzz=buzz)
+        ctxs = self._patches()
         for c in ctxs:
             c.start()
         try:
@@ -108,33 +121,29 @@ class TestNarratorOffVoiceDelivery(unittest.IsolatedAsyncioTestCase):
             for c in reversed(ctxs):
                 c.stop()
 
-    async def test_question_buzzes(self):
-        await self._run(_make_event("question", "high", question="Which approach?"))
-        self._buzz.assert_awaited_once()
+    async def test_ide_finished_does_not_phone_buzz_but_audits(self):
+        await self._run(_make_event("finished", "high", source="ide"))
+        self._buzz.assert_not_awaited()
+        self._alerts.assert_awaited()  # the glanceable #ucs trail stays
 
-    async def test_finished_buzzes(self):
-        await self._run(_make_event("finished", "high"))
-        self._buzz.assert_awaited_once()
-
-    async def test_finished_low_severity_buzzes(self):
-        # A status-less finish still notifies (a stop is a stop).
-        await self._run(_make_event("finished", "low"))
-        self._buzz.assert_awaited_once()
-
-    async def test_errored_buzzes(self):
-        await self._run(_make_event("errored", "high"))
-        self._buzz.assert_awaited_once()
-
-    async def test_stalled_buzzes(self):
-        await self._run(_make_event("stalled", "high"))
-        self._buzz.assert_awaited_once()
-
-    async def test_progress_does_not_buzz(self):
-        await self._run(_make_event("progress", "low"))
+    async def test_ide_question_does_not_phone_buzz(self):
+        await self._run(_make_event("question", "high", source="ide", question="Which?"))
         self._buzz.assert_not_awaited()
 
-    async def test_started_does_not_buzz(self):
-        await self._run(_make_event("started", "low"))
+    async def test_sdk_finished_phone_buzzes(self):
+        await self._run(_make_event("finished", "high", source="sdk"))
+        self._buzz.assert_awaited_once()
+
+    async def test_claude_code_errored_phone_buzzes(self):
+        await self._run(_make_event("errored", "high", source="claude_code"))
+        self._buzz.assert_awaited_once()
+
+    async def test_progress_never_buzzes(self):
+        await self._run(_make_event("progress", "low", source="sdk"))
+        self._buzz.assert_not_awaited()
+
+    async def test_started_never_buzzes(self):
+        await self._run(_make_event("started", "low", source="sdk"))
         self._buzz.assert_not_awaited()
 
 
@@ -145,7 +154,8 @@ class TestDmCarriesSummary(unittest.TestCase):
     def test_finished_dm_includes_last_assistant_text(self):
         from src import bot
 
-        evt = _make_event("finished", "high", reason="Cursor task completed in proj.")
+        evt = _make_event("finished", "high", source="sdk",
+                          reason="Cursor task completed in proj.")
         evt.agent.last_assistant_text = "Refactored the auth module and all 40 tests pass."
         dm = bot._format_registry_dm(evt)
         self.assertIn("Cursor task completed", dm)
@@ -154,7 +164,8 @@ class TestDmCarriesSummary(unittest.TestCase):
     def test_question_dm_includes_the_question(self):
         from src import bot
 
-        evt = _make_event("question", "high", reason="proj is asking", question="Ship v1 or wait?")
+        evt = _make_event("question", "high", source="sdk",
+                          reason="proj is asking", question="Ship v1 or wait?")
         dm = bot._format_registry_dm(evt)
         self.assertIn("Ship v1 or wait?", dm)
 
@@ -191,15 +202,6 @@ class TestNoPhantomAgentFraming(unittest.TestCase):
                             severity="high", reason="x is asking")
         dm = bot._format_registry_dm(evt)
         self.assertIn("relay", dm.lower())
-
-    def test_ide_inject_context_forbids_fake_delivery(self):
-        from src import bot
-        from src.cursor_registry import RegistryEvent
-
-        evt = RegistryEvent(kind="question", agent=self._agent("ide"),
-                            severity="high", reason="x is asking")
-        ctx = bot._format_registry_context_for_inject(evt)
-        self.assertIn("no background agent", ctx.lower())
 
 
 if __name__ == "__main__":

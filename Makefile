@@ -5,7 +5,7 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter fulfillment-golden fulfillment-calibrate fulfillment-pressure fulfillment-reverify fulfillment-report
+.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter fulfillment-golden fulfillment-calibrate fulfillment-pressure fulfillment-reverify fulfillment-report notify-heartbeat install-notify-heartbeat uninstall-notify-heartbeat
 
 help:
 	@echo "Targets:"
@@ -63,6 +63,21 @@ fulfillment-reverify:
 # A live chief-of-staff scorecard over the running bot's real records.
 fulfillment-report:
 	@$(PYTHON) -m src.fulfillment report --data-dir data --hours 72
+
+# The notify path's self-test + its launchd schedule. `notify-heartbeat` runs
+# the REAL delivery once (proof to your phone, loud alarm if the path is down);
+# install/uninstall manage the daily launchd job (runs at load + 09:00).
+notify-heartbeat:
+	@$(PYTHON) src/notify_phone.py heartbeat
+
+install-notify-heartbeat:
+	@launchctl bootout gui/$$(id -u)/com.you.aria-notify-heartbeat 2>/dev/null || true
+	@launchctl bootstrap gui/$$(id -u) ops/com.you.aria-notify-heartbeat.plist
+	@echo "notify heartbeat installed (runs at load + daily 09:00)"
+
+uninstall-notify-heartbeat:
+	@launchctl bootout gui/$$(id -u)/com.you.aria-notify-heartbeat 2>/dev/null || true
+	@echo "notify heartbeat removed"
 
 preflight:
 	@$(PYTHON) -m src.preflight

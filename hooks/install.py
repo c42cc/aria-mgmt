@@ -26,18 +26,26 @@ import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FORWARDER = os.path.join(REPO_ROOT, "hooks", "cursor-event.py")
+NOTIFY_FINISH = os.path.join(REPO_ROOT, "hooks", "notify-finish.py")
 HOOKS_FILE = os.path.expanduser("~/.cursor/hooks.json")
 
 ARIA_TAG = "aria-cursor-event"
 
 
 def aria_entry(hook_type: str, *, matcher: str | None = None) -> dict:
-    """One hook entry; tagged so we can find/remove it on re-install."""
+    """One forwarder hook entry; tagged so we can find/remove it on re-install."""
     cmd = f"{FORWARDER} {hook_type}"
     entry: dict = {"command": cmd, "_tag": ARIA_TAG}
     if matcher:
         entry["matcher"] = matcher
     return entry
+
+
+def notify_entry(hook_type: str) -> dict:
+    """The deterministic notify-on-stop entry: Cursor's `stop` -> a verified
+    phone DM (`notify-finish.py` -> `notify_phone.py`). Independent of the bot;
+    same tag so it is managed/removable alongside the forwarder."""
+    return {"command": f"{NOTIFY_FINISH} {hook_type}", "_tag": ARIA_TAG}
 
 
 def desired_entries() -> dict[str, list[dict]]:
@@ -53,7 +61,10 @@ def desired_entries() -> dict[str, list[dict]]:
       - afterAgentResponse:  light narration of every assistant text turn
     """
     return {
-        "stop": [aria_entry("stop")],
+        # `stop` carries TWO Aria entries: the registry forwarder (voice / query
+        # state) AND the deterministic phone notifier — the latter owns the buzz
+        # so a dead bot/tailer can never drop it.
+        "stop": [aria_entry("stop"), notify_entry("stop")],
         "subagentStop": [aria_entry("subagentStop")],
         "sessionEnd": [aria_entry("sessionEnd")],
         "postToolUse": [
@@ -135,10 +146,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Print the result, do not write")
     args = ap.parse_args()
 
-    if not os.path.exists(FORWARDER):
-        raise SystemExit(f"forwarder not found at {FORWARDER}")
-    if not os.access(FORWARDER, os.X_OK):
-        raise SystemExit(f"forwarder is not executable: chmod +x {FORWARDER}")
+    for path in (FORWARDER, NOTIFY_FINISH):
+        if not os.path.exists(path):
+            raise SystemExit(f"hook script not found at {path}")
+        if not os.access(path, os.X_OK):
+            raise SystemExit(f"hook script is not executable: chmod +x {path}")
 
     hooks = load_hooks()
     if args.uninstall:

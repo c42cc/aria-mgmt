@@ -1805,47 +1805,6 @@ async def _cursor_event_consumer(
 # ---------------------------------------------------------------------------
 
 
-async def _dm_authorized_user(content: str) -> bool:
-    """Send a DM to the first authorized user. Returns True on success,
-    False on any delivery failure (Forbidden, HTTPException, missing user).
-
-    Failures are logged but NOT individually posted to #ucs-alerts. The
-    caller owns the "escalate to a loud alerts post" decision so we get
-    exactly one Discord message per event instead of the double-post
-    pattern (silent audit + loud "Pager DM blocked" wall-of-text) that
-    flooded #ucs-alerts with two records per Cursor hook.
-    """
-    if not config.authorized_user_ids:
-        log.warning("No authorized_user_ids configured — cannot DM")
-        return False
-    user_id = int(config.authorized_user_ids[0])
-    try:
-        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-    except discord.HTTPException:
-        log.exception("Could not fetch authorized user for DM")
-        return False
-
-    try:
-        dm = user.dm_channel or await user.create_dm()
-    except discord.HTTPException:
-        log.exception("create_dm failed for %s", user_id)
-        return False
-
-    for chunk in _split_at_paragraphs(content):
-        try:
-            await dm.send(chunk)
-        except discord.Forbidden:
-            log.warning(
-                "User %s has DMs disabled — caller will escalate to #ucs-alerts if severity warrants",
-                user_id,
-            )
-            return False
-        except discord.HTTPException:
-            log.exception("DM send failed")
-            return False
-    return True
-
-
 def _cached_thread_label(sid: str) -> str:
     """Distilled human label for a thread sid from the summaries cache, or ''.
 
@@ -2010,45 +1969,34 @@ def _format_registry_dm(evt: RegistryEvent) -> str:
     return "\n".join(lines)
 
 
-async def _notify_user_buzz(content: str) -> bool:
-    """Deliver a phone-buzzing notification to the authorized user.
+async def _notify_user_buzz(
+    content: str, *, kind: str = "finished", project: str = "", sid: str = ""
+) -> bool:
+    """Deliver a phone-buzzing notification through the ONE delivery home.
 
-    The off-voice delivery primitive for cursor-watch events. `#ucs-alerts`
-    is a forced-silent stream (it must never buzz — Corbin's rule), so a real
-    notification has to land somewhere that actually pings. Order:
+    Every off-voice buzz (SDK / Claude-Code finishes, Task events) routes
+    through `notify_phone.deliver` — the exact verified primitive the standalone
+    Cursor stop hook uses, so the honesty contract has one home and cannot
+    drift. "Delivered" means Discord accepted the DM (a real message id).
 
-      1. DM the authorized user — the most direct "message me". Buzzes the
-         phone when Corbin's DMs are open.
-      2. Fall back to a NON-silent @mention post in the main `#ucs` channel —
-         the same proven buzz surface `_post_proposal_card` uses — when DMs
-         are closed/unavailable.
-
-    Returns True if either path delivered, False if both failed. `content`
-    is expected to already carry the `<@id>` mention prefix (e.g. from
-    `_format_registry_dm`) so the `#ucs` fallback still pings even though it
-    is a channel, not a DM.
-
-    This exists because the prior off-voice path silently dropped any
-    finished/errored/asking event the `propose_next` model call couldn't turn
-    into a suggestion — the bug behind "a thread finished and Aria never
-    messaged me."
+    A failure is LOUD — `notify_phone` raises a `[NOTIFY PATH DOWN]` alarm and
+    a `failed` ledger line — never the silent `#ucs` fallback that logged a
+    fabricated "delivered" while Corbin's DMs were dead all day (the v1 lie
+    this replaces). The sync urllib send runs in an executor so the bot's event
+    loop never blocks.
     """
-    try:
-        if await _dm_authorized_user(content):
-            log.info("cursor-watch: notification delivered via DM")
-            return True
-    except Exception:
-        log.exception("cursor-watch: DM attempt raised — falling back to #ucs")
+    from . import notify_phone
 
-    try:
-        await post_to_text(content)
-        log.info("cursor-watch: notification delivered via #ucs @mention")
-        return True
-    except Exception:
-        log.exception(
-            "cursor-watch: #ucs notification post failed — event NOT delivered"
-        )
-        return False
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(
+        None,
+        lambda: notify_phone.deliver(content, kind=kind, project=project, sid=sid),
+    )
+    if res.delivered:
+        log.info("cursor-watch: notification delivered via DM (msg %s)", res.msg_id)
+    else:
+        log.error("cursor-watch: notification NOT delivered — %s", res.error)
+    return res.delivered
 
 
 # The ONE attention policy: a thread buzzes the user exactly ONCE when it SETTLES
@@ -2217,11 +2165,20 @@ async def _narrate_registry_event(evt: RegistryEvent) -> None:
     if evt.kind not in _BUZZ_KINDS:
         return
 
-    # No dedup cooldown needed: the lifecycle watcher emits exactly ONE terminal
-    # event per halt (guarded by the durable per-sid transcript-offset watermark),
-    # so a buzz here is already de-duplicated at the source — a new buzz means a
-    # genuinely new hand-back, never the same stop re-reported.
-    await _notify_user_buzz(_format_registry_dm(evt))
+    # The IDE phone buzz is owned by the deterministic Cursor `stop` hook
+    # (hooks/notify-finish.py -> notify_phone): the hook fires the instant the
+    # turn hands back, so a tailer miss can never drop the phone notification
+    # and we never double-buzz. This narrator keeps the silent #ucs audit (above)
+    # and the spoken voice heads-up (when on voice), and still owns the phone
+    # buzz for SDK / Claude-Code finishes — no IDE hook fires for those.
+    if agent.source == "ide":
+        return
+    await _notify_user_buzz(
+        _format_registry_dm(evt),
+        kind=evt.kind,
+        project=agent.project_label,
+        sid=agent.current_sid or "",
+    )
 
 
 def _undelivered_agents() -> list[CursorAgent]:
