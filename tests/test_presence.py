@@ -70,6 +70,74 @@ class TestParseDuration(unittest.TestCase):
         self.assertIsNone(p.parse_duration(""))
 
 
+class TestMatchGoAway(unittest.TestCase):
+    """The DETERMINISTIC trigger: 'go away' is recognized from the transcript,
+    not a model tool-call (which never fired — she chatted back instead)."""
+
+    def test_exact_phrase_with_duration(self):
+        from src import presence as p
+
+        self.assertEqual(p.match_go_away("area go away for 2 hours"), 7200.0)
+        self.assertEqual(p.match_go_away("go away for 30 minutes"), 1800.0)
+        self.assertEqual(p.match_go_away("go to sleep for an hour"), 3600.0)
+
+    def test_bare_go_away_defaults(self):
+        from src import presence as p
+
+        self.assertEqual(p.match_go_away("go away"), p.DEFAULT_AWAY_SECONDS)
+        self.assertEqual(p.match_go_away("leave me alone"), p.DEFAULT_AWAY_SECONDS)
+        self.assertEqual(p.match_go_away("be quiet"), p.DEFAULT_AWAY_SECONDS)
+
+    def test_no_false_trigger(self):
+        from src import presence as p
+
+        self.assertIsNone(p.match_go_away("how can I help you today"))
+        self.assertIsNone(p.match_go_away("don't go away"))
+        self.assertIsNone(p.match_go_away("okay I'm here when you want"))
+        self.assertIsNone(p.match_go_away(""))
+
+
+class TestStopPhraseSilencesImmediately(unittest.IsolatedAsyncioTestCase):
+    """When 'go away' is heard, the session silences her output THIS INSTANT
+    (drops queued audio) and fires the stop callback — no audio, no tool-call."""
+
+    async def test_go_away_silences_and_fires_silently(self):
+        import asyncio
+        from src.gemini_session import GeminiSession
+
+        fired: list[float] = []
+
+        async def cb(secs: float) -> None:
+            fired.append(secs)
+
+        s = GeminiSession(stop_phrase_callback=cb)
+        s._audio_out_queue.put_nowait(b"her-pending-audio")  # she'd started talking
+        s._user_turn_acc = "aria go away for 2 hours"
+        await s._maybe_stop_phrase()
+        await asyncio.sleep(0.02)  # let the callback task run
+
+        self.assertTrue(s._silenced)                 # output gated
+        self.assertTrue(s._audio_out_queue.empty())  # pending audio dropped -> silent
+        self.assertEqual(fired, [7200.0])            # stop fired with the duration
+
+    async def test_normal_speech_never_silences(self):
+        import asyncio
+        from src.gemini_session import GeminiSession
+
+        fired: list[float] = []
+
+        async def cb(secs: float) -> None:
+            fired.append(secs)
+
+        s = GeminiSession(stop_phrase_callback=cb)
+        s._user_turn_acc = "what's on my calendar today"
+        await s._maybe_stop_phrase()
+        await asyncio.sleep(0.02)
+
+        self.assertFalse(s._silenced)
+        self.assertEqual(fired, [])
+
+
 class TestVoiceGates(unittest.IsolatedAsyncioTestCase):
     """While away, the wake word opens no session and auto-join refuses — the
     root fix for the empty-room 3 AM self-talk."""

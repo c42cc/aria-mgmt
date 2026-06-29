@@ -13,6 +13,7 @@ from typing import Any, Callable, Coroutine
 from google import genai
 from google.genai import types
 
+from . import presence
 from .config import config
 from .prompts import load_template
 
@@ -20,27 +21,6 @@ log = logging.getLogger(__name__)
 
 
 TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="go_away",
-        description=(
-            "Go quiet and leave for a while when Corbin tells you to — e.g. 'go "
-            "away for 30 minutes', 'leave me alone for an hour', 'be quiet for 9 "
-            "hours', 'go away'. You stop listening (wake word off) and leave voice, "
-            "then auto-resume after the time. Use ONLY when he explicitly asks you "
-            "to go away / be quiet for a period. Default to 30 minutes if he didn't "
-            "say how long."
-        ),
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "minutes": types.Schema(
-                    type="NUMBER",
-                    description="How long to stay away, in minutes (30 = 30 minutes, 540 = 9 hours).",
-                ),
-            },
-            required=["minutes"],
-        ),
-    ),
     types.FunctionDeclaration(
         name="plan_with_claude",
         description="Send a planning request to Claude Opus 4.6 for analysis, planning, architecture, or debugging strategy.",
@@ -808,6 +788,7 @@ class GeminiSession:
         tool_handler: Callable[..., Coroutine] | None = None,
         transcript_callback: Callable[[str, str], Coroutine] | None = None,
         orphan_callback: Callable[[str, str, str], Coroutine] | None = None,
+        stop_phrase_callback: Callable[[float], Coroutine] | None = None,
     ):
         """
         transcript_callback(role, text) is invoked once per *completed* turn
@@ -824,6 +805,12 @@ class GeminiSession:
         self.tool_handler = tool_handler
         self.transcript_callback = transcript_callback
         self.orphan_callback = orphan_callback
+        # Deterministic "go away" — fired the instant the input transcript matches
+        # a stop phrase, NOT via a model tool-call (the Live API doesn't reliably
+        # emit those). On fire we silence output immediately so there is no audio.
+        self.stop_phrase_callback = stop_phrase_callback
+        self._silenced = False
+        self._stop_fired_this_turn = False
         self._client: genai.Client | None = None
         self._session: Any = None
         self._session_ctx: Any = None
@@ -918,6 +905,8 @@ class GeminiSession:
         )
         self._session = await self._session_ctx.__aenter__()
         self._connected = True
+        self._silenced = False
+        self._stop_fired_this_turn = False
 
     async def send_audio(self, pcm_bytes: bytes) -> None:
         """Send PCM audio chunk (16kHz mono int16) to Gemini.
@@ -1047,6 +1036,34 @@ class GeminiSession:
         finally:
             self._pending_confirmations.pop(action_id, None)
 
+    async def _maybe_stop_phrase(self) -> None:
+        """Deterministic "go away": if the accumulated USER transcript is a stop
+        command, silence her output THIS INSTANT and fire the stop callback. No
+        model tool-call (those are unreliable), no spoken acknowledgement — she
+        just stops. The bot's callback sets the away state and tears the session
+        down; silencing here means nothing she may have already started plays."""
+        if self._stop_fired_this_turn or not self.stop_phrase_callback:
+            return
+        seconds = presence.match_go_away(self._user_turn_acc)
+        if seconds is None:
+            return
+        self._stop_fired_this_turn = True
+        self._silenced = True
+        # Drop anything she already queued so NO audio plays.
+        while not self._audio_out_queue.empty():
+            try:
+                self._audio_out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        log.info(
+            "Stop phrase detected (...%r) — silencing, going away %.0fs",
+            self._user_turn_acc[-50:], seconds,
+        )
+        try:
+            asyncio.create_task(self.stop_phrase_callback(seconds))
+        except Exception:
+            log.exception("stop_phrase_callback scheduling failed")
+
     async def _receive_loop(self) -> None:
         """Main receive loop: process audio, transcriptions, and tool calls from Gemini."""
         backoff = 1.0
@@ -1095,7 +1112,7 @@ class GeminiSession:
                             # until turn_complete fires below.
                             self._idle_event.clear()
                             for part in sc.model_turn.parts:
-                                if part.inline_data and part.inline_data.data:
+                                if part.inline_data and part.inline_data.data and not self._silenced:
                                     # AUDIO TELEMETRY (stage A): prove Gemini is
                                     # actually emitting voice bytes. Silence here
                                     # means the model produced no audio (preview
@@ -1129,6 +1146,7 @@ class GeminiSession:
                                 TranscriptEntry("user", sc.input_transcription.text, time.time())
                             )
                             self._user_turn_acc += sc.input_transcription.text
+                            await self._maybe_stop_phrase()
 
                         if sc.output_transcription and sc.output_transcription.text:
                             self._transcript_buffer.append(
@@ -1139,6 +1157,7 @@ class GeminiSession:
                         if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
                             await self._flush_turn_accumulators()
                             self._idle_event.set()
+                            self._stop_fired_this_turn = False
 
                     elif msg.tool_call:
                         seen_in_turn: set[str] = set()

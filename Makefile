@@ -5,7 +5,7 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 
-.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter fulfillment-golden fulfillment-calibrate fulfillment-pressure fulfillment-reverify fulfillment-report notify-heartbeat install-notify-heartbeat uninstall-notify-heartbeat
+.PHONY: help run preflight bootstrap kill restart deps test anchor-test e2e-golden clean fmt audit-idempotency audit-dedup gate meter fulfillment-golden fulfillment-calibrate fulfillment-pressure fulfillment-reverify fulfillment-report notify-heartbeat install-notify-heartbeat uninstall-notify-heartbeat voice-log voice-last
 
 help:
 	@echo "Targets:"
@@ -69,6 +69,12 @@ fulfillment-report:
 # install/uninstall manage the daily launchd job (runs at load + 09:00).
 notify-heartbeat:
 	@$(PYTHON) src/notify_phone.py heartbeat
+
+# Source-of-truth voice log: when Aria actually fired (spoke), woke, went away.
+voice-log:
+	@$(PYTHON) -m src.voice_activity tail 40
+voice-last:
+	@$(PYTHON) -m src.voice_activity last
 
 install-notify-heartbeat:
 	@launchctl bootout gui/$$(id -u)/com.you.aria-notify-heartbeat 2>/dev/null || true

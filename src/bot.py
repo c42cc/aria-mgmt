@@ -29,6 +29,7 @@ from .gemini_session import GeminiSession
 from .local_audio import SpeakerOutput
 from .memory import init_memory, remember, recall
 from . import presence
+from . import voice_activity
 
 logging.basicConfig(
     level=logging.INFO,
@@ -403,6 +404,7 @@ async def _on_wake_word() -> None:
         return
 
     log.info("Wake word detected — opening local Gemini session")
+    voice_activity.log("wake", source="local")
     _local_session_active = True
 
     if _wake_listener:
@@ -450,6 +452,8 @@ async def _local_silence_watchdog() -> None:
 async def _close_local_session() -> None:
     global _local_session_active, _local_speaker, _local_silence_task
 
+    if _local_session_active:
+        voice_activity.log("session", state="local_close")
     _local_session_active = False
 
     if _wake_listener:
@@ -905,6 +909,10 @@ async def _on_voice_transcript(role: str, text: str) -> None:
     if not text:
         return
 
+    # Source-of-truth voice log: "spoke" is the record of Aria actually firing.
+    voice_activity.log("spoke" if role in ("aria", "assistant") else "heard",
+                       text=text[:300])
+
     channel_name = "voice"
     if voice_controller.channel_id:
         ch = bot.get_channel(int(voice_controller.channel_id))
@@ -1079,18 +1087,6 @@ async def _handle_tool_call(name: str, args: dict) -> str:
     that already send the result to message.channel do not trigger a
     duplicate post.
     """
-    if name == "go_away":
-        minutes = float(args.get("minutes") or 30)
-
-        async def _ack_then_leave() -> None:
-            await asyncio.sleep(2.5)  # let the spoken acknowledgement play first
-            await _go_quiet(minutes * 60.0)
-
-        asyncio.create_task(_ack_then_leave(), name="go_away_leave")
-        human = f"{minutes / 60:.0f} hours" if minutes >= 90 else f"{int(minutes)} minutes"
-        return (f"Okay \u2014 going quiet for about {human}. I'll stop listening and "
-                f"come back then; say '!here' if you want me sooner.")
-
     from .tools import handle_tool_call
     result = await handle_tool_call(name, args)
     if name in _VOICE_VISIBLE_TOOLS and result:
@@ -2397,6 +2393,7 @@ async def on_ready():
             tool_handler=_handle_tool_call,
             transcript_callback=_on_voice_transcript,
             orphan_callback=_on_orphan_tool_result,
+            stop_phrase_callback=_on_stop_phrase,
         )
 
         from .tools import set_transcript_provider
@@ -2638,12 +2635,19 @@ async def leave(ctx: commands.Context):
     await ctx.send("Left voice channel.")
 
 
-async def _go_quiet(seconds: float) -> str:
-    """Enter the away state for `seconds` and leave any live voice session. The
-    one place 'go away' takes effect (the !away command and the go_away voice
-    tool both call it), so the behavior can't diverge."""
+async def _go_quiet(seconds: float, *, how: str = "text") -> str:
+    """Enter the away state for `seconds` and SILENTLY tear down every live voice
+    surface — local mic/speaker session AND Discord voice. The one place 'go
+    away' takes effect (the spoken stop-phrase and the !away command both call
+    it), so the behavior can't diverge. No audio is produced."""
     presence.set_away(seconds)
+    voice_activity.log("go_away", seconds=round(seconds), how=how, until=presence.describe())
     _cancel_audio_tasks()
+    if _local_session_active:
+        try:
+            await _close_local_session()
+        except Exception:
+            log.exception("go-away: error closing local session")
     if gemini and gemini.connected:
         try:
             await gemini.close()
@@ -2654,6 +2658,14 @@ async def _go_quiet(seconds: float) -> str:
     except Exception:
         log.exception("go-away: error leaving voice")
     return presence.describe()
+
+
+async def _on_stop_phrase(seconds: float) -> None:
+    """Wired into the Gemini session: fired the instant the user's transcript is
+    a 'go away' command. Deterministic, silent, no confirmation — she just stops
+    for the duration (the fix for 'I said go away and she chatted back')."""
+    log.info("Voice stop-phrase — going quiet %.0fs (silent, no reply)", seconds)
+    await _go_quiet(seconds, how="voice")
 
 
 @bot.command(name="away")
@@ -2678,6 +2690,7 @@ async def _cmd_here(ctx: commands.Context) -> None:
         await ctx.send("Not authorized.")
         return
     presence.clear_away()
+    voice_activity.log("came_back", how="text")
     await ctx.send("Back \u2014 listening again.")
 
 

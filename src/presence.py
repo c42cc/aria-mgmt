@@ -88,3 +88,39 @@ def parse_duration(text: str) -> float | None:
     if unit.startswith("h"):
         return val * 3600.0
     return val * 60.0
+
+
+# Spoken "go away" — detected DETERMINISTICALLY from the transcript, never from a
+# model tool-call (the Live API does not reliably emit function calls, which is
+# exactly why "go away for 2 hours" was ignored and she chatted back instead).
+_GO_AWAY = re.compile(
+    r"\b(go away|go to sleep|go to bed|leave me alone|be quiet|go quiet|"
+    r"shut up|stop talking|quiet down|that'?s all for now)\b",
+    re.IGNORECASE,
+)
+_NOT_GO_AWAY = re.compile(r"\b(do ?n'?t|do not|never)\s+go away\b", re.IGNORECASE)
+_FOR_DUR = re.compile(
+    r"\bfor\s+(an?|\d+(?:\.\d+)?)\s*"
+    r"(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
+    re.IGNORECASE,
+)
+DEFAULT_AWAY_SECONDS = 30 * 60.0
+
+
+def match_go_away(text: str) -> float | None:
+    """If `text` (a speech transcript) is a 'go away' command, return how long to
+    stay away in seconds (the spoken duration, else DEFAULT_AWAY_SECONDS). Else
+    None. The deterministic trigger for the voice mute."""
+    if not text or _NOT_GO_AWAY.search(text) or not _GO_AWAY.search(text):
+        return None
+    m = _FOR_DUR.search(text)
+    if not m:
+        return DEFAULT_AWAY_SECONDS
+    qty = m.group(1).lower()
+    val = 1.0 if qty in ("a", "an") else float(qty)
+    unit = m.group(2).lower()
+    if unit.startswith("s"):
+        return val
+    if unit.startswith("h"):
+        return val * 3600.0
+    return val * 60.0
