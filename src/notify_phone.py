@@ -10,15 +10,27 @@ contract cannot drift into two homes (the v1 defect: a hook that fabricated
 
 Contract — non-negotiable, enforced here:
 
-  * "delivered" means Discord ACCEPTED the message for your DM (HTTP 2xx + a
-    message id). Nothing else may write a `delivered` ledger line.
-  * A failure is LOUD, never silent and never a lie: a `failed` ledger line,
-    a `[NOTIFY PATH DOWN]` alarm in the text channel, and a local macOS
-    notification (a rung that does NOT depend on Discord, so a total Discord
-    outage still pokes you). None of these claim the original notification
-    arrived.
+  * "delivered" means Discord ACCEPTED the message (HTTP 2xx + a message id),
+    and the ledger line names WHICH leg carried it (`via: dm` or
+    `via: channel_mention`). Nothing else may write a `delivered` line, and a
+    channel delivery NEVER masquerades as a DM.
+  * A STANDING owner-side DM block (Discord 50007 "user blocked the app" /
+    50278 "no mutual guilds" — in practice the owner's privacy settings
+    refusing bot DMs) is not an outage to nag about per-stop: the SAME content
+    is delivered as an @mention in the text channel (a real push, a real
+    message id), the block is alarmed ONCE A DAY with the owner's one-tap fix,
+    and the daily heartbeat keeps naming it until it heals. Forensic
+    2026-07-02 01:49: the DM leg had never delivered once since birth
+    (403/50278 on every stop), so the 30-minute alarm throttle had turned a
+    dead leg into an all-night `NOTIFY PATH DOWN` @mention nag — the alarms
+    were the only thing reaching the phone, while every real notification
+    was dropped.
+  * Any other failure is LOUD, never silent and never a lie: a `failed`
+    ledger line, a `[NOTIFY PATH DOWN]` alarm in the text channel, and a
+    local macOS notification (a rung that does NOT depend on Discord). None
+    of these claim the original notification arrived.
   * No retry/backoff loop, no silent fallback. A failed send stays visible in
-    the ledger; the root fix (e.g. "enable DMs") is surfaced, not papered over.
+    the ledger; the root fix is surfaced, not papered over.
   * It is never "Discord's fault." A timeout, a 5xx, a thundering herd — all
     read as OUR notify path failing, surfaced for us to fix.
 
@@ -44,6 +56,27 @@ HTTP_TIMEOUT = 8.0
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_DIR = os.path.expanduser("~/.cursor/aria-notify")
 LEDGER = os.path.expanduser("~/Library/Logs/voicebot/notify.log")
+
+# Discord's standing owner-side DM refusals: 50007 (user blocked the app),
+# 50278 ("no mutual guilds" — returned even WITH a verified mutual guild when
+# the owner's privacy settings refuse bot DMs; verified live 2026-07-02).
+# These are not transient: they hold until the OWNER flips a Discord setting,
+# so the content reroutes to the channel-mention leg and the block is alarmed
+# once a day, not per stop.
+STANDING_DM_BLOCKS = frozenset({50007, 50278})
+
+DM_BLOCK_FIX = (
+    "Discord is refusing bot DMs to your account (a standing privacy block, "
+    "not an outage). One-tap fix, either works: (a) Discord -> User Settings "
+    "-> Privacy & Safety -> allow DMs / message requests from server members, "
+    "or (b) open @Aria's profile in the c42 server and send it one direct "
+    "message — that whitelists the DM thread. Until then your notifications "
+    "arrive as @mentions in the text channel."
+)
+
+# One alarm per cause per DAY: the scheduled 9am heartbeat is the prover that
+# re-surfaces a still-broken path — a 1:49 AM thread stop is not.
+ALARM_WINDOW_SEC = 86400.0
 
 
 # --------------------------------------------------------------------------- #
@@ -118,12 +151,15 @@ def _now_iso() -> str:
 # Discord REST (stdlib)
 # --------------------------------------------------------------------------- #
 class NotifyError(Exception):
-    """A typed, loud delivery failure. Carries the actionable hint."""
+    """A typed, loud delivery failure. Carries the actionable hint and the
+    Discord JSON error `code` (e.g. 50278) when the body carried one."""
 
-    def __init__(self, message: str, *, status: int | None = None, hint: str = ""):
+    def __init__(self, message: str, *, status: int | None = None, hint: str = "",
+                 code: int | None = None):
         super().__init__(message)
         self.status = status
         self.hint = hint
+        self.code = code
 
 
 def _post(token: str, path: str, body: dict) -> dict:
@@ -147,13 +183,14 @@ def _post(token: str, path: str, body: dict) -> dict:
             detail = exc.read().decode("utf-8")
         except Exception:
             detail = "<no body>"
+        code: int | None = None
+        try:
+            code = int(json.loads(detail).get("code"))
+        except (ValueError, TypeError, AttributeError):
+            code = None
         hint = ""
-        if exc.code == 403:
-            hint = (
-                "Discord is refusing the DM (DMs disabled for this server). "
-                "Fix: Discord -> right-click the server -> Privacy Settings -> "
-                "'Allow direct messages from server members' ON."
-            )
+        if code in STANDING_DM_BLOCKS:
+            hint = DM_BLOCK_FIX
         elif exc.code in (401, 403):
             hint = "Bot token rejected — check DISCORD_APP_BOT_TOKEN in .env."
         # Never 'blame Discord': a 5xx is OUR notify path failing to deliver.
@@ -161,6 +198,7 @@ def _post(token: str, path: str, body: dict) -> dict:
             f"notify path failed at {path}: HTTP {exc.code} {detail[:200]}",
             status=exc.code,
             hint=hint,
+            code=code,
         ) from exc
     except urllib.error.URLError as exc:
         raise NotifyError(
@@ -231,7 +269,7 @@ def _local_notification(title: str, message: str) -> None:
         sys.stderr.write(f"[notify_phone] local notification rung failed: {exc}\n")
 
 
-def _alarm_throttled(why_key: str, window_sec: float = 1800.0) -> bool:
+def _alarm_throttled(why_key: str, window_sec: float = ALARM_WINDOW_SEC) -> bool:
     """True if an alarm with this key fired within the window — so the loud rungs
     don't FLOOD #ucs while a broken path stays broken. This throttles only the
     repeated NOTICE; the `failed`/`alarm` ledger lines of truth are still written."""
@@ -302,6 +340,63 @@ class Result:
     msg_id: str = ""
     error: str = ""
     hint: str = ""
+    via: str = "dm"  # which leg carried it: "dm" | "channel_mention"
+
+
+def _ensure_mention(content: str, env: dict) -> str:
+    """A channel post only pushes the phone when it @mentions the owner."""
+    if "<@" in content:
+        return content
+    mention = (env.get("AUTHORIZED_USER_IDS", "").split(",") or [""])[0].strip()
+    return f"<@{mention}> {content}" if mention else content
+
+
+def _deliver_channel_mention(
+    env: dict, token: str, content: str, *, kind: str, project: str, sid: str,
+    blocked_by: NotifyError,
+) -> Result:
+    """The channel-mention leg for a STANDING owner-side DM block: the SAME
+    content lands as an @mention in the text channel (a real push, a real
+    message id), ledgered honestly as via=channel_mention — never as a DM.
+    The block itself is alarmed once a day with the owner's one-tap fix."""
+    channel = env.get("DISCORD_TEXT_CHANNEL_ID", "")
+    if not channel:
+        _alarm(env, why=f"DM blocked ({blocked_by.code}) and DISCORD_TEXT_CHANNEL_ID is unset",
+               hint="set DISCORD_TEXT_CHANNEL_ID in .env", missed=content, sid=sid,
+               project=project, why_key="no-channel-leg")
+        ledger_append({"status": "failed", "sid": sid, "project": project,
+                       "error": str(blocked_by), "hint": blocked_by.hint})
+        return Result(False, error=str(blocked_by), hint=blocked_by.hint)
+    try:
+        msg_id = _send(token, channel, _ensure_mention(content, env))
+    except NotifyError as exc:
+        # Both legs down — a real outage, loud on the remaining rungs.
+        _alarm(env, why=f"DM blocked ({blocked_by.code}) AND channel send failed: {exc}",
+               hint=exc.hint or blocked_by.hint, missed=content, sid=sid,
+               project=project, why_key=str(exc.status or "channel-send"))
+        ledger_append({"status": "failed", "sid": sid, "project": project,
+                       "error": str(exc), "hint": exc.hint})
+        return Result(False, error=str(exc), hint=exc.hint)
+
+    ledger_append({"status": "delivered", "via": "channel_mention", "sid": sid,
+                   "project": project, "kind": kind, "msg_id": msg_id,
+                   "dm_blocked": blocked_by.code})
+    # The standing block stays visible — once a day, with the one-tap fix —
+    # via the alarm and the 9am heartbeat, never a per-stop nag.
+    if not _alarm_throttled(f"dm-block-{blocked_by.code}"):
+        mention = (env.get("AUTHORIZED_USER_IDS", "").split(",") or [""])[0].strip()
+        note = (
+            f"{'<@' + mention + '> ' if mention else ''}\u2139\ufe0f Your DM leg is "
+            f"blocked (Discord {blocked_by.code}), so notifications are landing "
+            f"here as @mentions instead.\n{DM_BLOCK_FIX}"
+        )
+        try:
+            _send(token, channel, note)
+        except NotifyError as exc:
+            sys.stderr.write(f"[notify_phone] dm-block notice post failed: {exc}\n")
+        ledger_append({"status": "alarm", "sid": sid, "project": project,
+                       "why": f"standing DM block {blocked_by.code}", "daily": True})
+    return Result(True, msg_id=msg_id, via="channel_mention")
 
 
 def deliver(
@@ -312,12 +407,14 @@ def deliver(
     sid: str = "",
     env: dict | None = None,
 ) -> Result:
-    """Deliver `content` to the authorized user's phone via a verified DM.
+    """Deliver `content` to the authorized user's phone: a verified DM, or —
+    under a STANDING owner-side DM block — a verified channel @mention.
 
-    Returns a Result. Writes write-ahead `pending` then `delivered`/`failed`.
-    On ANY failure raises no exception to the caller — it has already shouted
-    (alarm + ledger) — and returns delivered=False so the caller can act, but
-    it NEVER returns delivered=True without Discord's message id.
+    Returns a Result. Writes write-ahead `pending` then `delivered`/`failed`;
+    a `delivered` line always names its leg (`via`). On ANY failure raises no
+    exception to the caller — it has already shouted (alarm + ledger) — and
+    returns delivered=False so the caller can act, but it NEVER returns
+    delivered=True without Discord's message id.
     """
     env = env or load_env()
     token = env.get("DISCORD_APP_BOT_TOKEN", "")
@@ -337,24 +434,34 @@ def deliver(
         channel_id = _dm_channel_id(token, user_id)
         msg_id = _send(token, channel_id, content)
     except NotifyError as exc:
+        # A standing owner-side block holds until a Discord setting changes —
+        # reroute THIS content to the channel-mention leg (honest, verified).
+        if exc.code in STANDING_DM_BLOCKS:
+            return _deliver_channel_mention(
+                env, token, content, kind=kind, project=project, sid=sid, blocked_by=exc,
+            )
         # A cached DM channel can go stale (rare). Re-open ONCE — this is error
         # recovery on a transient handle, not a retry loop that hides failure.
         if exc.status in (403, 404) and _drop_dm_cache(user_id):
             try:
                 channel_id = _dm_channel_id(token, user_id)
                 msg_id = _send(token, channel_id, content)
-                ledger_append({"status": "delivered", "sid": sid, "project": project,
-                               "kind": kind, "msg_id": msg_id})
+                ledger_append({"status": "delivered", "via": "dm", "sid": sid,
+                               "project": project, "kind": kind, "msg_id": msg_id})
                 return Result(True, msg_id=msg_id)
             except NotifyError as exc2:
                 exc = exc2
+                if exc.code in STANDING_DM_BLOCKS:
+                    return _deliver_channel_mention(
+                        env, token, content, kind=kind, project=project, sid=sid, blocked_by=exc,
+                    )
         _alarm(env, why=str(exc), hint=exc.hint, missed=content, sid=sid,
                project=project, why_key=str(exc.status or "send"))
         ledger_append({"status": "failed", "sid": sid, "project": project,
                        "error": str(exc), "hint": exc.hint})
         return Result(False, error=str(exc), hint=exc.hint)
 
-    ledger_append({"status": "delivered", "sid": sid, "project": project,
+    ledger_append({"status": "delivered", "via": "dm", "sid": sid, "project": project,
                    "kind": kind, "msg_id": msg_id})
     return Result(True, msg_id=msg_id)
 

@@ -113,9 +113,18 @@ def _size(path: str) -> int:
         return 0
 
 
+# Cursor's injected post-task follow-up prompt (a machinery user turn, not the
+# human). Kept as a literal so the DELIVERY path never imports the bot's
+# modules; the one behavioral home is src/cursor_registry._MACHINERY_USER_PREFIX
+# — change both together.
+_MACHINERY_USER_PREFIX = "Briefly inform the user about the task result"
+
+
 def _enrich(transcript: str) -> tuple[str, str, str]:
     """Bounded tail read for (terminal status, your intent, agent's last words).
-    Best-effort: any miss degrades the message, never the delivery."""
+    Best-effort: any miss degrades the message, never the delivery. The intent
+    is the last HUMAN turn — Cursor's injected machinery turns never overwrite
+    it (they made every task DM read "You asked: Briefly inform the user…")."""
     status, intent, last_words = "", "", ""
     if not transcript:
         return status, intent, last_words
@@ -147,7 +156,9 @@ def _enrich(transcript: str) -> tuple[str, str, str]:
         elif role == "user":
             txt = _text_of(obj.get("message") or obj.get("content"))
             if txt:
-                intent = _clean_intent(txt)
+                cleaned = _clean_intent(txt)
+                if cleaned and not cleaned.startswith(_MACHINERY_USER_PREFIX):
+                    intent = cleaned
     return status, intent, last_words
 
 

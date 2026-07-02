@@ -34,6 +34,16 @@ def _user(text: str) -> dict:
     return {"role": "user", "message": {"content": [{"type": "text", "text": text}]}}
 
 
+def _machinery_followup() -> dict:
+    """Cursor's injected post-task follow-up — a user-ROLE turn that is not the
+    human (verbatim shape from the 2026-07-02 duplicate-buzz forensic)."""
+    return _user(
+        "<timestamp>Thursday, Jul 2, 2026, 1:15 AM (UTC-7)</timestamp>\n\n"
+        "<user_query>Briefly inform the user about the task result and perform "
+        "any follow-up actions (if needed).</user_query>"
+    )
+
+
 def _atext(text: str) -> dict:
     return {"role": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
 
@@ -180,6 +190,70 @@ class LifecycleWatcher(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.sleep(0.45)
         self.assertEqual(self._kinds("finished"), [], "an old settled halt is history, never replayed")
+
+    async def test_machinery_followup_never_rebuzzes_the_same_handback(self):
+        # THE 2026-07-02 duplicate: finish -> Cursor injects "Briefly inform the
+        # user…" -> the agent's one-line coda settles -> a second "finished" for
+        # the SAME hand-back buzzed 24s after the first. Machinery growth must
+        # advance the watermark silently; only a HUMAN turn re-arms.
+        p = await self._attach("sidmach00")
+        _append(p, [_atext("real work done — handing back")])
+        await asyncio.sleep(0.4)
+        self.assertEqual(len(self._kinds("finished")), 1)
+
+        _append(p, [_machinery_followup(), _machinery_followup(),
+                    _atext("Both of those were already folded into the work.")])
+        await asyncio.sleep(0.4)
+        self.assertEqual(
+            len(self._kinds("finished")), 1,
+            "a machinery follow-up coda re-buzzed the same hand-back",
+        )
+
+        # A real human turn re-arms: the next hand-back is genuinely new.
+        _append(p, [_user("now tighten the tests"), _atext("tightened — done")])
+        await asyncio.sleep(0.4)
+        self.assertEqual(len(self._kinds("finished")), 2)
+
+    async def test_repeat_stall_without_human_input_is_one_buzz(self):
+        # A hang that keeps dribbling tool bytes and hanging again is the SAME
+        # stall — one buzz until a human pokes it or the state changes kind.
+        p = await self._attach("sidstall0")
+        _append(p, [_atool("Shell")])
+        await asyncio.sleep(0.9)  # settle + hung (0.6s in test config)
+        self.assertEqual(len(self._kinds("stalled")), 1)
+
+        _append(p, [_atool("Shell")])  # more machinery bytes, still no hand-back
+        await asyncio.sleep(0.9)
+        self.assertEqual(len(self._kinds("stalled")), 1, "the same hang re-nagged")
+
+        # By now the fully-delivered quiet tailer has reaped; production
+        # re-attaches on resume via the discovery sweep — mimic that.
+        _append(p, [_atext("finally finished — handing back")])
+        await self.reg.ensure_thread_from_disk("/proj/live_visuals_4", "sidstall0", p)
+        await asyncio.sleep(0.4)
+        self.assertEqual(len(self._kinds("finished")), 1, "a kind CHANGE still surfaces")
+
+    async def test_machinery_turn_does_not_answer_a_pending_question(self):
+        # An AskQuestion halt buzzes; Cursor's injected follow-up must not count
+        # as "the user answered" and erase the pending decision.
+        p = await self._attach("sidqmach0")
+        _append(p, [{
+            "role": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "I need a decision."},
+                {"type": "tool_use", "name": "AskQuestion",
+                 "input": {"questions": [{"prompt": "Ship v1 or wait?"}]}},
+            ]},
+        }])
+        await asyncio.sleep(0.45)
+        self.assertEqual(len(self._kinds("question")), 1)
+        _append(p, [_machinery_followup()])
+        await asyncio.sleep(0.3)
+        agent = self.reg._get_or_create("/proj/live_visuals_4", source="ide")
+        self.assertIsNotNone(
+            agent.sessions["sidqmach0"].pending_question,
+            "machinery erased a pending human decision",
+        )
 
     async def test_discovery_attaches_a_threadless_of_hooks(self):
         # A thread whose first hook never arrived: discovery's ensure-from-disk
