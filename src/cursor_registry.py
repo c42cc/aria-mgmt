@@ -96,6 +96,14 @@ class SessionInfo:
     # durable db watermark so the hot path doesn't hit sqlite every poll).
     _last_byte_at: float = 0.0
     _delivered_offset: int = -1
+    # Re-buzz gate: the kind last surfaced, and whether a HUMAN turn arrived
+    # since. The same terminal kind re-derived from machinery-only growth
+    # (Cursor's injected follow-up prompts) is the SAME hand-back — advance the
+    # watermark, never re-buzz it. Defaults False so the gate also holds across
+    # a tailer reap + discovery re-attach; it only ever gates SAME-kind repeats
+    # (a first emit always has a differing prior kind, "").
+    _delivered_kind: str = ""
+    _human_since_emit: bool = False
 
 
 @dataclass
@@ -234,6 +242,35 @@ def _sid_from_transcript_path(path: str | None) -> str:
 # existed.
 _ASK_TOOL_NAMES = {"askquestion", "askfollowupquestion", "askfollowup", "askuser"}
 
+# Cursor injects MACHINERY user-role turns into a transcript after a task run —
+# the post-task follow-up prompt below, and bare <system_notification>/timestamp
+# frames. They are not the human. Treating them as the human re-armed the
+# hand-back watcher: the agent's one-line coda to the injected prompt settled as
+# a "new" hand-back and re-buzzed the same completion (forensic 2026-07-02
+# 01:15:07 + 01:15:31 — duplicate "finished" 24s apart; the bytes between were
+# exactly three injected follow-ups and one coda).
+_MACHINERY_USER_PREFIX = "Briefly inform the user about the task result"
+
+
+def _human_user_turn(text: str) -> bool:
+    """True iff a user-role transcript turn carries a HUMAN utterance."""
+    if not text:
+        return False
+    lo = text.find("<user_query>")
+    if lo != -1:
+        hi = text.find("</user_query>", lo)
+        body = text[lo + len("<user_query>"): hi if hi != -1 else None].strip()
+    else:
+        body = text.strip()
+        if body.startswith("<system_notification>"):
+            return False
+        if body.startswith("<timestamp>") and "</timestamp>" in body \
+                and not body.split("</timestamp>", 1)[1].strip():
+            return False
+    if not body:
+        return False
+    return not body.startswith(_MACHINERY_USER_PREFIX)
+
 
 def _normalize_tool_name(name: str) -> str:
     return "".join(ch for ch in (name or "").lower() if ch.isalnum())
@@ -281,19 +318,23 @@ def _extract_ask_question(content: object) -> str | None:
 
 def _parse_jsonl_turns(
     lines: list[str],
-) -> tuple[str, str, list[str], str | None]:
-    """Return (last_assistant_text, last_user_text, plan_file_paths, ask_question).
+) -> tuple[str, str, list[str], str | None, bool]:
+    """Return (last_assistant_text, last_user_text, plan_file_paths,
+    ask_question, saw_human_user).
 
     `lines` is a list of raw JSONL lines (no trailing newlines). Plan files
     are surfaced when Cursor's tool_use blocks reference them. `ask_question`
     is the prompt of the most recent 'ask the user' tool call (e.g.
     `AskQuestion`) seen in an assistant turn, or None — the reliable decision
-    signal that the prose heuristic misses.
+    signal that the prose heuristic misses. `last_user_text` and
+    `saw_human_user` reflect HUMAN turns only — Cursor's injected machinery
+    user turns are never the human (see `_human_user_turn`).
     """
     last_assistant = ""
     last_user = ""
     plans: list[str] = []
     last_ask: str | None = None
+    saw_human_user = False
     for line in lines:
         line = line.strip()
         if not line:
@@ -331,9 +372,10 @@ def _parse_jsonl_turns(
         if joined:
             if role == "assistant":
                 last_assistant = joined
-            elif role == "user":
+            elif role == "user" and _human_user_turn(joined):
                 last_user = joined
-    return last_assistant, last_user, plans, last_ask
+                saw_human_user = True
+    return last_assistant, last_user, plans, last_ask, saw_human_user
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +942,8 @@ class CursorAgentRegistry:
         # This is the one anti-replay guard (restart- and backlog-safe) AND the fix
         # for a thread that hands back at the moment its first hook attaches us.
         if sess._delivered_offset < 0:
-            durable_off, _ = db.get_cursor_delivered(sess.sid)
+            durable_off, durable_kind = db.get_cursor_delivered(sess.sid)
+            sess._delivered_kind = durable_kind
             try:
                 exists = bool(sess.transcript_path) and os.path.exists(sess.transcript_path)
                 cur_size = os.path.getsize(sess.transcript_path) if exists else 0
@@ -930,7 +973,9 @@ class CursorAgentRegistry:
                         sess._tail_offset += len(new)
                         if new:
                             text_lines = new.decode("utf-8", errors="replace").splitlines()
-                            la, lu, plans, ask_q = _parse_jsonl_turns(text_lines)
+                            la, lu, plans, ask_q, saw_human = _parse_jsonl_turns(text_lines)
+                            if saw_human:
+                                sess._human_since_emit = True
                             if la or ask_q:
                                 # The session that just produced output IS the
                                 # current one. Without this, concurrent threads in
@@ -973,6 +1018,13 @@ class CursorAgentRegistry:
                     terminal = self._classify_terminal(agent, sess, quiet_for, hung)
                     if terminal is not None:
                         kind, severity, reason = terminal
+                        # The same kind, and no human turn since the last buzz:
+                        # machinery-only growth (Cursor's injected follow-up, a
+                        # continuing hang) is the SAME hand-back — advance the
+                        # watermark, never re-buzz it.
+                        rebuzz_of_same = (
+                            kind == sess._delivered_kind and not sess._human_since_emit
+                        )
                         sess._delivered_offset = sess._tail_offset
                         sess.status = _status_for_kind(kind, sess.status)
                         agent.status = _aggregate_agent_status(agent, time.time())
@@ -983,9 +1035,12 @@ class CursorAgentRegistry:
                             )
                         except Exception:
                             log.exception("watermark persist failed for %s", sess.sid[:8])
-                        await self._emit_event(
-                            RegistryEvent(kind=kind, agent=agent, severity=severity, reason=reason)
-                        )
+                        if not rebuzz_of_same:
+                            sess._delivered_kind = kind
+                            sess._human_since_emit = False
+                            await self._emit_event(
+                                RegistryEvent(kind=kind, agent=agent, severity=severity, reason=reason)
+                            )
 
                 # Reap a fully-delivered, long-quiet tailer to bound live tasks;
                 # the discovery sweep re-attaches a fresh one if it resumes (new

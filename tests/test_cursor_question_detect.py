@@ -90,9 +90,10 @@ class TestAskToolDetection(unittest.TestCase):
         from src.cursor_registry import _parse_jsonl_turns
 
         line = json.dumps({"role": "assistant", "message": {"content": _ASK_TURN_CONTENT}})
-        last_assistant, last_user, plans, ask_q = _parse_jsonl_turns([line])
+        last_assistant, last_user, plans, ask_q, saw_human = _parse_jsonl_turns([line])
         self.assertIsNotNone(ask_q)
         self.assertIn("PAINT REALITY", ask_q)
+        self.assertFalse(saw_human)  # an assistant ask is not a human turn
 
 
 # A turn that merely ENDS in a question mark, with NO ask-the-user tool call.
